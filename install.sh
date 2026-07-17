@@ -24,28 +24,21 @@ fail() {
   exit 1
 }
 
-command -v curl >/dev/null 2>&1 || fail "curl is required"
+command -v git >/dev/null 2>&1 || fail "git is required"
 command -v node >/dev/null 2>&1 || fail "Node.js 22+ is required"
 command -v npm >/dev/null 2>&1 || fail "npm is required"
-command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])")"
 [ "$NODE_MAJOR" -ge 22 ] || fail "Node.js 22+ is required (found $(node --version))"
 
-ARCHIVE="$TMP_DIR/source.tar.gz"
 SOURCE_DIR="$TMP_DIR/source"
-URL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF"
+URL="https://github.com/$REPO.git"
 
 say "Downloading latest $REPO@$REF"
-# Keep curl's transfer meter visible: codeload.github.com can be very slow on
-# some networks, and the meter shows received bytes, speed, and elapsed time.
-# Abort only when transfer speed stays below 1 KiB/s for 30 seconds; do not use
-# a fixed total timeout that would restart a large but steadily moving download.
-curl -fL --connect-timeout 10 \
-  --speed-limit 1024 --speed-time 30 --retry 5 --retry-delay 1 \
-  --retry-all-errors "$URL" -o "$ARCHIVE"
-mkdir -p "$SOURCE_DIR"
-tar -xzf "$ARCHIVE" -C "$SOURCE_DIR" --strip-components=1
+# Git reports counting, compressing, receiving, and resolving percentages even
+# when GitHub's archive endpoint does not provide a Content-Length header.
+git clone --depth 1 --single-branch --branch "$REF" --progress "$URL" "$SOURCE_DIR"
+rm -rf "$SOURCE_DIR/.git"
 [ -f "$SOURCE_DIR/package.json" ] || fail "downloaded archive is not a botmux source tree"
 
 # Use the repository-pinned pnpm version without relying on a globally working
