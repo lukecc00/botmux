@@ -1269,6 +1269,58 @@ describe('Worker turn_terminal routing', () => {
     expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
   });
 
+  it('warns after a reliable CLI stays idle without a terminal message', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-missing' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-missing');
+    expect(ds.missingTurnTerminalTimer).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it.each(['final_output', 'turn_terminal'] as const)('cancels the grace when %s arrives', async (type) => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-finished' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    (ds.worker as any).emit('message', type === 'final_output'
+      ? { type, sessionId: ds.session.sessionId, content: '', turnId: 'turn-finished' }
+      : { type, sessionId: ds.session.sessionId, turnId: 'turn-finished', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.missingTurnTerminalTimer).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it('only arms reliable CLIs and clears the grace on worker exit', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const unreliable = makeDs();
+    unreliable.session.cliId = 'coco';
+    __testOnly_setupWorkerHandlers(unreliable, unreliable.worker as any);
+    (unreliable.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-unreliable' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    expect(unreliable.missingTurnTerminalTimer).toBeUndefined();
+    const exiting = makeDs();
+    __testOnly_setupWorkerHandlers(exiting, exiting.worker as any);
+    (exiting.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-exiting' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    expect(exiting.missingTurnTerminalTimer).toBeDefined();
+    (exiting.worker as any).emit('exit', 0, null);
+    expect(exiting.missingTurnTerminalTimer).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
   it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {
     const ds = makeDs();
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 1]]);

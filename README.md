@@ -223,9 +223,37 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 ### 1. 安装 botmux
 
 ```bash
+# 始终安装 p/ai_open 分支的最新版本（再次执行即可更新）
+curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+
+# 或从 npm 安装正式发布版本
 npm install -g botmux
 # 或：pnpm add -g botmux
 # 或：bun add -g botmux
+```
+
+一句话安装命令会从 GitHub 下载当前分支的最新源码、按锁文件构建到 `~/.local/share/botmux`，并将 `botmux` 命令链接到 `~/.local/bin`；以后执行同一条命令即可原子切换到最新版本。可通过 `BOTMUX_INSTALL_REF`、`BOTMUX_INSTALL_REPO` 和 `BOTMUX_INSTALL_PREFIX` 覆盖分支、仓库及安装目录。
+
+安装后可检查版本：
+
+```bash
+botmux --version
+```
+
+如果新开终端后提示找不到 `botmux`，请将 `~/.local/bin` 永久加入 PATH（使用 zsh 时将 `~/.bashrc` 换成 `~/.zshrc`）：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+#### 更新到 `p/ai_open` 最新版本
+
+重新运行安装命令即可下载最新代码、按锁文件重新构建并原子切换版本：
+
+```bash
+curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+botmux --version
 ```
 
 botmux 的手动/定时更新会识别当前全局安装归属，并继续使用同一个 npm、pnpm 或 Bun 安装位置；无法安全识别的安装方式不会自动回退到 npm。

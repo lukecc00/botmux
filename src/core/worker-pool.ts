@@ -42,6 +42,7 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-re
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
+const MISSING_TURN_TERMINAL_GRACE_MS = 3_000;
 
 export function getDaemonBootId(): string {
   return DAEMON_BOOT_ID;
@@ -2282,6 +2283,40 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  const reliableTurnTerminal = createCliAdapterSync(
+    sessionCliId(ds, botCfg),
+    ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+  ).reliableTurnTerminal === true;
+  const clearMissingTurnTerminalGrace = (turnId?: string): void => {
+    if (!ds.missingTurnTerminalTimer) return;
+    if (turnId && ds.missingTurnTerminalKey !== `${workerGeneration}:${turnId}`) return;
+    clearTimeout(ds.missingTurnTerminalTimer);
+    ds.missingTurnTerminalTimer = undefined;
+    ds.missingTurnTerminalKey = undefined;
+  };
+  const armMissingTurnTerminalGrace = (turnId?: string, dispatchAttempt?: number): void => {
+    if (!reliableTurnTerminal || !turnId || managedAuxUiSuppressed(turnId, dispatchAttempt)) return;
+    const key = `${workerGeneration}:${turnId}`;
+    if (ds.missingTurnTerminalKey === key) return;
+    clearMissingTurnTerminalGrace();
+    ds.missingTurnTerminalKey = key;
+    ds.missingTurnTerminalTimer = setTimeout(() => {
+      if (ds.missingTurnTerminalKey !== key) return;
+      ds.missingTurnTerminalTimer = undefined;
+      ds.missingTurnTerminalKey = undefined;
+      const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
+      const message = tr('worker.turn_ended_without_result', { cliName }, loc);
+      emitSessionLifecycleHook(ds, 'session.requires_attention', {
+        reason: 'turn_ended_without_result',
+        message,
+        turnId,
+      });
+      void scopedReply(message, 'text', turnId).catch((err: any) => {
+        logger.error(`[${t}] Failed to deliver missing turn terminal notice to Lark: ${err?.message ?? err}`);
+      });
+    }, MISSING_TURN_TERMINAL_GRACE_MS);
+    ds.missingTurnTerminalTimer.unref?.();
+  };
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -2696,6 +2731,9 @@ function setupWorkerHandlers(
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+          }
+          if (ds.lastScreenStatus === 'idle') {
+            armMissingTurnTerminalGrace(msg.turnId, msg.dispatchAttempt);
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -3143,6 +3181,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        clearMissingTurnTerminalGrace(msg.turnId);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -3240,9 +3279,10 @@ function setupWorkerHandlers(
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress
         // another session.
-        if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
+        clearMissingTurnTerminalGrace(msg.turnId);
+        if (!msg.content || !msg.content.trim()) break;
         if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           break;
@@ -3297,6 +3337,7 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    clearMissingTurnTerminalGrace();
     logger.info(`[${t}] Worker process exited (code: ${code})`);
     // Last-resort startup guard: syntax/import crashes and abrupt exits can
     // happen before the worker sends either ready or a structured error.  Do

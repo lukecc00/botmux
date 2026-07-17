@@ -712,6 +712,7 @@ export const messages: Record<string, string> = {
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'worker.exited_unexpectedly': '⚠️ The {cliName} session ended unexpectedly (worker exit code: {code}, signal: {signal}). This turn may be incomplete. Send a new message to restart and retry.',
+  'worker.turn_ended_without_result': '⚠️ The {cliName} turn ended unexpectedly without a final reply that could be delivered. This turn may be incomplete; retry or send a new message to continue.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',

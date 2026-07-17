@@ -139,6 +139,10 @@ export interface DaemonSession {
   progressReplyHash?: string;
   progressReplySentAt?: number;
   progressReplyTurnId?: string;
+  /** Grace timer armed when a reliable-transcript CLI returns to its prompt
+   * without having emitted final_output / turn_terminal for the active turn. */
+  missingTurnTerminalTimer?: NodeJS.Timeout;
+  missingTurnTerminalKey?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the

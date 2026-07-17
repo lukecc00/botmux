@@ -79,9 +79,37 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ### 1. Install botmux
 
 ```bash
+# Always install the latest p/ai_open branch (rerun to update)
+curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+
+# Or install the latest npm release
 npm install -g botmux
 # or: pnpm add -g botmux
 # or: bun add -g botmux
+```
+
+The one-line installer downloads the latest source from GitHub, builds it from the lockfile into `~/.local/share/botmux`, and links the `botmux` command into `~/.local/bin`. Run the same command again to atomically switch to the latest version. Override the branch, repository, or prefix with `BOTMUX_INSTALL_REF`, `BOTMUX_INSTALL_REPO`, or `BOTMUX_INSTALL_PREFIX`.
+
+Verify the installed version:
+
+```bash
+botmux --version
+```
+
+If a new terminal cannot find `botmux`, add `~/.local/bin` to PATH permanently (replace `~/.bashrc` with `~/.zshrc` when using zsh):
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+#### Update to the latest `p/ai_open` version
+
+Rerun the installer to download the latest source, rebuild from the lockfile, and atomically switch versions:
+
+```bash
+curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+botmux --version
 ```
 
 Manual and scheduled updates keep using the npm, pnpm, or Bun global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
