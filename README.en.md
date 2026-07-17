@@ -80,7 +80,9 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ```bash
 # Always install the latest p/ai_open branch (rerun to update)
-curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
+  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
+  export PATH="$HOME/.local/bin:$PATH" && botmux --version
 
 # Or install the latest npm release
 npm install -g botmux
@@ -108,7 +110,8 @@ source ~/.bashrc
 Rerun the installer to download the latest source, rebuild from the lockfile, and atomically switch versions:
 
 ```bash
-curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
+  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
 botmux --version
 ```
 

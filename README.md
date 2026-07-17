@@ -224,7 +224,9 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ```bash
 # 始终安装 p/ai_open 分支的最新版本（再次执行即可更新）
-curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
+  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
+  export PATH="$HOME/.local/bin:$PATH" && botmux --version
 
 # 或从 npm 安装正式发布版本
 npm install -g botmux
@@ -252,7 +254,8 @@ source ~/.bashrc
 重新运行安装命令即可下载最新代码、按锁文件重新构建并原子切换版本：
 
 ```bash
-curl -fsSL --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 60 https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
+  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
 botmux --version
 ```
 
