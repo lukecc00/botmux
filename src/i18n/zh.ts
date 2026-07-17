@@ -714,6 +714,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
+  'worker.exited_unexpectedly': '⚠️ {cliName} 会话异常结束（worker exit code: {code}，signal: {signal}），本轮结果可能不完整。请发送新消息重新启动并重试。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

@@ -91,6 +91,7 @@ import {
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
+import { selectProgressReply } from './progress-reply.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -2636,6 +2637,38 @@ function setupWorkerHandlers(
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
 
+        // Each logical turn gets an independent first-progress allowance.
+        if (msg.turnId && ds.progressReplyTurnId !== msg.turnId) {
+          ds.progressReplyTurnId = msg.turnId;
+          ds.progressReplyHash = undefined;
+          ds.progressReplySentAt = undefined;
+        }
+
+        // Mirror coarse, filtered terminal snapshots as durable thread replies.
+        // The worker renderer has already removed terminal control traffic; we
+        // intentionally do not read native reasoning/thinking transcript rows.
+        // Throttling + content hashing prevents the 2s screen poll from
+        // flooding a topic while still making long-running work observable.
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+          && !ds.suppressRecoveryCard
+          && !ds.docCommentTurns?.has(msg.turnId ?? '')) {
+          const progress = selectProgressReply(msg.content, ds.lastScreenStatus, {
+            hash: ds.progressReplyHash,
+            sentAt: ds.progressReplySentAt,
+          });
+          if (progress) {
+            // Reserve before awaiting Lark so concurrent IPC messages cannot
+            // pass the throttle window. A failed post clears the hash, allowing
+            // a later snapshot to retry instead of losing progress forever.
+            ds.progressReplyHash = progress.hash;
+            ds.progressReplySentAt = Date.now();
+            void scopedReply(progress.content, 'text', msg.turnId).catch((err: any) => {
+              if (ds.progressReplyHash === progress.hash) ds.progressReplyHash = undefined;
+              logger.warn(`[${t}] Failed to deliver progress reply to Lark: ${err?.message ?? err}`);
+            });
+          }
+        }
+
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
@@ -3275,6 +3308,31 @@ function setupWorkerHandlers(
       // durable VC delivery is fenced to the receipt/lease chain, not replied
       // out-of-band (which could post on a silent delivery).
       void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
+    }
+    // Last-resort post-ready guard: OOM, SIGKILL and uncaught worker crashes do
+    // not pass through `claude_exit`, so the historical path only updated the
+    // dashboard. Notify the topic exactly for an unexpected current-worker
+    // death; intentional close/replacement and managed silent receivers remain
+    // excluded. CLI crashes handled inside the live worker keep their richer
+    // retry/crash-loop flow and do not reach this branch.
+    if (startupState.ready
+      && ds.worker === worker
+      && !worker.killed
+      && ds.session.status !== 'closed'
+      && !managedAuxUiSuppressed(startupState.initTurnId, startupState.initDispatchAttempt)) {
+      const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
+      const message = tr('worker.exited_unexpectedly', {
+        cliName,
+        code: code ?? 'null',
+        signal: signal ?? 'none',
+      }, loc);
+      emitSessionLifecycleHook(ds, 'session.requires_attention', {
+        reason: 'worker_unexpected_exit',
+        message,
+      });
+      void scopedReply(message, 'text').catch((err: any) => {
+        logger.error(`[${t}] Failed to deliver unexpected worker exit to Lark: ${err?.message ?? err}`);
+      });
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.

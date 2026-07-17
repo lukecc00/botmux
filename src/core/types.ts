@@ -135,6 +135,10 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Last filtered terminal snapshot mirrored as an in-thread progress reply. */
+  progressReplyHash?: string;
+  progressReplySentAt?: number;
+  progressReplyTurnId?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
