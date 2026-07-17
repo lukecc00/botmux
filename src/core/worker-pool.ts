@@ -42,7 +42,6 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-re
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
-const MISSING_TURN_TERMINAL_GRACE_MS = 3_000;
 
 export function getDaemonBootId(): string {
   return DAEMON_BOOT_ID;
@@ -92,7 +91,6 @@ import {
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
-import { selectProgressReply } from './progress-reply.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -2283,40 +2281,6 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
-  const reliableTurnTerminal = createCliAdapterSync(
-    sessionCliId(ds, botCfg),
-    ds.session.cliPathOverride ?? botCfg.cliPathOverride,
-  ).reliableTurnTerminal === true;
-  const clearMissingTurnTerminalGrace = (turnId?: string): void => {
-    if (!ds.missingTurnTerminalTimer) return;
-    if (turnId && ds.missingTurnTerminalKey !== `${workerGeneration}:${turnId}`) return;
-    clearTimeout(ds.missingTurnTerminalTimer);
-    ds.missingTurnTerminalTimer = undefined;
-    ds.missingTurnTerminalKey = undefined;
-  };
-  const armMissingTurnTerminalGrace = (turnId?: string, dispatchAttempt?: number): void => {
-    if (!reliableTurnTerminal || !turnId || managedAuxUiSuppressed(turnId, dispatchAttempt)) return;
-    const key = `${workerGeneration}:${turnId}`;
-    if (ds.missingTurnTerminalKey === key) return;
-    clearMissingTurnTerminalGrace();
-    ds.missingTurnTerminalKey = key;
-    ds.missingTurnTerminalTimer = setTimeout(() => {
-      if (ds.missingTurnTerminalKey !== key) return;
-      ds.missingTurnTerminalTimer = undefined;
-      ds.missingTurnTerminalKey = undefined;
-      const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
-      const message = tr('worker.turn_ended_without_result', { cliName }, loc);
-      emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'turn_ended_without_result',
-        message,
-        turnId,
-      });
-      void scopedReply(message, 'text', turnId).catch((err: any) => {
-        logger.error(`[${t}] Failed to deliver missing turn terminal notice to Lark: ${err?.message ?? err}`);
-      });
-    }, MISSING_TURN_TERMINAL_GRACE_MS);
-    ds.missingTurnTerminalTimer.unref?.();
-  };
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -2672,38 +2636,6 @@ function setupWorkerHandlers(
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
 
-        // Each logical turn gets an independent first-progress allowance.
-        if (msg.turnId && ds.progressReplyTurnId !== msg.turnId) {
-          ds.progressReplyTurnId = msg.turnId;
-          ds.progressReplyHash = undefined;
-          ds.progressReplySentAt = undefined;
-        }
-
-        // Mirror coarse, filtered terminal snapshots as durable thread replies.
-        // The worker renderer has already removed terminal control traffic; we
-        // intentionally do not read native reasoning/thinking transcript rows.
-        // Throttling + content hashing prevents the 2s screen poll from
-        // flooding a topic while still making long-running work observable.
-        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
-          && !ds.suppressRecoveryCard
-          && !ds.docCommentTurns?.has(msg.turnId ?? '')) {
-          const progress = selectProgressReply(msg.content, ds.lastScreenStatus, {
-            hash: ds.progressReplyHash,
-            sentAt: ds.progressReplySentAt,
-          });
-          if (progress) {
-            // Reserve before awaiting Lark so concurrent IPC messages cannot
-            // pass the throttle window. A failed post clears the hash, allowing
-            // a later snapshot to retry instead of losing progress forever.
-            ds.progressReplyHash = progress.hash;
-            ds.progressReplySentAt = Date.now();
-            void scopedReply(progress.content, 'text', msg.turnId).catch((err: any) => {
-              if (ds.progressReplyHash === progress.hash) ds.progressReplyHash = undefined;
-              logger.warn(`[${t}] Failed to deliver progress reply to Lark: ${err?.message ?? err}`);
-            });
-          }
-        }
-
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
@@ -2731,9 +2663,6 @@ function setupWorkerHandlers(
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
-          }
-          if (ds.lastScreenStatus === 'idle') {
-            armMissingTurnTerminalGrace(msg.turnId, msg.dispatchAttempt);
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -3181,7 +3110,6 @@ function setupWorkerHandlers(
           );
           break;
         }
-        clearMissingTurnTerminalGrace(msg.turnId);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -3281,7 +3209,6 @@ function setupWorkerHandlers(
         // another session.
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
-        clearMissingTurnTerminalGrace(msg.turnId);
         if (!msg.content || !msg.content.trim()) break;
         if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
@@ -3337,7 +3264,6 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
-    clearMissingTurnTerminalGrace();
     logger.info(`[${t}] Worker process exited (code: ${code})`);
     // Last-resort startup guard: syntax/import crashes and abrupt exits can
     // happen before the worker sends either ready or a structured error.  Do

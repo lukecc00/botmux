@@ -1269,55 +1269,45 @@ describe('Worker turn_terminal routing', () => {
     expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
   });
 
-  it('warns after a reliable CLI stays idle without a terminal message', async () => {
+  it('sends only the core final reply card, never terminal snapshots or an idle warning', async () => {
     vi.useFakeTimers();
     const ds = makeDs();
+    ds.workerPort = 12345;
+    ds.suppressRecoveryCard = true;
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-missing' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    await vi.advanceTimersByTimeAsync(2_999);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: '• Ran botmux skill show botmux-workflow\n• I need to confirm the workflow',
+      status: 'working',
+      turnId: 'turn-workflow-confirm',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: '已在飞书中询问是否启用 Workflow。',
+      status: 'idle',
+      turnId: 'turn-workflow-confirm',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(sessionReply).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: '这个需求适合拆成一个 Workflow。要我按 Workflow 自动跑完吗？',
+      lastUuid: 'assistant-workflow-confirm',
+      turnId: 'turn-workflow-confirm',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(0);
+
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0][4]).toBe('turn-missing');
-    expect(ds.missingTurnTerminalTimer).toBeUndefined();
-    vi.useRealTimers();
-  });
-
-  it.each(['final_output', 'turn_terminal'] as const)('cancels the grace when %s arrives', async (type) => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-finished' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    (ds.worker as any).emit('message', type === 'final_output'
-      ? { type, sessionId: ds.session.sessionId, content: '', turnId: 'turn-finished' }
-      : { type, sessionId: ds.session.sessionId, turnId: 'turn-finished', status: 'completed' });
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-    expect(ds.missingTurnTerminalTimer).toBeUndefined();
-    vi.useRealTimers();
-  });
-
-  it('only arms reliable CLIs and clears the grace on worker exit', async () => {
-    vi.useFakeTimers();
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
-    const unreliable = makeDs();
-    unreliable.session.cliId = 'coco';
-    __testOnly_setupWorkerHandlers(unreliable, unreliable.worker as any);
-    (unreliable.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-unreliable' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    expect(unreliable.missingTurnTerminalTimer).toBeUndefined();
-    const exiting = makeDs();
-    __testOnly_setupWorkerHandlers(exiting, exiting.worker as any);
-    (exiting.worker as any).emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: 'turn-exiting' } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    expect(exiting.missingTurnTerminalTimer).toBeDefined();
-    (exiting.worker as any).emit('exit', 0, null);
-    expect(exiting.missingTurnTerminalTimer).toBeUndefined();
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(sessionReply).not.toHaveBeenCalled();
+    expect(sessionReply.mock.calls[0][2]).toBe('interactive');
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-workflow-confirm');
+    expect(sessionReply.mock.calls[0][1]).toContain('这个需求适合拆成一个 Workflow');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('Ran botmux skill show');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('I need to confirm');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('异常结束');
     vi.useRealTimers();
   });
 
