@@ -37,11 +37,11 @@ SOURCE_DIR="$TMP_DIR/source"
 URL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF"
 
 say "Downloading latest $REPO@$REF"
-# Keep the progress bar visible: codeload.github.com can be very slow on some
-# networks, and silent curl otherwise makes a healthy download look hung.
+# Keep curl's transfer meter visible: codeload.github.com can be very slow on
+# some networks, and the meter shows received bytes, speed, and elapsed time.
 # Abort only when transfer speed stays below 1 KiB/s for 30 seconds; do not use
 # a fixed total timeout that would restart a large but steadily moving download.
-curl -fL --progress-bar --connect-timeout 10 \
+curl -fL --connect-timeout 10 \
   --speed-limit 1024 --speed-time 30 --retry 5 --retry-delay 1 \
   --retry-all-errors "$URL" -o "$ARCHIVE"
 mkdir -p "$SOURCE_DIR"
