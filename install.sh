@@ -37,8 +37,13 @@ SOURCE_DIR="$TMP_DIR/source"
 URL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF"
 
 say "Downloading latest $REPO@$REF"
-curl -fsSL --connect-timeout 10 --max-time 180 --retry 5 --retry-delay 1 \
-  --retry-max-time 300 "$URL" -o "$ARCHIVE"
+# Keep the progress bar visible: codeload.github.com can be very slow on some
+# networks, and silent curl otherwise makes a healthy download look hung.
+# Abort only when transfer speed stays below 1 KiB/s for 30 seconds; do not use
+# a fixed total timeout that would restart a large but steadily moving download.
+curl -fL --progress-bar --connect-timeout 10 \
+  --speed-limit 1024 --speed-time 30 --retry 5 --retry-delay 1 \
+  --retry-all-errors "$URL" -o "$ARCHIVE"
 mkdir -p "$SOURCE_DIR"
 tar -xzf "$ARCHIVE" -C "$SOURCE_DIR" --strip-components=1
 [ -f "$SOURCE_DIR/package.json" ] || fail "downloaded archive is not a botmux source tree"
