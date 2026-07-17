@@ -1,7 +1,7 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { buildCodexBotmuxShellHints } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
@@ -298,7 +298,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: buildCodexBotmuxShellHints(),
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an
     // active-turn STEER, not a deferred next-turn submit. Two rollout shapes

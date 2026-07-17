@@ -306,9 +306,10 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
-    // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny.
     expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+    expect(content).toContain('关键阶段写成面向用户的 commentary');
+    expect(content).toContain('自动同步到飞书卡片');
+    expect(content).toContain('<codex_delivery>');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
   });

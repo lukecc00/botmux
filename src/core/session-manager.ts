@@ -13,7 +13,7 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCodexBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -635,7 +635,13 @@ export function buildNewTopicPrompt(
   // (Claude Code builds its own via --append-system-prompt). Source hints
   // freshly from i18n so they respect the resolved locale instead of the
   // static `adapter.systemHints` array that was baked at module load.
-  const hints = adapter.injectsSessionContext ? [] : (cliId === 'hermes' ? buildHermesBotmuxHints(locale) : buildBotmuxShellHints(locale));
+  const hints = adapter.injectsSessionContext
+    ? []
+    : cliId === 'hermes'
+      ? buildHermesBotmuxHints(locale)
+      : cliId === 'codex'
+        ? buildCodexBotmuxShellHints(locale)
+        : buildBotmuxShellHints(locale);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -824,6 +830,9 @@ export function buildFollowUpContent(
       ? hermesFollowupReminder(opts?.locale)
       : t('ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    if (opts?.cliId === 'codex') {
+      parts.push(`<codex_delivery>${t('ai.followup.codex_structured_delivery', undefined, opts?.locale)}</codex_delivery>`);
+    }
   }
   if (whiteboardBlock) parts.push(whiteboardBlock);
 

@@ -2777,6 +2777,68 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'progress_output': {
+        // Progress must come from the same worker/session and exact managed
+        // attempt as the turn it describes. Unlike screen_update, its content
+        // is transcript-native assistant commentary, never a terminal scrape.
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.error(
+            `[${t}] Dropped progress_output with mismatched sessionId `
+            + `(msg=${msg.sessionId}, expected=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+          );
+          break;
+        }
+        if (!msg.content.trim()) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (ds.suppressRecoveryCard) break;
+        if (ds.docCommentTurns?.has(msg.turnId)) break;
+
+        if (!ds.progressOutputUuids) ds.progressOutputUuids = new Set();
+        if (ds.progressOutputUuids.has(msg.uuid)) break;
+        ds.progressOutputUuids.add(msg.uuid); // reserve before async delivery
+        while (ds.progressOutputUuids.size > 512) {
+          const oldest = ds.progressOutputUuids.values().next().value;
+          if (oldest === undefined) break;
+          ds.progressOutputUuids.delete(oldest);
+        }
+
+        const cardJson = buildMarkdownCard(
+          msg.content,
+          undefined, // progress is deliberately low-attention: no owner @ footer
+          renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          localeForBot(ds.larkAppId),
+          ds.workingDir,
+          daemonCardLocalHomeLinkMode(ds),
+        );
+        const deliver = (attempt: number): void => {
+          const backoff = FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0;
+          setTimeout(() => {
+            if (ds.session.status === 'closed') return;
+            scopedReply(cardJson, 'interactive', msg.turnId)
+              .then(() => {
+                logger.info(
+                  `[${t}] Structured progress forwarded `
+                  + `(turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`,
+                );
+              })
+              .catch((err: any) => {
+                const next = attempt + 1;
+                if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+                  ds.progressOutputUuids?.delete(msg.uuid);
+                  logger.error(
+                    `[${t}] Structured progress gave up after ${next} attempts `
+                    + `(turn ${msg.turnId.substring(0, 8)}): ${err?.message ?? err}`,
+                  );
+                  return;
+                }
+                deliver(next);
+              });
+          }, backoff);
+        };
+        deliver(0);
+        break;
+      }
+
       case 'screenshot_uploaded': {
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.

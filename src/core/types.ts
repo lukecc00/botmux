@@ -133,6 +133,8 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
+  /** In-memory reservation/dedupe for structured per-turn progress cards. */
+  progressOutputUuids?: Set<string>;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns

@@ -563,6 +563,15 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  | {
+      type: 'progress_output';
+      /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */
+      sessionId: string;
+      content: string;
+      uuid: string;
+      turnId: string;
+      dispatchAttempt?: number;
+    }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */

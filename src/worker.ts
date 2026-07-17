@@ -1321,7 +1321,7 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
  *  对齐 maybeEmitAdoptPreamble；区别只在事件取出方式（codex/coco 是结构化
  *  event，不需要走 claude 那套 jsonl turn assembly）。 */
 function maybeEmitCodexAdoptPreamble(
-  history: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  history: readonly { kind: 'user' | 'assistant_progress' | 'assistant_final'; text: string }[],
 ): void {
   if (!lastInitConfig?.adoptMode) return;
   if (lastInitConfig?.adoptRestoredFromMetadata) return;
@@ -2411,6 +2411,22 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   return drainCocoEvents(path, offset);
 }
 
+/** Forward only transcript-native assistant commentary. Tool calls, command
+ * output, reasoning, and the terminal viewport never enter this path. */
+function ingestStructuredBridgeEvents(events: CodexBridgeEvent[]): void {
+  codexBridgeQueue.ingest(events);
+  for (const progress of codexBridgeQueue.drainProgressOutputs()) {
+    send({
+      type: 'progress_output',
+      sessionId,
+      content: progress.content,
+      uuid: progress.uuid,
+      turnId: progress.turnId,
+      dispatchAttempt: progress.dispatchAttempt,
+    });
+  }
+}
+
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
   // Single 1s ticker that handles three jobs: late-attach (poll for the
@@ -2547,7 +2563,7 @@ function hermesBridgeIngest(): void {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(filtered.events);
+  ingestStructuredBridgeEvents(filtered.events);
   if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
@@ -2560,7 +2576,7 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     mtrBridgeOffset = result.newOffset;
     mtrBridgeBaselineDone = true;
     log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
@@ -2585,7 +2601,7 @@ function mtrBridgeIngest(): void {
   const result = drainMtrSession(mtrBridgeSource, mtrBridgeOffset);
   mtrBridgeOffset = result.newOffset;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   if (result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
@@ -2615,7 +2631,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
@@ -2882,7 +2898,7 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
@@ -2905,6 +2921,15 @@ function codexBridgeMarkPendingTurn(
   if (!codexBridgeFallbackActive()) return false;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt);
+  // Handles the rare transcript-before-mark race: mark() replays the buffered
+  // user + commentary records and may make progress immediately available.
+  for (const progress of codexBridgeQueue.drainProgressOutputs()) {
+    send({
+      type: 'progress_output', sessionId, content: progress.content,
+      uuid: progress.uuid, turnId: progress.turnId,
+      dispatchAttempt: progress.dispatchAttempt,
+    });
+  }
   return true;
 }
 

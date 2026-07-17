@@ -10,6 +10,9 @@ function userEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
   return { uuid: uuid ?? `a${++nextUuid}`, timestampMs: ts, kind: 'assistant_final', text };
 }
+function progressEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
+  return { uuid: uuid ?? `p${++nextUuid}`, timestampMs: ts, kind: 'assistant_progress', text };
+}
 function markerForContent(sentAtMs: number, content: string): BridgeSendMarker {
   return { sentAtMs, ...buildBridgeSendMarkerContent(content) };
 }
@@ -45,6 +48,40 @@ function emitDecisions(
 }
 
 describe('CodexBridgeQueue', () => {
+  it('attributes clean progress to the collecting turn without closing it', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t-progress', 'please fix it', 100, 3);
+    q.ingest([
+      userEv('please fix it', 'user-progress', 101),
+      progressEv('修复完成，正在验证。', 'progress-1', 102),
+    ]);
+
+    expect(q.drainProgressOutputs()).toEqual([{
+      uuid: 'progress-1',
+      content: '修复完成，正在验证。',
+      turnId: 't-progress',
+      dispatchAttempt: 3,
+    }]);
+    expect(q.drainEmittable()).toEqual([]);
+
+    q.ingest([asstEv('全部完成', 'final-progress', 103)]);
+    expect(q.drainEmittable()[0]).toMatchObject({ turnId: 't-progress', finalText: '全部完成' });
+  });
+
+  it('replays transcript-before-mark progress and dedupes its uuid', () => {
+    const q = new CodexBridgeQueue();
+    q.ingest([
+      userEv('race prompt', 'race-user', 100),
+      progressEv('race progress', 'race-progress', 101),
+    ]);
+    q.mark('race-turn', 'race prompt', 100);
+    expect(q.drainProgressOutputs()).toEqual([expect.objectContaining({
+      uuid: 'race-progress', turnId: 'race-turn', content: 'race progress',
+    })]);
+    q.ingest([progressEv('race progress', 'race-progress', 101)]);
+    expect(q.drainProgressOutputs()).toEqual([]);
+  });
+
   it('marked turn whose user fingerprint matches becomes started; assistant_final closes it; drainEmittable yields finalText', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'hello model please', 100);

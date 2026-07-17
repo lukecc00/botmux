@@ -1273,6 +1273,7 @@ describe('Worker turn_terminal routing', () => {
     vi.useFakeTimers();
     const ds = makeDs();
     ds.workerPort = 12345;
+    ds.streamCardId = 'om_existing_stream';
     ds.suppressRecoveryCard = true;
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -1308,6 +1309,64 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[0][1]).not.toContain('Ran botmux skill show');
     expect(sessionReply.mock.calls[0][1]).not.toContain('I need to confirm');
     expect(sessionReply.mock.calls[0][1]).not.toContain('异常结束');
+    vi.useRealTimers();
+  });
+
+  it('forwards only structured progress as a Markdown card and dedupes its transcript uuid', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    ds.workerPort = 12345;
+    ds.streamCardId = 'om_existing_stream';
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: '• Ran pnpm build\n└ noisy terminal output\n• internal reasoning',
+      status: 'working',
+      turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    const progress = {
+      type: 'progress_output',
+      sessionId: ds.session.sessionId,
+      content: '修复和边界测试都已完成，现在重启并确认 daemon。',
+      uuid: 'rollout.jsonl:1234',
+      turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>;
+    (ds.worker as any).emit('message', progress);
+    (ds.worker as any).emit('message', progress);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][2]).toBe('interactive');
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-progress');
+    expect(sessionReply.mock.calls[0][1]).toContain('修复和边界测试都已完成');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('Ran pnpm build');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('internal reasoning');
+    vi.useRealTimers();
+  });
+
+  it('drops structured progress from a mismatched worker session', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: 'another-session', content: 'must not leak',
+      uuid: 'foreign:1', turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sessionReply).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -1438,6 +1497,14 @@ describe('Worker turn_terminal routing', () => {
       dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
     (ds.worker as any).emit('message', {
+      type: 'progress_output',
+      sessionId: ds.session.sessionId,
+      content: 'meeting-derived progress must remain private',
+      uuid: 'meeting-progress:1',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
       type: 'tui_prompt',
       description: 'permission needed',
       options: [{ text: 'allow', selected: false }],
@@ -1511,6 +1578,30 @@ describe('Worker turn_terminal routing', () => {
       code: 17,
       signal: 'SIGTERM',
     });
+  });
+
+  it('notifies Lark when a ready worker process really exits unexpectedly', async () => {
+    const ds = makeDs();
+    ds.suppressRecoveryCard = true;
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'ready', port: 4567, token: 'token', turnId: 'turn-crashed',
+    } satisfies Extract<WorkerToDaemon, { type: 'ready' }>);
+    (ds.worker as any).emit('exit', 9, 'SIGKILL');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toContain('异常结束');
+    expect(sessionReply.mock.calls[0][1]).toContain('worker exit code: 9');
   });
 
   it('reports a managed CLI exit even when the Node worker stays alive', async () => {

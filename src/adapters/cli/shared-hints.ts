@@ -40,6 +40,17 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
   return hints;
 }
 
+/** Codex has a structured rollout bridge: its commentary and final-answer
+ * records are delivered without scraping the terminal or asking the model to
+ * shell out. Keep botmux-send guidance only for capabilities that really need
+ * an explicit provider action. */
+export function buildCodexBotmuxShellHints(locale?: Locale): string[] {
+  return buildBotmuxShellHints(locale)
+    .filter(line => line !== t('ai.shell.how_to_send', undefined, locale)
+      && line !== t('ai.shell.when_to_send', undefined, locale))
+    .concat(t('ai.shell.codex_structured_delivery', undefined, locale));
+}
+
 /** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers.
  *  Static legacy value must not read runtime config at module import time. */
 export const BOTMUX_SHELL_HINTS: string[] = [

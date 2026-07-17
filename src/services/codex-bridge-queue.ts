@@ -70,12 +70,21 @@ export interface CodexPendingTurn {
   sourceSessionId?: string;
 }
 
+/** Clean model-authored progress prose attributed to one exact pending turn. */
+export interface CodexProgressOutput {
+  uuid: string;
+  content: string;
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
+  private progressOutputs: CodexProgressOutput[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
@@ -120,6 +129,7 @@ export class CodexBridgeQueue {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     this.bufferedUnmatched = [];
+    this.progressOutputs = [];
     this.lastClosedAssistantFinalTimeMs = undefined;
     return dropped;
   }
@@ -258,6 +268,20 @@ export class CodexBridgeQueue {
         // so mark() can replay it instead of losing the line to `seen`.
         this.rememberUnmatched(ev);
       }
+    } else if (ev.kind === 'assistant_progress') {
+      if (this.collecting) {
+        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+        this.progressOutputs.push({
+          uuid: ev.uuid,
+          content: ev.text,
+          turnId: this.collecting.turnId,
+          dispatchAttempt: this.collecting.dispatchAttempt,
+        });
+      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        // The transcript can beat the daemon's mark IPC. Keep progress beside
+        // its preceding user event so mark() replays and attributes both.
+        this.rememberUnmatched(ev);
+      }
     } else if (ev.kind === 'assistant_final') {
       if (this.collecting) {
         if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
@@ -270,6 +294,11 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     }
+  }
+
+  /** Drain progress independently of final-answer readiness. */
+  drainProgressOutputs(): CodexProgressOutput[] {
+    return this.progressOutputs.splice(0);
   }
 
   /** Pop FIFO any leading turn that is started AND observed assistant_final.

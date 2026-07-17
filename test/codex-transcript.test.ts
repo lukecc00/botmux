@@ -249,7 +249,7 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('real user prompt');
   });
 
-  it('skips assistant phase=commentary (mid-turn status)', () => {
+  it('extracts assistant phase=commentary as clean progress, separate from final output', () => {
     writeFileSync(path,
       ev({
         type: 'response_item',
@@ -257,14 +257,17 @@ describe('drainCodexRollout', () => {
           type: 'message',
           role: 'assistant',
           phase: 'commentary',
-          content: [{ type: 'output_text', text: 'thinking…' }],
+          content: [{ type: 'output_text', text: '已完成修复，正在跑边界测试。' }],
         },
       }) +
       ev(assistantFinalResponseItem('done')));
     const r = drainCodexRollout(path, 0);
-    expect(r.events).toHaveLength(1);
-    expect(r.events[0].kind).toBe('assistant_final');
-    expect(r.events[0].text).toBe('done');
+    expect(r.events).toHaveLength(2);
+    expect(r.events[0]).toMatchObject({
+      kind: 'assistant_progress',
+      text: '已完成修复，正在跑边界测试。',
+    });
+    expect(r.events[1]).toMatchObject({ kind: 'assistant_final', text: 'done' });
   });
 
   it('skips reasoning / function_call / function_call_output / event_msg', () => {

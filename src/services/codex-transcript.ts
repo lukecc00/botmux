@@ -4,10 +4,12 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about two `response_item.payload.type === 'message'`
+ * fallback only cares about three `response_item.payload.type === 'message'`
  * shapes:
  *
  *   - role=user             → the user's prompt text (input_text content)
+ *   - role=assistant +
+ *     phase=commentary      → a model-authored, user-facing progress update
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
  *
@@ -17,10 +19,10 @@
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
  *     Picking `response_item` keeps the reader to a single source of truth
  *     and avoids any chance of double-emit if both paths are present.
- *   - Skipping role=developer (system instructions), phase=commentary
- *     (mid-turn status), reasoning, and function_call* keeps the bridge
- *     focused on what the user actually said and what the model finally
- *     answered — same scope as the Claude bridge.
+ *   - role=developer (system instructions), reasoning, function_call*, and
+ *     function_call_output remain excluded. Commentary is intentionally kept
+ *     separate from final answers so callers can mirror only the model's clean
+ *     progress prose without scraping terminal tool output.
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
@@ -107,8 +109,9 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
+   *   - 'assistant_progress' is a clean mid-turn user-facing update
    *   - 'assistant_final' closes the currently-collecting turn */
-  kind: 'user' | 'assistant_final';
+  kind: 'user' | 'assistant_progress' | 'assistant_final';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
@@ -136,7 +139,7 @@ export interface CodexBridgeEvent {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  events: readonly { kind: 'user' | 'assistant_progress' | 'assistant_final'; text: string }[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -333,14 +336,18 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && p.phase === 'final_answer') {
+    } else if (p.role === 'assistant' && (p.phase === 'commentary' || p.phase === 'final_answer')) {
       const text = joinTextBlocks(p.content, 'output_text');
       if (!text) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text });
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: p.phase === 'commentary' ? 'assistant_progress' : 'assistant_final',
+        text,
+      });
     }
-    // Skip role=developer (instructions), phase=commentary (mid-turn
-    // status), and any reasoning / function_call* events — see file
-    // header for rationale.
+    // Skip role=developer (instructions) and any reasoning / function_call*
+    // events — see file header for rationale.
   }
   return { events, newOffset, pendingTail };
 }

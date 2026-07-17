@@ -226,7 +226,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 # 始终安装 p/ai_open 分支的最新版本（再次执行即可更新）
 curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
   https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
-  export PATH="$HOME/.local/bin:$PATH" && botmux --version
+  export PATH="$HOME/.local/bin:$PATH" && botmux setup
 
 # 或从 npm 安装正式发布版本
 npm install -g botmux
@@ -234,7 +234,7 @@ npm install -g botmux
 # 或：bun add -g botmux
 ```
 
-一句话安装命令会从 GitHub 下载当前分支的最新源码、按锁文件构建到 `~/.local/share/botmux`，并将 `botmux` 命令链接到 `~/.local/bin`；以后执行同一条命令即可原子切换到最新版本。可通过 `BOTMUX_INSTALL_REF`、`BOTMUX_INSTALL_REPO` 和 `BOTMUX_INSTALL_PREFIX` 覆盖分支、仓库及安装目录。
+一句话接入命令会从 GitHub 下载当前分支的最新源码、按锁文件构建到 `~/.local/share/botmux`，将 `botmux` 命令链接到 `~/.local/bin`，然后立即启动 `botmux setup` 完成飞书扫码、创建应用和发布机器人。以后更新请使用下方更新命令，即可原子切换到最新版本而不重复进入 setup。可通过 `BOTMUX_INSTALL_REF`、`BOTMUX_INSTALL_REPO` 和 `BOTMUX_INSTALL_PREFIX` 覆盖分支、仓库及安装目录。
 
 安装后可检查版本：
 

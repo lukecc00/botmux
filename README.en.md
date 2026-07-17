@@ -82,7 +82,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 # Always install the latest p/ai_open branch (rerun to update)
 curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
   https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
-  export PATH="$HOME/.local/bin:$PATH" && botmux --version
+  export PATH="$HOME/.local/bin:$PATH" && botmux setup
 
 # Or install the latest npm release
 npm install -g botmux
@@ -90,7 +90,7 @@ npm install -g botmux
 # or: bun add -g botmux
 ```
 
-The one-line installer downloads the latest source from GitHub, builds it from the lockfile into `~/.local/share/botmux`, and links the `botmux` command into `~/.local/bin`. Run the same command again to atomically switch to the latest version. Override the branch, repository, or prefix with `BOTMUX_INSTALL_REF`, `BOTMUX_INSTALL_REPO`, or `BOTMUX_INSTALL_PREFIX`.
+The one-line setup command downloads the latest source from GitHub, builds it from the lockfile into `~/.local/share/botmux`, links the `botmux` command into `~/.local/bin`, and immediately starts `botmux setup` for QR login, app creation, and bot publishing. For later updates, use the update command below to atomically switch versions without entering setup again. Override the branch, repository, or prefix with `BOTMUX_INSTALL_REF`, `BOTMUX_INSTALL_REPO`, or `BOTMUX_INSTALL_PREFIX`.
 
 Verify the installed version:
 
