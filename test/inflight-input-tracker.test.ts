@@ -155,4 +155,27 @@ describe('InflightInputTracker', () => {
     expect(t.onCliExit()).toBe(0);
     expect(t.takeCarryOver()).toEqual([]);
   });
+
+  it('recovers an exact failed turn after a premature idle clear', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('continue the task', 'failed-turn'));
+    t.onTurnComplete();
+
+    expect(t.onTurnFailed('failed-turn', input => ({
+      ...input,
+      content: `${input.content}\nRECOVER`,
+    }))).toBe(1);
+    expect(t.takeCarryOver()).toEqual([item('continue the task\nRECOVER', 'failed-turn')]);
+  });
+
+  it('does not recover a durable delivery through the worker-local path', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'durable', turnId: 'durable-turn', dispatchAttempt: 2 });
+    expect(t.onTurnFailed(
+      'durable-turn',
+      input => input,
+      input => input.dispatchAttempt === undefined,
+    )).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
 });

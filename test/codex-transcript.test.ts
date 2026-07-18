@@ -63,6 +63,40 @@ describe('codexSessionIdFromRolloutPath', () => {
   });
 });
 
+describe('Codex abnormal task completion', () => {
+  it('emits a failed empty boundary when task_complete has no final message', () => {
+    writeFileSync(path,
+      ev(userResponseItem('keep working'))
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'native-turn', last_agent_message: null },
+      }),
+    );
+    const out = drainCodexRollout(path, 0).events;
+    expect(out.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_task_complete_without_final',
+    });
+  });
+
+  it('does not duplicate a normal task_complete that carries a final message', () => {
+    writeFileSync(path,
+      ev(userResponseItem('keep working'))
+      + ev(assistantFinalResponseItem('done'))
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'native-turn', last_agent_message: 'done' },
+      }),
+    );
+    expect(drainCodexRollout(path, 0).events.map(event => event.kind))
+      .toEqual(['user', 'assistant_final']);
+  });
+});
+
 describe('findCodexRolloutBySessionId', () => {
   it('honors CODEX_HOME when locating rollout transcripts', () => {
     const prevCodexHome = process.env.CODEX_HOME;

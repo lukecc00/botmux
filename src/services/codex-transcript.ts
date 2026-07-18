@@ -13,12 +13,18 @@
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
  *
- * Why these and not `event_msg`:
+ * Why almost all `event_msg` records are ignored:
  *   - `response_item` is the canonical transcript record; `event_msg` is a
  *     UI-event stream that can carry the same final text via two channels
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
  *     Picking `response_item` keeps the reader to a single source of truth
  *     and avoids any chance of double-emit if both paths are present.
+ *   - One narrow exception is `task_complete` with no `last_agent_message`.
+ *     Codex writes exactly that terminal after exhausting its reconnects
+ *     (`stream closed before response.completed`) while keeping the TUI
+ *     process alive.  There is no assistant response_item in that shape, so
+ *     without this explicit failed boundary botmux waits forever and the user
+ *     never learns that the turn stopped.
  *   - role=developer (system instructions), reasoning, function_call*, and
  *     function_call_output remain excluded. Commentary is intentionally kept
  *     separate from final answers so callers can mirror only the model's clean
@@ -327,11 +333,25 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const ts = typeof obj?.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    if (obj?.type === 'event_msg'
+      && obj.payload?.type === 'task_complete'
+      && (typeof obj.payload.last_agent_message !== 'string'
+        || obj.payload.last_agent_message.trim().length === 0)) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_task_complete_without_final',
+      });
+      continue;
+    }
     if (obj?.type !== 'response_item') continue;
     const p = obj.payload;
     if (!p || typeof p !== 'object' || p.type !== 'message') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     if (p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;

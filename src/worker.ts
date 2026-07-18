@@ -815,6 +815,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
+const codexMissingFinalRecoveryAttempts = new Map<string, number>();
+const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
+const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
@@ -2964,6 +2967,49 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    if (!adoptMode
+      && turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
+      && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) {
+      const recoveryAttempts = codexMissingFinalRecoveryAttempts.get(turn.turnId) ?? 0;
+      if (recoveryAttempts === 0) {
+        const staged = inflightInputs.onTurnFailed(
+          turn.turnId,
+          item => ({
+            ...item,
+            content: `${item.content}${CODEX_RECOVERY_SUFFIX}`,
+            codexAppInput: item.codexAppInput
+              ? { ...item.codexAppInput, text: `${item.codexAppInput.text}${CODEX_RECOVERY_SUFFIX}` }
+              : undefined,
+          }),
+          item => item.dispatchAttempt === undefined,
+        );
+        if (staged > 0) {
+          codexMissingFinalRecoveryAttempts.set(turn.turnId, 1);
+          send({
+            type: 'user_notify',
+            turnId: turn.turnId,
+            message: '⚠️ Codex 运行流在生成最终答复前异常终止。已自动切换到全新 Codex 会话，并从当前工作区继续本轮任务。',
+          });
+          void restartCliProcess('Codex task completed without final output', {
+            preservePending: true,
+            forceFresh: true,
+          });
+          continue;
+        }
+      }
+      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
+      inflightInputs.onTurnComplete();
+      send({
+        type: 'user_notify',
+        turnId: turn.turnId,
+        message: recoveryAttempts > 0
+          ? '❌ Codex 运行流再次异常终止，自动切换新会话后仍未能完成。本轮已停止自动重试，请查看当前工作区；已完成的文件修改会保留。'
+          : '❌ Codex 运行流在生成最终答复前异常终止，且 botmux 无法安全恢复原任务输入，因此未自动重放。本轮已停止，请查看当前工作区；已完成的文件修改会保留。',
+      });
+      emitTurnTerminal(turn.turnId, 'failed', CODEX_MISSING_FINAL_ERROR);
+      continue;
+    }
     if (!turn.finalText) continue;
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
@@ -3000,6 +3046,12 @@ function emitReadyCodexTurns(): void {
     });
   }
   for (const turn of ready) {
+    if (turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
+      && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) continue;
+    if ((turn.terminalStatus ?? 'completed') === 'completed') {
+      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
+    }
     emitTurnTerminal(
       turn.turnId,
       turn.terminalStatus ?? 'completed',
@@ -6714,7 +6766,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; forceFresh?: boolean } = {},
 ): Promise<void> {
   if (lastInitConfig?.adoptMode) {
     log(`Restart ignored in adopt mode (${reason})`);
@@ -6764,7 +6816,16 @@ async function restartCliProcess(
           startScreenUpdates();
           startScreenAnalyzer();
           try {
-            spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+            if (opts.forceFresh) {
+              spawnCli({
+                ...lastInitConfig,
+                resume: false,
+                cliSessionId: undefined,
+                prompt: '',
+              });
+            } else {
+              spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+            }
           } catch (err) {
             cliRestartInProgress = false;
             await sendFatalWorkerErrorAndExit(err);
