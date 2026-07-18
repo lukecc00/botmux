@@ -804,6 +804,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   if (sent && msg.followUpContent) {
     sendToPty(msg.followUpContent, undefined, {
       codexAppInput: msg.followUpCodexAppInput,
+      requireIdle: msg.followUpAfterIdle,
     });
     log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
   }
@@ -4680,6 +4681,7 @@ function sendToPty(
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    requireIdle?: boolean;
   } = {},
 ): void {
   if (!cliAdapter) return;
@@ -4691,6 +4693,7 @@ function sendToPty(
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
+    ...(opts.requireIdle ? { requireIdle: true } : {}),
   };
   // During an exact lease-fenced CLI restart the worker stays alive while the
   // backend is rebuilt. Preserve incoming attempt N+1 in the worker queue; the

@@ -148,6 +148,12 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
+  buildFreshCodexHandoffPrompt,
+  buildFreshCodexHandoffTopic,
+  CODEX_HANDOFF_SUMMARY_PROMPT,
+  shouldFreshHandoffCodex,
+} from './core/codex-handoff.js';
+import {
   getSessionPersistentBackendType,
   killPersistentSession,
   persistentSessionName,
@@ -3237,6 +3243,110 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);
+}
+
+/** Consume a Codex-generated Handoff Summary into a new Lark topic backed by
+ * a genuinely fresh Codex session. This deliberately does not copy
+ * cliSessionId and calls forkWorker with resume=false. */
+async function migrateCodexHandoffToFreshTopic(
+  source: DaemonSession,
+  summary: string,
+): Promise<boolean> {
+  if (!source.pendingCodexFreshHandoff) return false;
+  source.pendingCodexFreshHandoff = undefined;
+
+  const trimmed = summary.trim();
+  if (!trimmed) return false;
+  const locale = localeForBot(source.larkAppId);
+  try {
+    const anchor = await sendMessage(
+      source.larkAppId,
+      source.chatId,
+      buildFreshCodexHandoffTopic(trimmed, locale),
+    );
+    const bot = getBot(source.larkAppId);
+    const promptText = buildFreshCodexHandoffPrompt(trimmed);
+    const session = sessionStore.createSession(
+      source.chatId,
+      anchor,
+      source.session.title || 'Handoff Summary',
+      source.chatType,
+    );
+    const now = Date.now();
+    session.larkAppId = source.larkAppId;
+    session.scope = 'thread';
+    session.ownerOpenId = source.session.ownerOpenId;
+    session.ownerUnionId = source.session.ownerUnionId;
+    session.creatorOpenId = source.session.creatorOpenId;
+    session.lastCallerOpenId = source.session.lastCallerOpenId;
+    session.workingDir = source.workingDir ?? source.session.workingDir;
+    // Freeze the same Codex launcher/model, but never copy the native thread
+    // id. cliSessionId therefore starts empty and Codex receives no `resume`.
+    session.cliId = 'codex';
+    session.cliPathOverride = source.session.cliPathOverride;
+    session.wrapperCli = source.session.wrapperCli;
+    session.model = source.session.model;
+    session.agentFrozen = true;
+    session.lastMessageAt = new Date(now).toISOString();
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const fresh: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: source.larkAppId,
+      chatId: source.chatId,
+      chatType: source.chatType,
+      scope: 'thread',
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: source.cliVersion,
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: session.workingDir,
+      ownerOpenId: session.ownerOpenId,
+      currentTurnTitle: session.title,
+    };
+    activeSessions.set(sessionKey(anchor, source.larkAppId), fresh);
+    ensureSessionWhiteboard(fresh);
+    const input = buildNewTopicCliInput(
+      promptText,
+      session.sessionId,
+      'codex',
+      session.cliPathOverride,
+      undefined,
+      undefined,
+      await getAvailableBots(source.larkAppId, source.chatId),
+      undefined,
+      { name: bot.botName, openId: bot.botOpenId },
+      locale,
+      undefined,
+      { larkAppId: source.larkAppId, chatId: source.chatId, whiteboardId: session.whiteboardId },
+    );
+    rememberLastCliInput(fresh, promptText, input);
+    forkWorker(fresh, input, { resume: false });
+
+    const closeResult = await closeSessionHelper(source.session.sessionId);
+    if (closeResult.alreadyClosed) {
+      // Unit-level/direct callers can invoke this before the daemon registers
+      // the activeSessions map with worker-pool. Keep the source lifecycle
+      // correct even then; production normally closes through the helper.
+      killWorker(source);
+      activeSessions.delete(activeSessionKey(source));
+      sessionStore.closeSession(source.session.sessionId);
+    }
+    logger.info(
+      `[${tag(source)}] Codex /compact handoff → fresh topic ${anchor.substring(0, 12)} `
+      + `(new session=${session.sessionId.substring(0, 8)}, resume=false)`,
+    );
+    return true;
+  } catch (err) {
+    // The summary is still useful. Return false so worker-pool delivers it in
+    // the source topic through its ordinary retry path instead of losing it.
+    logger.error(`[${tag(source)}] Codex fresh handoff failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
 }
 
 /**
@@ -14494,6 +14604,31 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
         // shows up as a fresh streaming card instead of silently PATCH-ing the
         // previous turn's card.
+        const effectiveCliId = ds.session.cliId ?? getBot(larkAppId).config.cliId;
+        if (shouldFreshHandoffCodex(effectiveCliId, commandContent)) {
+          if (ds.pendingCodexFreshHandoff) {
+            await sessionReply(
+              anchor,
+              localeForBot(larkAppId) === 'en'
+                ? 'A Codex handoff is already in progress.'
+                : 'Codex 上下文交接正在进行中，请稍候。',
+              'text',
+              larkAppId,
+            );
+            return;
+          }
+          ds.pendingCodexFreshHandoff = { requestedAt: Date.now() };
+          beginNewTurn(ds, 'Codex Handoff Summary');
+          ds.worker.send({
+            type: 'raw_input',
+            content: commandContent,
+            followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
+            followUpAfterIdle: true,
+          } as DaemonToWorker);
+          markSessionActivity(ds);
+          logger.info(`[${anchor.substring(0, 12)}] Codex /compact → fresh-session handoff armed`);
+          return;
+        }
         beginNewTurn(ds, commandContent);
         ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
         markSessionActivity(ds);
@@ -15685,6 +15820,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // matching the dashboard-driven close.
       void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
+    },
+    onFinalOutput(ds, output) {
+      if (!ds.pendingCodexFreshHandoff) return false;
+      return migrateCodexHandoffToFreshTopic(ds, output.content);
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onTurnTerminal(ds, terminal, context) {

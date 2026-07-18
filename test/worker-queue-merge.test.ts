@@ -88,6 +88,7 @@ describe('durable turn queue boundary', () => {
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'im' })).toBe(true);
     expect(pendingInputAllowsTypeAhead(true, true, { content: 'im' })).toBe(false);
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'delivery', dispatchAttempt: 1 })).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'handoff', requireIdle: true })).toBe(false);
   });
 
   it('forces separate idle edges on both sides of a durable attempt', () => {

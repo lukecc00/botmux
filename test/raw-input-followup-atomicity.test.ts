@@ -76,6 +76,7 @@ describe('worker raw_input delivery', () => {
   it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
     expect(region).toContain('sendToPty(msg.followUpContent, undefined, {');
     expect(region).toContain('codexAppInput: msg.followUpCodexAppInput');
+    expect(region).toContain('requireIdle: msg.followUpAfterIdle');
   });
 
   it('holds ordinary prompt flushes only for the text-to-Enter critical window', () => {

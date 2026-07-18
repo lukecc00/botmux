@@ -81,6 +81,12 @@ export interface DaemonSession {
    *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
    *  daemon restart. */
   pendingRawInput?: string;
+  /** Codex-only /compact migration. While set, the next transcript-backed
+   * final output is the requested Handoff Summary and is consumed by the
+   * daemon to seed a brand-new Lark topic + Codex session. In-memory only: a
+   * daemon restart must never replay a migration or resume the exhausted
+   * native Codex thread by accident. */
+  pendingCodexFreshHandoff?: { requestedAt: number };
   /** Wrapped prompt for messages buffered while a pendingRawInput session
    *  waited for repo selection (pendingFollowUps / attachments). Built at the
    *  fork site (where prompt-building context lives) and delivered right

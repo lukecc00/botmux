@@ -6,6 +6,10 @@ export interface PendingCliInput {
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** Administrative raw command followed by a real model turn (Codex
+   * /compact handoff). This turn must wait for a genuine prompt instead of
+   * steering into the still-running command. */
+  requireIdle?: boolean;
 }
 
 export function mergeQueuedCliInput(
@@ -38,7 +42,8 @@ export function pendingInputAllowsTypeAhead(
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
     && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin;
+    && !next?.vcMeetingImTurnOrigin
+    && !next?.requireIdle;
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL

@@ -139,6 +139,13 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Give the daemon first refusal over a transcript-backed final. Used by
+   * Codex /compact handoff to consume the summary into a new topic instead of
+   * publishing it as an ordinary reply in the exhausted source topic. */
+  onFinalOutput?: (
+    ds: DaemonSession,
+    output: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  ) => boolean | Promise<boolean>;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -3283,6 +3290,17 @@ function setupWorkerHandlers(
         if (ds.lastBridgeEmittedUuid === dedupeKey) {
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
+        }
+        if (cb.onFinalOutput) {
+          try {
+            if (await cb.onFinalOutput(ds, msg)) {
+              ds.lastBridgeEmittedUuid = dedupeKey;
+              logger.info(`[${t}] final_output consumed by daemon handoff (turn ${msg.turnId.substring(0, 8)})`);
+              break;
+            }
+          } catch (err) {
+            logger.error(`[${t}] daemon final-output interceptor failed; falling back to ordinary delivery: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on

@@ -238,6 +238,30 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('lets a daemon handoff consume final_output without posting it normally', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onFinalOutput = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onFinalOutput,
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(onFinalOutput).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
   it('drops final_output whose worker sessionId does not match the daemon session', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
