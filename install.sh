@@ -60,7 +60,13 @@ PNPM="npx --yes pnpm@9.5.0"
 say "Installing locked dependencies"
 (cd "$SOURCE_DIR" && $PNPM install --frozen-lockfile)
 say "Building botmux"
-(cd "$SOURCE_DIR" && $PNPM build)
+(cd "$SOURCE_DIR" \
+  && node scripts/clean-dist.mjs \
+  && ./node_modules/.bin/tsc \
+  && cp src/setup/lark-scopes.json dist/setup/ \
+  && node scripts/build-dashboard.mjs \
+  && chmod +x dist/cli.js \
+  && node scripts/audit-dist.mjs)
 [ -x "$SOURCE_DIR/dist/cli.js" ] || fail "build completed without dist/cli.js"
 
 # Persist the source identity beside the built release. Future CLI, Dashboard,

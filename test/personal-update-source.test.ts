@@ -15,6 +15,9 @@ describe('personal distribution source invariants', () => {
     expect(installer).toContain('--filter=blob:none');
     expect(installer).toContain('attempt $attempt/3');
     expect(installer).toContain('failed to download $REPO@$REF after 3 attempts');
+    expect(installer).toContain('./node_modules/.bin/tsc');
+    expect(installer).toContain('node scripts/build-dashboard.mjs');
+    expect(installer).not.toContain('$PNPM build');
   });
 
   it('publishes GitHub releases only and never the official npm package', () => {
