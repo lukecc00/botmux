@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   detectGlobalInstallManager,
@@ -8,6 +11,36 @@ import {
 } from '../src/utils/global-install.js';
 
 describe('resolveGlobalInstallPlan', () => {
+  it('updates an installer-managed source release from the pinned personal repo and prefix', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-managed-source-'));
+    try {
+      writeFileSync(join(root, '.botmux-install.json'), JSON.stringify({
+        schemaVersion: 1, method: 'github-source', repo: 'lukecc00/botmux', ref: 'p/ai_open',
+        revision: 'b'.repeat(40), version: '3.1.0', prefix: '/opt/personal botmux',
+        installedAt: '2026-07-19T00:00:00.000Z',
+      }));
+      expect(resolveGlobalInstallPlan(root, 'linux')).toEqual({
+        manager: 'github-source', command: 'sh', args: ['/opt/personal botmux/share/botmux/current/install.sh'],
+        env: {
+          BOTMUX_INSTALL_PREFIX: '/opt/personal botmux',
+          BOTMUX_INSTALL_REPO: 'lukecc00/botmux',
+          BOTMUX_INSTALL_REF: 'p/ai_open',
+        },
+        activePackageRoot: '/opt/personal botmux/share/botmux/current',
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('does not trust source metadata that points at another repository', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-managed-source-bad-'));
+    try {
+      writeFileSync(join(root, '.botmux-install.json'), JSON.stringify({
+        schemaVersion: 1, method: 'github-source', repo: 'deepcoldy/botmux', ref: 'master',
+        revision: 'b'.repeat(40), version: '3.1.0', prefix: '/opt/botmux', installedAt: 'x',
+      }));
+      expect(() => resolveGlobalInstallPlan(root, 'linux')).toThrow(UnsupportedGlobalInstallError);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('targets the exact POSIX npm prefix', () => {
     const plan = resolveGlobalInstallPlan('/home/bot/.local/lib/node_modules/botmux', 'linux');
     expect(plan).toEqual({

@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-REPO="${BOTMUX_INSTALL_REPO:-lukecc00/botmux}"
-REF="${BOTMUX_INSTALL_REF:-p/ai_open}"
+REPO="lukecc00/botmux"
+REF="p/ai_open"
 PREFIX="${BOTMUX_INSTALL_PREFIX:-$HOME/.local}"
 APP_HOME="$PREFIX/share/botmux"
 BIN_DIR="$PREFIX/bin"
@@ -38,6 +38,9 @@ say "Downloading latest $REPO@$REF"
 # Git reports counting, compressing, receiving, and resolving percentages even
 # when GitHub's archive endpoint does not provide a Content-Length header.
 git clone --depth 1 --single-branch --branch "$REF" --progress "$URL" "$SOURCE_DIR"
+REVISION="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+SHORT_REVISION="$(printf '%.8s' "$REVISION")"
+VERSION="$(node -p "require(process.argv[1]).version" "$SOURCE_DIR/dev-version.json")"
 rm -rf "$SOURCE_DIR/.git"
 [ -f "$SOURCE_DIR/package.json" ] || fail "downloaded archive is not a botmux source tree"
 
@@ -50,6 +53,22 @@ say "Building botmux"
 (cd "$SOURCE_DIR" && $PNPM build)
 [ -x "$SOURCE_DIR/dist/cli.js" ] || fail "build completed without dist/cli.js"
 
+# Persist the source identity beside the built release. Future CLI, Dashboard,
+# and scheduled updates read this file and return to the same personal repo.
+BOTMUX_META_REPO="$REPO" BOTMUX_META_REF="$REF" \
+BOTMUX_META_REVISION="$REVISION" BOTMUX_META_VERSION="$VERSION" \
+BOTMUX_META_PREFIX="$PREFIX" node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const info = {
+    schemaVersion: 1, method: "github-source",
+    repo: process.env.BOTMUX_META_REPO, ref: process.env.BOTMUX_META_REF,
+    revision: process.env.BOTMUX_META_REVISION, version: process.env.BOTMUX_META_VERSION,
+    prefix: path.resolve(process.env.BOTMUX_META_PREFIX), installedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(process.argv[1], ".botmux-install.json"), JSON.stringify(info, null, 2) + "\n");
+' "$SOURCE_DIR"
+
 mkdir -p "$APP_HOME/releases" "$BIN_DIR"
 mv "$SOURCE_DIR" "$RELEASE_DIR"
 ln -sfn "$RELEASE_DIR" "$APP_HOME/current.new"
@@ -57,7 +76,7 @@ mv -f "$APP_HOME/current.new" "$APP_HOME/current"
 ln -sfn "$APP_HOME/current/dist/cli.js" "$BIN_DIR/botmux.new"
 mv -f "$BIN_DIR/botmux.new" "$BIN_DIR/botmux"
 
-say "Installed $("$BIN_DIR/botmux" --version 2>/dev/null || printf '%s' "$REPO@$REF")"
+say "Installed v$VERSION ($REPO@$REF, $SHORT_REVISION)"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) say "Add to your shell profile: export PATH=\"$BIN_DIR:\$PATH\"" ;;

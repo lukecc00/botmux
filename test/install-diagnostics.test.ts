@@ -35,6 +35,7 @@ function deps(over: Partial<InstallProbeDeps> = {}): InstallProbeDeps {
       [BUN_BIN]: BUN_CLI,
     })[p] ?? p,
     isSourceCheckout: (root) => root === '/root/iserver/botmux',
+    isManagedSource: () => false,
     ...over,
   };
 }
@@ -60,6 +61,14 @@ describe('analyzeInstalls', () => {
     const out = analyzeInstalls([SHIM], deps());
     expect(out.multiple).toBe(false);
     expect(out.entries).toEqual([{ binPath: SHIM, root: '/root/iserver/botmux', kind: 'source-checkout' }]);
+  });
+
+  it('classifies an installer-managed personal release separately from a checkout', () => {
+    const out = analyzeInstalls([SHIM], deps({
+      isSourceCheckout: () => false,
+      isManagedSource: (root) => root === '/root/iserver/botmux',
+    }));
+    expect(out.entries[0].kind).toBe('github-source');
   });
 
   it('shim + npm → multiple, both kinds surfaced', () => {

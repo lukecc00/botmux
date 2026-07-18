@@ -1,21 +1,21 @@
 /**
- * Detect the package manager that owns the running global botmux install and
- * build an update command that targets that same install.
+ * Detect the managed personal-source or package-manager install that owns the
+ * running botmux and build an update command targeting that exact install.
  *
  * Detection is deliberately conservative: writing with the wrong package
  * manager can create a second, inactive botmux copy. npm, pnpm, and Bun are
  * supported; known Yarn layouts are identified for diagnostics but rejected
  * until their global-dir/bin-dir semantics are handled explicitly.
  */
-import { posix, win32 } from 'node:path';
-import { botmuxInstallRoot } from './install-info.js';
+import { join, posix, win32 } from 'node:path';
+import { botmuxInstallRoot, managedSourceInstallAt, PERSONAL_UPDATE_REF, PERSONAL_UPDATE_REPO } from './install-info.js';
 
-export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun';
-export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'unknown';
+export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun' | 'github-source';
+export type DetectedInstallManager = Exclude<GlobalInstallManager, 'github-source'> | 'yarn' | 'unknown';
 
 export interface GlobalInstallPlan {
   manager: GlobalInstallManager;
-  command: GlobalInstallManager;
+  command: string;
   args: string[];
   /** Package-manager-specific environment needed to keep the update in the
    *  install location that owns the running botmux process. */
@@ -44,6 +44,7 @@ export function detectGlobalInstallManager(
   packageRoot: string,
   platform: NodeJS.Platform = process.platform,
 ): DetectedInstallManager {
+  if (managedSourceInstallAt(packageRoot)) return 'unknown';
   const root = normalized(packageRoot).toLowerCase();
   if (!root.endsWith('/node_modules/botmux')) return 'unknown';
 
@@ -75,6 +76,20 @@ export function resolveGlobalInstallPlan(
   platform: NodeJS.Platform = process.platform,
   spec = 'botmux@latest',
 ): GlobalInstallPlan {
+  const managed = managedSourceInstallAt(packageRoot);
+  if (managed) {
+    if (platform === 'win32') throw new UnsupportedGlobalInstallError('unknown', packageRoot);
+    const stableRoot = join(managed.prefix, 'share', 'botmux', 'current');
+    return {
+      manager: 'github-source', command: 'sh', args: [join(stableRoot, 'install.sh')],
+      env: {
+        BOTMUX_INSTALL_PREFIX: managed.prefix,
+        BOTMUX_INSTALL_REPO: PERSONAL_UPDATE_REPO,
+        BOTMUX_INSTALL_REF: PERSONAL_UPDATE_REF,
+      },
+      activePackageRoot: stableRoot,
+    };
+  }
   const manager = detectGlobalInstallManager(packageRoot, platform);
   const path = platform === 'win32' ? win32 : posix;
 

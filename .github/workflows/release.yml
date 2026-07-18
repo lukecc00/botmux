@@ -1,4 +1,4 @@
-name: Release
+name: Personal Release
 
 on:
   push:
@@ -14,135 +14,28 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - run: npm install -g pnpm
+      - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
-
-      - name: Sync version from git tag to package.json
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
-
-      - name: Resolve npm dist-tag + prerelease flag
-        id: dist_tag
+      - name: Verify tag matches personal version manifest
         run: |
-          # 含 prerelease 后缀（v1.2.3-canary.0 / -beta.x / -rc.x）发到对应 dist-tag，
-          # 不覆盖 latest；纯净 vX.Y.Z 仍走默认 latest。
-          VERSION="${GITHUB_REF_NAME#v}"
-          if   [[ "$VERSION" == *"-canary"* ]]; then NPM_TAG=canary;  PRERELEASE=true
-          elif [[ "$VERSION" == *"-beta"*   ]]; then NPM_TAG=beta;    PRERELEASE=true
-          elif [[ "$VERSION" == *"-rc"*     ]]; then NPM_TAG=rc;      PRERELEASE=true
-          elif [[ "$VERSION" == *"-"*       ]]; then NPM_TAG=next;    PRERELEASE=true
-          else                                       NPM_TAG=latest;  PRERELEASE=false
-          fi
-          echo "tag=$NPM_TAG"           >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
-
-      - name: Guard against downgrading npm latest
-        # 防止把比 npm 当前 latest 还小的版本号发到 latest dist-tag（曾发生
-        # `git tag | tail` 拿到字典序末尾 v2.9.x 被当成最新版的事故，
-        # CI 直接把 npm latest 从 2.27.4 覆盖到 2.9.x，导致所有
-        # `npm i botmux` 用户被回退）。只在 dist-tag=latest 时校验；
-        # canary/beta/rc/next 走旁路 dist-tag 不影响 latest。
-        if: steps.dist_tag.outputs.tag == 'latest'
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          CURRENT_LATEST=$(npm view botmux@latest version 2>/dev/null || echo "0.0.0")
-          echo "npm latest currently: $CURRENT_LATEST"
-          echo "this tag             : $VERSION"
-          # semver compare via Node's built-in semver in npm
-          if ! node -e "
-            const a='$VERSION', b='$CURRENT_LATEST';
-            const parse = s => s.split('.').map(Number);
-            const [a1,a2,a3] = parse(a), [b1,b2,b3] = parse(b);
-            const cmp = a1!==b1 ? a1-b1 : a2!==b2 ? a2-b2 : a3-b3;
-            if (cmp <= 0) { console.error('REFUSING to publish ' + a + ' as latest (current latest is ' + b + ', would downgrade users)'); process.exit(1); }
-            console.log('OK: ' + a + ' > ' + b);
-          "; then
+          EXPECTED="v$(node -p "require('./dev-version.json').version")"
+          test "$GITHUB_REF_NAME" = "$EXPECTED" || {
+            echo "tag $GITHUB_REF_NAME does not match dev-version.json ($EXPECTED)" >&2
             exit 1
-          fi
-
-      - name: Guard — stable release must contain the latest master
-        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
-        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
-        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
-        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
-        # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
-        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
-        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
-        if: steps.dist_tag.outputs.tag == 'latest'
-        run: |
-          git fetch origin master --quiet
-          if ! git merge-base --is-ancestor origin/master HEAD; then
-            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
-            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
-            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
-            exit 1
-          fi
-          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
-
+          }
       - run: pnpm build
-
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist_tag.outputs.tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
-
-      - name: Generate changelog
-        id: changelog
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read release notes from annotated tag
+        id: notes
         run: |
-          # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
-          git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
-          # 上一个 tag: stable 只跟 stable 比 (词法排序会把 canary 排到 stable 前面,
-          # 不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X 而不是 v2.24.3)
-          if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
-            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | head -1)
-          else
-            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
-          fi
-          TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
-
-          # 区间内每个非 merge commit → 反查所属 PR（gh api，有界：约等于区间 commit 数，
-          # 不翻全仓、不触发 git-cliff 那种二级限流 401）。squash 与 merge-commit 两种合并
-          # 都覆盖：squash 时区间含该 commit；merge-commit（"Merge pull request #N"）时区间
-          # 含其子 commit，子 commit 的 /pulls 仍指向同一 PR——靠 PR number 在 node 侧去重。
-          # （旧逻辑只 grep "(#N)" squash subject，merge-commit 的 PR 整条隐身，是真 bug。）
-          # 无关联 PR 的直推 commit 回退用自身 subject。结果 TSV 交给 changelog-sections.mjs
-          # 按约定式 `type(scope):` 前缀分桶成 ✨新功能/🐛修复/… 段落 + 去重的贡献者名单。
-          # 单次遍历同时兼顾 PR 列表与致谢，gh 调用量与旧版致谢循环持平。
-          RAW=$(mktemp)
-          for sha in $(git rev-list --no-merges --reverse "${PREV_TAG}..${GITHUB_REF_NAME}"); do
-            PULLS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
-              --jq '.[] | [.number, .title, .user.login] | @tsv' 2>/dev/null || true)
-            if [ -n "$PULLS" ]; then
-              printf '%s\n' "$PULLS" | while IFS=$'\t' read -r num title login; do
-                printf 'pr\t%s\t%s\t%s\n' "$num" "$title" "$login"
-              done >> "$RAW"
-            else
-              printf 'commit\t%s\t%s\t\n' "${sha:0:7}" "$(git log -1 --pretty=%s "$sha")" >> "$RAW"
-            fi
-          done
-          SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
-
           {
-            echo 'body<<CHANGELOG_EOF'
-            # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
-            # 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
-            if [ -n "$TAG_MSG" ]; then echo "$TAG_MSG"; echo ""; fi
-            if [ -n "$SECTIONS" ]; then echo "---"; echo ""; echo "$SECTIONS"; fi
-            echo ""
-            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
-            echo 'CHANGELOG_EOF'
+            echo 'body<<RELEASE_EOF'
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME"
+            echo 'RELEASE_EOF'
           } >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+          body: ${{ steps.notes.outputs.body }}

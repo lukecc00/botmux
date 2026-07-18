@@ -15,7 +15,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { isLocalDevInstallAt, botmuxVersion, botmuxInstallRoot } from './install-info.js';
+import { isLocalDevInstallAt, managedSourceInstallAt, botmuxVersion, botmuxInstallRoot } from './install-info.js';
 import { detectGlobalInstallManager } from './global-install.js';
 import { parseVersion } from '../core/update-check.js';
 
@@ -68,6 +68,7 @@ export type InstallKind =
   | 'pnpm-global'
   | 'yarn-global'
   | 'bun-global'
+  | 'github-source'
   | 'source-checkout'
   | 'unknown';
 
@@ -93,6 +94,7 @@ export interface InstallProbeDeps {
   realpath: (path: string) => string | null;
   /** Does `root` look like a source checkout (has .git or src)? */
   isSourceCheckout: (root: string) => boolean;
+  isManagedSource: (root: string) => boolean;
 }
 
 /** A shim under 4 KiB is a tiny `exec node "<cli.js>"` wrapper; the real cli.js
@@ -127,6 +129,7 @@ function resolveBin(binPath: string, deps: InstallProbeDeps): { cliJs: string; r
 }
 
 function classify(root: string, deps: InstallProbeDeps): InstallKind {
+  if (deps.isManagedSource(root)) return 'github-source';
   if (deps.isSourceCheckout(root)) return 'source-checkout';
   const manager = detectGlobalInstallManager(root);
   if (manager !== 'unknown') return `${manager}-global`;
@@ -169,6 +172,7 @@ const PROD_PROBE_DEPS: InstallProbeDeps = {
     try { return realpathSync(p); } catch { return null; }
   },
   isSourceCheckout: (root) => isLocalDevInstallAt(root),
+  isManagedSource: (root) => managedSourceInstallAt(root) !== null,
 };
 
 /** List every `botmux` on PATH (best-effort; [] when the lookup tool fails). */

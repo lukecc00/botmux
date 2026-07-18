@@ -113,9 +113,14 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('fetchLatestVersion', () => {
-  it('returns the registry version', async () => {
-    const v = await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: '2.85.1' }) });
+  it('returns the personal branch manifest version', async () => {
+    let requested = '';
+    const v = await fetchLatestVersion({ fetchImpl: async (input) => {
+      requested = String(input);
+      return jsonResponse(200, { version: '2.85.1' });
+    } });
     expect(v).toBe('2.85.1');
+    expect(requested).toBe('https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json');
   });
   it('null on non-200 / malformed / unparseable / throw', async () => {
     expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
@@ -128,9 +133,14 @@ describe('fetchLatestVersion', () => {
 describe('fetchReleasesSince', () => {
   it('maps + filters the releases array (ok:true)', async () => {
     const releases = [{ tag_name: 'v2.85.1', body: 'n', html_url: 'u', published_at: 'x' }];
-    const out = await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, releases) });
+    let requested = '';
+    const out = await fetchReleasesSince('2.85.0', { fetchImpl: async (input) => {
+      requested = String(input);
+      return jsonResponse(200, releases);
+    } });
     expect(out.ok).toBe(true);
     expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
+    expect(requested).toContain('api.github.com/repos/lukecc00/botmux/releases');
   });
   it('ok:true with an empty list when already latest (genuinely empty)', async () => {
     const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });

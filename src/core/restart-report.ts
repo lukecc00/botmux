@@ -12,7 +12,7 @@ import { countActiveSessionsOnDisk } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
-export const GITHUB_REPO = 'deepcoldy/botmux';
+export const GITHUB_REPO = 'lukecc00/botmux';
 
 export interface RestartReportInput {
   kind: RestartKind;

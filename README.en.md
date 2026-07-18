@@ -84,13 +84,13 @@ curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
   https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
   export PATH="$HOME/.local/bin:$PATH" && botmux setup
 
-# Or install the latest npm release
+# Or install the upstream official npm release (outside this personal update channel)
 npm install -g botmux
 # or: pnpm add -g botmux
 # or: bun add -g botmux
 ```
 
-The one-line setup command downloads the latest source from GitHub, builds it from the lockfile into `~/.local/share/botmux`, links the `botmux` command into `~/.local/bin`, and immediately starts `botmux setup` for QR login, app creation, and bot publishing. For later updates, use the update command below to atomically switch versions without entering setup again. Override the branch, repository, or prefix with `BOTMUX_INSTALL_REF`, `BOTMUX_INSTALL_REPO`, or `BOTMUX_INSTALL_PREFIX`.
+The one-line setup command always downloads `lukecc00/botmux` branch `p/ai_open`, builds it into `~/.local/share/botmux`, and records the repository, branch, commit, and version. Future `botmux update`, Dashboard updates, and scheduled updates return only to this personal repository and never switch to the official npm package. `BOTMUX_INSTALL_PREFIX` may override the install prefix.
 
 Verify the installed version:
 
@@ -107,15 +107,15 @@ source ~/.bashrc
 
 #### Update to the latest `p/ai_open` version
 
-Rerun the installer to download the latest source, rebuild from the lockfile, and atomically switch versions:
+Use the built-in updater; it reuses the personal repository and branch pinned by the installer:
 
 ```bash
-curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
-  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+botmux update
+botmux restart
 botmux --version
 ```
 
-Manual and scheduled updates keep using the npm, pnpm, or Bun global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
+Rerunning the installer remains supported. Updates build in a new release directory and atomically switch `current`, leaving the active release intact if anything fails.
 
 > Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` / `grok` / `kiro-cli` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 

@@ -6,8 +6,8 @@
  * At the scheduled local time (Asia/Shanghai, once/day) it:
  *  - checks the cross-daemon busy gate (anyDaemonBusy) — a session mid-CLI-turn
  *    anywhere defers the run to the next day (no retry);
- *  - auto-update (npm/pnpm/Bun global): update the package with its owning package
- *    manager, then restart
+ *  - auto-update: update a personal GitHub source release from its pinned
+ *    repo/ref, or a package install with its owning package manager, then restart
  *    to apply iff the version actually changed;
  *  - auto-restart: just restart.
  * Before triggering a restart it drops a restart-intent breadcrumb so the fresh
@@ -53,7 +53,7 @@ export interface MaintenanceDeps {
   isLocalDev: () => boolean;
   /** Current on-disk botmux version (read fresh — changes after runUpdate). */
   currentVersion: () => string;
-  /** Updates the owning npm/pnpm/Bun global install (download/install only). */
+  /** Updates the owning managed-source or package-manager install. */
   runUpdate: () => void;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */

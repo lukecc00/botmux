@@ -1,5 +1,5 @@
 /**
- * Update check: query the published "latest" botmux version and the GitHub
+ * Update check: query the personal branch version manifest and GitHub
  * release notes accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
@@ -94,7 +94,7 @@ function vtag(v: string): string {
   return v.startsWith('v') ? v : `v${v}`;
 }
 
-const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
+const PERSONAL_VERSION_URL = 'https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json';
 
 export interface FetchOpts {
   timeoutMs?: number;
@@ -102,14 +102,14 @@ export interface FetchOpts {
 }
 
 /**
- * The npm registry's `latest` dist-tag version — the authoritative target for
- * both npm and pnpm updates. null on any failure (offline, non-200,
+ * The personal `p/ai_open` version manifest — the authoritative target for
+ * managed-source updates. null on any failure (offline, non-200,
  * malformed body, or a version string we can't parse).
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(REGISTRY_LATEST_URL, {
+    const res = await fetchImpl(PERSONAL_VERSION_URL, {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });

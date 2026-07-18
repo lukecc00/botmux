@@ -10,7 +10,22 @@ import {
   botmuxVersion,
   botmuxVersionAt,
   botmuxCliEntryAt,
+  managedSourceInstallAt,
 } from '../src/utils/install-info.js';
+
+function writeManaged(root: string, overrides: Record<string, unknown> = {}): void {
+  writeFileSync(join(root, '.botmux-install.json'), JSON.stringify({
+    schemaVersion: 1,
+    method: 'github-source',
+    repo: 'lukecc00/botmux',
+    ref: 'p/ai_open',
+    revision: 'a'.repeat(40),
+    version: '3.1.0',
+    prefix: '/home/bot/.local',
+    installedAt: '2026-07-19T00:00:00.000Z',
+    ...overrides,
+  }));
+}
 
 describe('isLocalDevInstallAt', () => {
   let dir: string;
@@ -34,6 +49,20 @@ describe('isLocalDevInstallAt', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'botmux' }));
     expect(isLocalDevInstallAt(dir)).toBe(false);
   });
+  it('false for an installer-managed source release even though src/ is present', () => {
+    mkdirSync(join(dir, 'src'));
+    writeManaged(dir);
+    expect(isLocalDevInstallAt(dir)).toBe(false);
+    expect(managedSourceInstallAt(dir)).toMatchObject({ repo: 'lukecc00/botmux', ref: 'p/ai_open' });
+  });
+  it('fails closed on another repository or malformed revision', () => {
+    mkdirSync(join(dir, 'src'));
+    writeManaged(dir, { repo: 'deepcoldy/botmux' });
+    expect(managedSourceInstallAt(dir)).toBeNull();
+    expect(isLocalDevInstallAt(dir)).toBe(true);
+    writeManaged(dir, { revision: 'short' });
+    expect(managedSourceInstallAt(dir)).toBeNull();
+  });
 });
 
 describe('isLocalDevInstall (runtime)', () => {
@@ -48,7 +77,10 @@ describe('botmuxVersion', () => {
   it('reads the version from the package root package.json', () => {
     // resolve repo root from this test file: test/ → repo root
     const root = fileURLToPath(new URL('..', import.meta.url));
-    const expected = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    const expected = packageVersion === '0.0.0'
+      ? JSON.parse(readFileSync(join(root, 'dev-version.json'), 'utf-8')).version
+      : packageVersion;
     expect(botmuxVersion()).toBe(expected);
   });
 
@@ -58,6 +90,16 @@ describe('botmuxVersion', () => {
       writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '9.8.7' }));
       expect(botmuxVersionAt(root)).toBe('9.8.7');
       expect(botmuxCliEntryAt(root)).toBe(join(root, 'dist', 'cli.js'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('reads the personal source release version when package.json is the source placeholder', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-source-version-'));
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '0.0.0' }));
+      writeManaged(root, { version: '3.1.0' });
+      expect(botmuxVersionAt(root)).toBe('3.1.0');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

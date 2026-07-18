@@ -228,13 +228,13 @@ curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
   https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh && \
   export PATH="$HOME/.local/bin:$PATH" && botmux setup
 
-# 或从 npm 安装正式发布版本
+# 或安装上游官方 npm 版本（不属于本个人仓库更新链）
 npm install -g botmux
 # 或：pnpm add -g botmux
 # 或：bun add -g botmux
 ```
 
-一句话接入命令会从 GitHub 下载当前分支的最新源码、按锁文件构建到 `~/.local/share/botmux`，将 `botmux` 命令链接到 `~/.local/bin`，然后立即启动 `botmux setup` 完成飞书扫码、创建应用和发布机器人。以后更新请使用下方更新命令，即可原子切换到最新版本而不重复进入 setup。可通过 `BOTMUX_INSTALL_REF`、`BOTMUX_INSTALL_REPO` 和 `BOTMUX_INSTALL_PREFIX` 覆盖分支、仓库及安装目录。
+一句话接入命令固定从 `lukecc00/botmux` 的 `p/ai_open` 分支下载最新源码、按锁文件构建到 `~/.local/share/botmux`，并记录仓库、分支、commit 和版本。以后 `botmux update`、Dashboard 手动更新及定时自动更新都只回到这个个人仓库，不会切换到官方 npm 包。`BOTMUX_INSTALL_PREFIX` 可覆盖安装目录。
 
 安装后可检查版本：
 
@@ -251,15 +251,15 @@ source ~/.bashrc
 
 #### 更新到 `p/ai_open` 最新版本
 
-重新运行安装命令即可下载最新代码、按锁文件重新构建并原子切换版本：
+可直接使用内置更新命令；它会复用安装时固定的个人仓库和分支：
 
 ```bash
-curl -fsSL --connect-timeout 5 --max-time 60 --retry 5 --retry-delay 1 \
-  https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh
+botmux update
+botmux restart
 botmux --version
 ```
 
-botmux 的手动/定时更新会识别当前全局安装归属，并继续使用同一个 npm、pnpm 或 Bun 安装位置；无法安全识别的安装方式不会自动回退到 npm。
+重新执行安装命令也仍然可用。更新会先在新 release 目录完成依赖安装和构建，再原子切换 `current`；失败不会破坏当前版本。
 
 > 要求 **Node.js ≥ 22**，且本地已装好并登录至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `grok` / `kiro-cli` 等在 PATH 中）。推荐顺手装 **tmux**（装了自动启用会话常驻）。
 

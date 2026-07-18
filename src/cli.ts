@@ -88,6 +88,7 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
+import { botmuxVersion } from './utils/install-info.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
 import {
   postWorkflowDaemonMutation,
@@ -4537,7 +4538,7 @@ botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 
 提示: 多数子命令支持 \`botmux <子命令> --help\` 查看完整参数。
 
 配置目录: ~/.botmux/
-文档: https://github.com/deepcoldy/botmux
+项目与更新源: https://github.com/lukecc00/botmux
 `);
 }
 
@@ -8119,13 +8120,7 @@ async function cmdPresetExport(rest: string[]): Promise<void> {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 function getVersion(): string {
-  const pkgPath = join(PKG_ROOT, 'package.json');
-  try {
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg.version || 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  return botmuxVersion();
 }
 
 const command = process.argv[2];

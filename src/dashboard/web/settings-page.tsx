@@ -53,7 +53,7 @@ const COMMON_TIMEZONES = [
   'America/Los_Angeles', 'America/New_York', 'America/Sao_Paulo', 'Australia/Sydney',
 ];
 
-type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
+type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'github-source' | 'source-checkout' | 'unknown';
 interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
 interface CliRuntimeUpdateStatus {
@@ -74,7 +74,7 @@ interface UpdateStatus {
   cliUpdates: CliRuntimeUpdateStatus[];
   localDevInstall: boolean;
   updateSupported: boolean;
-  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
+  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'github-source' | 'unknown';
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
@@ -151,6 +151,7 @@ function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   if (kind === 'pnpm-global') return tr('update.kindPnpm');
   if (kind === 'yarn-global') return tr('update.kindYarn');
   if (kind === 'bun-global') return tr('update.kindBun');
+  if (kind === 'github-source') return tr('update.kindGithubSource');
   if (kind === 'source-checkout') return tr('update.kindSource');
   return tr('update.kindUnknown');
 }

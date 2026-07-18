@@ -9,12 +9,54 @@
  * reliable "running from source" signal.
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** Pure check: is `rootDir` a source working copy rather than an npm install? */
+export const PERSONAL_UPDATE_REPO = 'lukecc00/botmux';
+export const PERSONAL_UPDATE_REF = 'p/ai_open';
+export const MANAGED_SOURCE_INSTALL_FILE = '.botmux-install.json';
+
+export interface ManagedSourceInstallInfo {
+  schemaVersion: 1;
+  method: 'github-source';
+  repo: typeof PERSONAL_UPDATE_REPO;
+  ref: typeof PERSONAL_UPDATE_REF;
+  revision: string;
+  version: string;
+  prefix: string;
+  installedAt: string;
+}
+
+function validVersion(value: unknown): value is string {
+  return typeof value === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value);
+}
+
+/** Exact repo/ref validation is a supply-chain boundary: this personal build
+ * must never silently update from the official npm package or another fork. */
+export function managedSourceInstallAt(rootDir: string): ManagedSourceInstallInfo | null {
+  try {
+    const value = JSON.parse(readFileSync(join(rootDir, MANAGED_SOURCE_INSTALL_FILE), 'utf-8')) as Record<string, unknown>;
+    if (value.schemaVersion !== 1 || value.method !== 'github-source'
+      || value.repo !== PERSONAL_UPDATE_REPO || value.ref !== PERSONAL_UPDATE_REF
+      || typeof value.revision !== 'string' || !/^[0-9a-f]{40}$/i.test(value.revision)
+      || !validVersion(value.version) || typeof value.prefix !== 'string' || !isAbsolute(value.prefix)
+      || typeof value.installedAt !== 'string') return null;
+    return value as unknown as ManagedSourceInstallInfo;
+  } catch {
+    return null;
+  }
+}
+
+export function managedSourceInstall(): ManagedSourceInstallInfo | null {
+  return managedSourceInstallAt(packageRoot());
+}
+
+/** Pure check: is `rootDir` a source checkout rather than a managed source
+ * release or npm install? */
 export function isLocalDevInstallAt(rootDir: string): boolean {
-  return existsSync(join(rootDir, '.git')) || existsSync(join(rootDir, 'src'));
+  if (existsSync(join(rootDir, '.git'))) return true;
+  if (managedSourceInstallAt(rootDir)) return false;
+  return existsSync(join(rootDir, 'src'));
 }
 
 let cached: boolean | undefined;
@@ -31,10 +73,16 @@ export function isLocalDevInstall(): boolean {
 export function botmuxVersionAt(rootDir: string): string {
   try {
     const pkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf-8'));
-    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+    if (typeof pkg.version === 'string' && pkg.version !== '0.0.0') return pkg.version;
   } catch {
-    return '0.0.0';
+    // Fall through.
   }
+  const managed = managedSourceInstallAt(rootDir);
+  if (managed) return managed.version;
+  try {
+    const release = JSON.parse(readFileSync(join(rootDir, 'dev-version.json'), 'utf-8'));
+    return validVersion(release?.version) ? release.version : '0.0.0';
+  } catch { return '0.0.0'; }
 }
 
 export function botmuxVersion(): string {
