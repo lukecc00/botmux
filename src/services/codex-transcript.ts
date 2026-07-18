@@ -20,11 +20,11 @@
  *     Picking `response_item` keeps the reader to a single source of truth
  *     and avoids any chance of double-emit if both paths are present.
  *   - One narrow exception is `task_complete` with no `last_agent_message`.
- *     Codex writes exactly that terminal after exhausting its reconnects
- *     (`stream closed before response.completed`) while keeping the TUI
- *     process alive.  There is no assistant response_item in that shape, so
- *     without this explicit failed boundary botmux waits forever and the user
- *     never learns that the turn stopped.
+ *     Codex writes that terminal both for intentionally answer-less turns and
+ *     after exhausting reconnects (`stream closed before response.completed`).
+ *     There is no assistant response_item in either shape, so this reader
+ *     emits an ambiguous boundary; the worker combines it with the filtered
+ *     terminal diagnostic to decide between silent completion and recovery.
  *   - role=developer (system instructions), reasoning, function_call*, and
  *     function_call_output remain excluded. Commentary is intentionally kept
  *     separate from final answers so callers can mirror only the model's clean
@@ -132,6 +132,18 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+}
+
+/** Codex renders transport failures in the terminal but does not persist the
+ * error text in rollout JSONL.  `task_complete(last_agent_message=null)` alone
+ * is therefore not an error signal: it also occurs after intentionally
+ * answer-less turns (for example a tool already delivered the response).
+ * Keep the terminal wording check narrow so normal empty completions stay
+ * silent while the known disconnected-stream failure enters recovery. */
+export function isCodexAbnormalTerminationOutput(content: string): boolean {
+  const normalized = content.replace(/\r/g, '').toLowerCase();
+  return normalized.includes('stream disconnected before completion')
+    || normalized.includes('stream closed before response.completed');
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -344,8 +356,8 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         timestampMs,
         kind: 'assistant_final',
         text: '',
-        terminalStatus: 'failed',
-        terminalErrorCode: 'codex_task_complete_without_final',
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
       });
       continue;
     }

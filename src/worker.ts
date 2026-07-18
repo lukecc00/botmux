@@ -83,7 +83,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -817,12 +817,18 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
 const inflightInputs = new InflightInputTracker();
 const codexMissingFinalRecoveryAttempts = new Map<string, number>();
 const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
+const CODEX_MISSING_FINAL_CANDIDATE = 'codex_task_complete_without_final_candidate';
 const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+/** Latest filtered terminal viewport. Codex records an empty task_complete for
+ * both normal answer-less turns and stream failures; only the viewport carries
+ * the differentiating `stream disconnected before completion` diagnostic. */
+let latestFilteredScreenContent = '';
+let currentCodexTerminalOutputTail = '';
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): void {
@@ -2967,6 +2973,19 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    if (turn.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE) {
+      const terminalEvidence = `${latestFilteredScreenContent}\n${stripAnsiForLog(currentCodexTerminalOutputTail)}`;
+      if (isCodexAbnormalTerminationOutput(terminalEvidence)) {
+        turn.terminalStatus = 'failed';
+        turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;
+      } else {
+        // Empty task_complete is also Codex's normal terminal for a turn that
+        // intentionally has no final (commonly after an explicit send tool).
+        // It closes the bridge queue but must not notify or trigger recovery.
+        turn.terminalStatus = 'completed';
+        turn.terminalErrorCode = undefined;
+      }
+    }
     if (!adoptMode
       && turn.dispatchAttempt === undefined
       && turn.terminalStatus === 'failed'
@@ -4052,6 +4071,9 @@ function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   lastPtyActivityAtMs = Date.now();
+  if (lastInitConfig?.cliId === 'codex') {
+    currentCodexTerminalOutputTail = tailChars(currentCodexTerminalOutputTail + data, 16_000);
+  }
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
   renderer?.write(data);
@@ -4175,6 +4197,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
+    latestFilteredScreenContent = content;
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
   // cwd-move 注入（barrier=true，如 /cd）必须先于本次 pending 用户消息落地：
@@ -4609,6 +4632,7 @@ async function flushPending(): Promise<void> {
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       currentBotmuxDispatchAttempt = item.dispatchAttempt;
+      if (lastInitConfig?.cliId === 'codex') currentCodexTerminalOutputTail = '';
       currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
       writeCliPidMarker();
       publishSandboxRelayCapability();
@@ -4878,6 +4902,7 @@ function startScreenUpdates(): void {
 
       const usageAware = usageLimitTracker.classify(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
+        latestFilteredScreenContent = content;
         lastSentStatus = usageAware.status;
         send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
       }

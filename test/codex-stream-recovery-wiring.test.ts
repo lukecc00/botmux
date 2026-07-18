@@ -5,6 +5,9 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 
 describe('Codex missing-final recovery wiring', () => {
   it('replays the interrupted ordinary turn into a forced fresh session once', () => {
+    expect(workerSource).toContain("stripAnsiForLog(currentCodexTerminalOutputTail)");
+    expect(workerSource).toContain('isCodexAbnormalTerminationOutput(terminalEvidence)');
+    expect(workerSource).toContain("turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;");
     expect(workerSource).toContain("turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR");
     expect(workerSource).toContain('inflightInputs.onTurnFailed(');
     expect(workerSource).toContain("codexMissingFinalRecoveryAttempts.set(turn.turnId, 1);");
@@ -12,6 +15,11 @@ describe('Codex missing-final recovery wiring', () => {
     expect(workerSource).toContain('forceFresh: true,');
     expect(workerSource).toContain('resume: false,');
     expect(workerSource).toContain('cliSessionId: undefined,');
+  });
+
+  it('closes a normal empty completion silently instead of reporting an anomaly', () => {
+    expect(workerSource).toContain("turn.terminalStatus = 'completed';");
+    expect(workerSource).toContain('turn.terminalErrorCode = undefined;');
   });
 
   it('always publishes a user-visible terminal failure when recovery cannot finish', () => {

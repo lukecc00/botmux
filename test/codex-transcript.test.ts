@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -63,8 +63,8 @@ describe('codexSessionIdFromRolloutPath', () => {
   });
 });
 
-describe('Codex abnormal task completion', () => {
-  it('emits a failed empty boundary when task_complete has no final message', () => {
+describe('Codex empty task completion', () => {
+  it('emits an ambiguous candidate boundary when task_complete has no final message', () => {
     writeFileSync(path,
       ev(userResponseItem('keep working'))
       + ev({
@@ -77,9 +77,18 @@ describe('Codex abnormal task completion', () => {
     expect(out.at(-1)).toMatchObject({
       kind: 'assistant_final',
       text: '',
-      terminalStatus: 'failed',
-      terminalErrorCode: 'codex_task_complete_without_final',
+      terminalStatus: 'ambiguous',
+      terminalErrorCode: 'codex_task_complete_without_final_candidate',
     });
+  });
+
+  it('recognizes only the known terminal stream-disconnect diagnostics', () => {
+    expect(isCodexAbnormalTerminationOutput(
+      '■ stream disconnected before completion: stream closed before response.completed',
+    )).toBe(true);
+    expect(isCodexAbnormalTerminationOutput('Stream closed before response.completed')).toBe(true);
+    expect(isCodexAbnormalTerminationOutput('已发送结果，等待下一条消息')).toBe(false);
+    expect(isCodexAbnormalTerminationOutput('')).toBe(false);
   });
 
   it('does not duplicate a normal task_complete that carries a final message', () => {
