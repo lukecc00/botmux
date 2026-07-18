@@ -353,6 +353,9 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
 ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+    return jsonRes(res, 409, { ok: false, error: 'codex_handoff_in_progress' });
+  }
   // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
   // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
@@ -387,6 +390,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+    return jsonRes(res, 409, { ok: false, error: 'codex_handoff_in_progress' });
+  }
   // Adopt/observed sessions: botmux never owned the CLI — suspending would kill
   // the user's real tmux/zellij pane. Same guard as /restart.
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {

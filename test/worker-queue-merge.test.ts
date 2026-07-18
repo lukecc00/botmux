@@ -43,6 +43,16 @@ describe('mergeQueuedCliInput', () => {
     expect(ordinaryTail).toEqual([{ content: 'human turn', turnId: 'im-1' }]);
   });
 
+  it('never merges a handoff summary that must wait for a real idle edge', () => {
+    const pending = [{ content: 'queued user turn', turnId: 'old-turn' }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'Handoff Summary request',
+      turnId: 'summary-turn',
+      requireIdle: true,
+    })).toBe(false);
+    expect(pending).toEqual([{ content: 'queued user turn', turnId: 'old-turn' }]);
+  });
+
   it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
     const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
     expect(mergeQueuedCliInput(pending, {

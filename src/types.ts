@@ -259,6 +259,22 @@ export interface Session {
   whiteboardId?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /** Durable fence for a Codex context-window handoff. While present, daemon
+   * restore must never reattach/resume this native thread. Only a bounded goal
+   * and migration correlation state are persisted — never the old transcript. */
+  codexFreshHandoff?: {
+    requestId: string;
+    reason: 'manual_compact' | 'context_window_exceeded';
+    requestedAt: string;
+    interruptedTurnId?: string;
+    interruptedUserGoal?: string;
+    summaryTurnId: string;
+    phase: 'collecting' | 'migrating' | 'completed';
+    completedAt?: string;
+    selectedSummary?: string;
+    newTopicAnchor?: string;
+    newSessionId?: string;
+  };
   /**
    * Set true when the idle-worker sweeper suspends this session over the per-bot
    * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
@@ -496,19 +512,22 @@ export interface CodexAppTurnInput {
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
+  /** Clean user-authored goal retained separately from the rendered botmux
+   * envelope so context-exhaustion handoff never has to reverse-parse it. */
+  userGoal?: string;
   codexAppInput?: CodexAppTurnInput;
 }
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; prompt: string; promptUserGoal?: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'message'; content: string; userGoal?: string; codexAppInput?: CodexAppTurnInput; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; followUpContent?: string; followUpCodexAppInput?: CodexAppTurnInput; followUpAfterIdle?: boolean }
+  | { type: 'raw_input'; content: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; followUpAfterIdle?: boolean }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -563,6 +582,10 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  /** Codex ended an ordinary turn because its model context window is full.
+   * The daemon owns the cross-Lark-topic handoff: /compact the old native
+   * thread, collect a bounded summary, then start a fresh native thread. */
+  | { type: 'codex_context_exhausted'; sessionId: string; turnId: string; interruptedUserGoal?: string }
   | {
       type: 'progress_output';
       /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */

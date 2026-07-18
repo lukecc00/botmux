@@ -802,7 +802,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Enter lands. sendToPty also observes commandLineWritesPending, so another
   // raw command's text -> Enter window cannot be interrupted by the follow-up.
   if (sent && msg.followUpContent) {
-    sendToPty(msg.followUpContent, undefined, {
+    sendToPty(msg.followUpContent, msg.followUpTurnId, {
       codexAppInput: msg.followUpCodexAppInput,
       requireIdle: msg.followUpAfterIdle,
     });
@@ -818,15 +818,17 @@ const inflightInputs = new InflightInputTracker();
 const codexMissingFinalRecoveryAttempts = new Map<string, number>();
 const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
 const CODEX_MISSING_FINAL_CANDIDATE = 'codex_task_complete_without_final_candidate';
-const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
+const CODEX_CONTEXT_WINDOW_ERROR = 'codex_context_window_exceeded';
+const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止或耗尽上下文。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 /** Latest filtered terminal viewport. Codex records an empty task_complete for
- * both normal answer-less turns and stream failures; only the viewport carries
- * the differentiating `stream disconnected before completion` diagnostic. */
+ * both normal answer-less turns and some stream failures; only the viewport
+ * carries the differentiating legacy `stream disconnected before completion`
+ * diagnostic. Context-window failures use the structured task_complete error. */
 let latestFilteredScreenContent = '';
 let currentCodexTerminalOutputTail = '';
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
@@ -2927,10 +2929,11 @@ function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
+  userGoal?: string,
 ): boolean {
   if (!codexBridgeFallbackActive()) return false;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt);
+  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt, userGoal);
   // Handles the rare transcript-before-mark race: mark() replays the buffered
   // user + commentary records and may make progress immediately available.
   for (const progress of codexBridgeQueue.drainProgressOutputs()) {
@@ -2989,6 +2992,38 @@ function emitReadyCodexTurns(): void {
     if (!adoptMode
       && turn.dispatchAttempt === undefined
       && turn.terminalStatus === 'failed'
+      && turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR) {
+      // Do NOT restart/resume/replay inside this Lark topic. The daemon keeps
+      // the old native thread alive just long enough to run /compact and ask
+      // for a bounded Handoff Summary, then creates a new Lark topic backed by
+      // a genuinely fresh native Codex session.
+      const writtenGoals = inflightInputs.takeForHandoff(turn.turnId)
+        .map(item => item.userGoal)
+        .filter((goal): goal is string => !!goal);
+      const interruptedUserGoal = [...new Set([
+        turn.userGoal,
+        ...writtenGoals,
+        ...pendingMessages.map(item => item.userGoal).filter((goal): goal is string => !!goal),
+      ].filter((goal): goal is string => !!goal))].join('\n\n').slice(0, 4_000) || undefined;
+      // Nothing already queued may execute in the exhausted native thread or
+      // sit ahead of the summary mark in CodexBridgeQueue. Its clean goals are
+      // frozen above and carried into the fresh-topic handoff instead.
+      pendingMessages.length = 0;
+      pendingRawInputs.length = 0;
+      codexBridgeQueue.clearPending();
+      inflightInputs.onTurnComplete();
+      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
+      send({
+        type: 'codex_context_exhausted',
+        sessionId,
+        turnId: turn.turnId,
+        interruptedUserGoal,
+      });
+      continue;
+    }
+    if (!adoptMode
+      && turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
       && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) {
       const recoveryAttempts = codexMissingFinalRecoveryAttempts.get(turn.turnId) ?? 0;
       if (recoveryAttempts === 0) {
@@ -3008,7 +3043,7 @@ function emitReadyCodexTurns(): void {
           send({
             type: 'user_notify',
             turnId: turn.turnId,
-            message: '⚠️ Codex 运行流在生成最终答复前异常终止。已自动切换到全新 Codex 会话，并从当前工作区继续本轮任务。',
+            message: '⚠️ Codex 运行流在生成最终答复前异常终止。已自动切换到全新 Codex 会话，不 resume 旧会话，并从当前工作区继续本轮任务。',
           });
           void restartCliProcess('Codex task completed without final output', {
             preservePending: true,
@@ -3026,7 +3061,7 @@ function emitReadyCodexTurns(): void {
           ? '❌ Codex 运行流再次异常终止，自动切换新会话后仍未能完成。本轮已停止自动重试，请查看当前工作区；已完成的文件修改会保留。'
           : '❌ Codex 运行流在生成最终答复前异常终止，且 botmux 无法安全恢复原任务输入，因此未自动重放。本轮已停止，请查看当前工作区；已完成的文件修改会保留。',
       });
-      emitTurnTerminal(turn.turnId, 'failed', CODEX_MISSING_FINAL_ERROR);
+      emitTurnTerminal(turn.turnId, 'failed', turn.terminalErrorCode);
       continue;
     }
     if (!turn.finalText) continue;
@@ -3067,7 +3102,8 @@ function emitReadyCodexTurns(): void {
   for (const turn of ready) {
     if (turn.dispatchAttempt === undefined
       && turn.terminalStatus === 'failed'
-      && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) continue;
+      && (turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR
+        || turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR)) continue;
     if ((turn.terminalStatus ?? 'completed') === 'completed') {
       codexMissingFinalRecoveryAttempts.delete(turn.turnId);
     }
@@ -4653,7 +4689,7 @@ async function flushPending(): Promise<void> {
         // queue is path-agnostic, and the late-attach below will start
         // ingest from offset 0 so the user_message that lands shortly
         // after still fingerprint-matches this turn.
-        codexBridgeMarkPendingTurn(msg, item.turnId, item.dispatchAttempt);
+        codexBridgeMarkPendingTurn(msg, item.turnId, item.dispatchAttempt, item.userGoal);
       }
       if (durableWrite
         && cliAdapter.reliableTurnTerminal === true
@@ -4754,6 +4790,7 @@ function sendToPty(
   content: string,
   turnId?: string,
   opts: {
+    userGoal?: string;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -4764,6 +4801,7 @@ function sendToPty(
   const next: PendingCliInput = {
     content,
     turnId,
+    ...(opts.userGoal ? { userGoal: opts.userGoal } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -8145,11 +8183,12 @@ process.on('message', async (raw: unknown) => {
           // Mark it here before the CLI starts processing; late-attach is fine
           // because CodexBridgeQueue is path-agnostic until ingest discovers the
           // transcript file.
-          codexBridgeMarkPendingTurn(msg.prompt, msg.turnId, msg.dispatchAttempt);
+          codexBridgeMarkPendingTurn(msg.prompt, msg.turnId, msg.dispatchAttempt, msg.promptUserGoal);
         }
         if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({
             content: msg.prompt,
+            userGoal: msg.promptUserGoal,
             turnId: msg.turnId,
             dispatchAttempt: msg.dispatchAttempt,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -8309,6 +8348,7 @@ process.on('message', async (raw: unknown) => {
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
         sendToPty(content, msg.turnId, {
+          userGoal: msg.userGoal,
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,

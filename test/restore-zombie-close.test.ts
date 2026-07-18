@@ -403,6 +403,33 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_exists', 'app_test'))).toBeDefined();
   });
 
+  it('persisted Codex handoff → recovers without re-attaching the old native session', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex';
+    const s = makeActivePersistentSession('om_handoff_restore');
+    s.codexFreshHandoff = {
+      requestId: 'handoff-request',
+      reason: 'context_window_exceeded',
+      requestedAt: new Date().toISOString(),
+      interruptedTurnId: 'turn-full',
+      interruptedUserGoal: 'finish migration',
+      summaryTurnId: 'summary-turn',
+      phase: 'collecting',
+    };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const recoverCodexHandoff = vi.fn(async () => {});
+
+    await restoreActiveSessions(map, { recoverCodexHandoff });
+
+    const restored = map.get(sessionKey('om_handoff_restore', 'app_test'))!;
+    expect(restored.pendingCodexFreshHandoff?.summaryTurnId).toBe('summary-turn');
+    expect(recoverCodexHandoff).toHaveBeenCalledWith(restored);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('restores only the latest clean Codex App sidecar after a disk reload and re-attaches it', async () => {
     probe.result = 'exists';
     bot.cliId = 'codex-app';

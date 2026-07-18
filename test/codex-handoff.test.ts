@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   buildFreshCodexHandoffPrompt,
   buildFreshCodexHandoffTopic,
+  buildFallbackCodexHandoffSummary,
+  clearFreshCodexHandoffLineage,
+  CODEX_HANDOFF_SUMMARY_MAX_CHARS,
   CODEX_HANDOFF_SUMMARY_PROMPT,
+  normalizeCodexHandoffSummary,
+  omitOldCodexSessionIds,
+  selectCodexHandoffSummary,
   shouldFreshHandoffCodex,
 } from '../src/core/codex-handoff.js';
 
@@ -19,7 +25,26 @@ describe('Codex /compact fresh handoff', () => {
     expect(CODEX_HANDOFF_SUMMARY_PROMPT).toContain('headed exactly "Handoff Summary"');
     expect(CODEX_HANDOFF_SUMMARY_PROMPT).toContain('Do not continue the task');
     expect(CODEX_HANDOFF_SUMMARY_PROMPT).toContain('remaining steps');
-    expect(CODEX_HANDOFF_SUMMARY_PROMPT).toContain('under 6000 characters');
+    expect(CODEX_HANDOFF_SUMMARY_PROMPT).toContain('under 4000 characters');
+  });
+
+  it('enforces the summary limit in code, not only in the prompt', () => {
+    const normalized = normalizeCodexHandoffSummary(`Handoff Summary\n\n${'x'.repeat(8_000)}`);
+    expect(normalized.length).toBeLessThanOrEqual(CODEX_HANDOFF_SUMMARY_MAX_CHARS);
+    expect(normalized).toContain('[Summary truncated by botmux]');
+  });
+
+  it('uses a small workspace-oriented fallback for missing or invalid summaries', () => {
+    const fallback = buildFallbackCodexHandoffSummary({
+      userGoal: 'finish the migration',
+      workingDir: '/repo',
+    });
+    expect(selectCodexHandoffSummary('context window exceeded', {
+      userGoal: 'finish the migration', workingDir: '/repo',
+    })).toBe(fallback);
+    expect(fallback).toContain('Goal: finish the migration');
+    expect(fallback).toContain('Workspace: /repo');
+    expect(fallback.length).toBeLessThanOrEqual(CODEX_HANDOFF_SUMMARY_MAX_CHARS);
   });
 
   it('labels the visible topic and fresh prompt as non-resume handoff', () => {
@@ -30,5 +55,25 @@ describe('Codex /compact fresh handoff', () => {
     expect(prompt).toContain('NEW thread');
     expect(prompt).toContain('not a request to resume');
     expect(prompt).toContain(summary);
+  });
+
+  it('removes old native and botmux session ids from the carried summary', () => {
+    const summary = omitOldCodexSessionIds(
+      'Handoff Summary\n\nOld native: old-native-id; old botmux: old-botmux-id.',
+      ['old-native-id', 'old-botmux-id'],
+    );
+    expect(summary).not.toContain('old-native-id');
+    expect(summary).not.toContain('old-botmux-id');
+    expect(summary).toContain('[old Codex session id omitted]');
+  });
+
+  it('clears every old native/adopt/task lineage field on the fresh session', () => {
+    const session = {
+      cliSessionId: 'old-native',
+      adoptedFrom: { cwd: '/repo', sessionId: 'old-adopted' },
+      riffParentTaskId: 'old-remote-task',
+    };
+    clearFreshCodexHandoffLineage(session);
+    expect(session).toEqual({});
   });
 });

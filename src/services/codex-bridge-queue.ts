@@ -46,6 +46,7 @@ const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
 
 export interface CodexPendingTurn {
   turnId: string;
+  userGoal?: string;
   dispatchAttempt?: number;
   started: boolean;
   contentFingerprint?: string;
@@ -112,9 +113,16 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
-  mark(turnId: string, message: string, markTimeMs: number = Date.now(), dispatchAttempt?: number): void {
+  mark(
+    turnId: string,
+    message: string,
+    markTimeMs: number = Date.now(),
+    dispatchAttempt?: number,
+    userGoal?: string,
+  ): void {
     this.queue.push({
       turnId,
+      userGoal,
       dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),

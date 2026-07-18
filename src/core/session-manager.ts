@@ -772,7 +772,9 @@ export function buildNewTopicCliInput(
   );
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
-  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
+    return { content, userGoal: (opts?.codexAppText ?? userMessage).slice(0, 4_000) };
+  }
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const senderBlock = renderSenderTag(sender);
@@ -783,6 +785,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   return {
     content,
+    userGoal: (opts?.codexAppText ?? userMessage).slice(0, 4_000),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
       roleBlock,
@@ -865,7 +868,9 @@ export function buildFollowUpCliInput(
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): CliTurnPayload {
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
-  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
+  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
+    return { content: legacyContent, userGoal: (opts?.codexAppText ?? content).slice(0, 4_000) };
+  }
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
   const senderBlock = renderSenderTag(opts.sender);
@@ -875,6 +880,7 @@ export function buildFollowUpCliInput(
   const mentionBlock = renderMentionBlock(opts.mentions);
   return {
     content: legacyContent,
+    userGoal: (opts.codexAppText ?? content).slice(0, 4_000),
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
       roleBlock,
@@ -1056,6 +1062,7 @@ export function buildReforkCliInput(
         selfMention: opts?.selfMention,
         locale,
       }),
+      userGoal: content.slice(0, 4_000),
     };
   }
   return buildFollowUpCliInput(content, ds.session.sessionId, {
@@ -1194,7 +1201,10 @@ export async function staggeredRecoveryFork(
   }
 }
 
-export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
+export async function restoreActiveSessions(
+  activeSessions: Map<string, DaemonSession>,
+  opts: { recoverCodexHandoff?: (ds: DaemonSession) => void | Promise<void> } = {},
+): Promise<void> {
   const sessions = sessionStore.listSessions();
   const active = sessions.filter(s => s.status === 'active');
 
@@ -1207,8 +1217,14 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   killStalePids(active);
 
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
+  const codexHandoffsToRecover: DaemonSession[] = [];
 
   for (const session of active) {
+    if (session.codexFreshHandoff?.phase === 'completed') {
+      logger.warn(`[${session.sessionId.substring(0, 8)}] Closing superseded Codex source session during restore`);
+      sessionStore.closeSession(session.sessionId);
+      continue;
+    }
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1355,8 +1371,18 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // Restart stays silent in the group: the recovery re-fork won't post or
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
+      ...(session.codexFreshHandoff ? {
+        pendingCodexFreshHandoff: {
+          ...session.codexFreshHandoff,
+          requestedAt: Date.parse(session.codexFreshHandoff.requestedAt) || Date.now(),
+        },
+      } : {}),
     };
-    if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    // An in-progress Codex handoff must survive a bot config switch long
+    // enough to migrate without resuming the old native thread. Every ordinary
+    // session keeps the historical mismatch-before-register ordering so a
+    // stale CLI row is closed without briefly appearing on the dashboard.
+    if (!ds.pendingCodexFreshHandoff && await closeActiveSessionIfCliMismatch(ds)) continue;
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
@@ -1364,7 +1390,23 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
     announceSessionRow(ds);
 
+    if (ds.pendingCodexFreshHandoff) {
+      logger.warn(
+        `[${session.sessionId.substring(0, 8)}] Restored pending Codex handoff; `
+        + 'old native thread will not be resumed or re-attached',
+      );
+      codexHandoffsToRecover.push(ds);
+      continue;
+    }
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
+  }
+
+  // Recover only after every active row (including a partially-created fresh
+  // target session) has been registered. This lets the daemon reuse the exact
+  // new session/topic instead of racing the later restore iteration and
+  // accidentally closing/replacing it.
+  for (const ds of codexHandoffsToRecover) {
+    await opts.recoverCodexHandoff?.(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -1386,6 +1428,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // Queued（待办池）会话从没起过 CLI，没有任何后端会话——别去探它，否则 tmux 后端
     // 会把「找不到 backing」误判成僵尸而关掉它。
     if (ds.session.queued) continue;
+    if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) continue;
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) continue;
     if (!shouldAutoForkOnRestore(backendType)) continue;
@@ -1476,6 +1519,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
 export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<number | undefined> {
   if (ds.workerPort) return ds.workerPort;
   if (ds.session.status !== 'active') return undefined;
+  if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+    logger.warn(`[${ds.session.sessionId.substring(0, 8)}] terminal wake refused during Codex fresh-topic handoff`);
+    return undefined;
+  }
 
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return undefined;
@@ -1527,10 +1574,11 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'codex_handoff_in_progress'; activeSessionId?: string }> {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+  if (session.codexFreshHandoff) return { ok: false, error: 'codex_handoff_in_progress' };
 
   // A dedicated VC receiver is not an ordinary chat conversation. Its
   // identity is fenced by (meeting, member, epoch) and its active-map slot is

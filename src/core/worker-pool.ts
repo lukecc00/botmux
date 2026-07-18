@@ -146,6 +146,16 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     output: Extract<WorkerToDaemon, { type: 'final_output' }>,
   ) => boolean | Promise<boolean>;
+  /** Codex reported a structured context-window terminal. The daemon uses
+   * the still-live old native thread only to compact/summarize, then migrates
+   * to a brand-new Lark topic + native Codex session. */
+  onCodexContextExhausted?: (
+    ds: DaemonSession,
+    output: Extract<WorkerToDaemon, { type: 'codex_context_exhausted' }>,
+  ) => void | Promise<void>;
+  /** The old CLI exited while a Codex handoff intent was active. The daemon
+   * must finalize via a bounded fallback rather than resume that native id. */
+  onCodexHandoffSourceExit?: (ds: DaemonSession) => void | Promise<void>;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -1842,6 +1852,10 @@ export function sendWorkerInput(
     dispatchAttempt?: number;
   } = {},
 ): boolean {
+  if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+    logger.warn(`[${tag(ds)}] Refused worker input while Codex fresh-topic handoff is active`);
+    return false;
+  }
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
@@ -1849,6 +1863,7 @@ export function sendWorkerInput(
   ds.worker.send({
     type: 'message',
     content: normalized.content,
+    ...(normalized.userGoal ? { userGoal: normalized.userGoal } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(turnId ? { turnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
@@ -1869,6 +1884,10 @@ export function forkWorker(
   } = false,
 ): void {
   const cb = requireCallbacks();
+  if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+    logger.warn(`[${tag(ds)}] Refused worker fork/reattach while Codex fresh-topic handoff is active`);
+    return;
+  }
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
@@ -2132,6 +2151,7 @@ export function forkWorker(
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     prompt,
+    promptUserGoal: promptPayload.userGoal,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
     cliSessionId: ds.session.cliSessionId,
@@ -2980,6 +3000,16 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
+        if (effectiveCliId === 'codex' && ds.pendingCodexFreshHandoff) {
+          logger.warn(`[${t}] Codex exited during context handoff; skipping auto-resume of old native session`);
+          try {
+            await cb.onCodexHandoffSourceExit?.(ds);
+          } catch (err: any) {
+            logger.error(`[${t}] Failed to finalize Codex handoff after source exit: ${err.message}`);
+          }
+          break;
+        }
+
         // Do NOT auto-restart in adopt mode — there's nothing to restart
         if (ds.adoptedFrom) {
           logger.info(`[${t}] Adopted session ended`);
@@ -3163,6 +3193,26 @@ function setupWorkerHandlers(
           await scopedReply(msg.message, 'text', msg.turnId);
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
+        }
+        break;
+      }
+
+      case 'codex_context_exhausted': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored codex_context_exhausted from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(
+            `[${t}] Dropped codex_context_exhausted with mismatched sessionId `
+            + `(worker=${msg.sessionId}, daemon=${ds.session.sessionId})`,
+          );
+          break;
+        }
+        try {
+          await cb.onCodexContextExhausted?.(ds, msg);
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to begin Codex context handoff: ${err.message}`);
         }
         break;
       }

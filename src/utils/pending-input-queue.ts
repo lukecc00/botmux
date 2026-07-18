@@ -2,6 +2,7 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
+  userGoal?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -25,8 +26,10 @@ export function mergeQueuedCliInput(
   // would drop or mis-attach the sidecar.
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
-    || tail.codexAppInput || next.codexAppInput) return false;
+    || tail.codexAppInput || next.codexAppInput
+    || tail.requireIdle || next.requireIdle) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
+  tail.userGoal = next.userGoal ?? tail.userGoal;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
 }

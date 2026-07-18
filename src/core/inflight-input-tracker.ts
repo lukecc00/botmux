@@ -24,6 +24,7 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export type InflightItem = {
   content: string;
+  userGoal?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -47,6 +48,17 @@ export class InflightInputTracker {
    *  type-ahead queue). Nothing is in flight anymore. */
   onTurnComplete(): void {
     this.unacked.length = 0;
+  }
+
+  /** Freeze every ordinary input already written into the current CLI batch
+   * for a cross-thread handoff. Type-ahead CLIs may have accepted follow-ups
+   * that are no longer in the pending queue but have not reached a terminal;
+   * those goals must move to the fresh thread instead of disappearing. */
+  takeForHandoff(turnId: string): InflightItem[] {
+    const inFlight = this.unacked.splice(0);
+    if (inFlight.length > 0) return inFlight;
+    const lastMatchingIndex = this.recent.map(item => item.turnId).lastIndexOf(turnId);
+    return lastMatchingIndex >= 0 ? this.recent.slice(lastMatchingIndex) : [];
   }
 
   /** CLI process died. Stash whatever was in flight for the next spawn.

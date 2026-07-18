@@ -1700,3 +1700,58 @@ describe('Worker turn_terminal routing', () => {
     expect(onCliExit).not.toHaveBeenCalled();
   });
 });
+
+describe('Codex context exhaustion routing', () => {
+  it('routes only a matching current-worker event to the daemon handoff callback', async () => {
+    const ds = makeDs();
+    const onCodexContextExhausted = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCodexContextExhausted,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const event: Extract<WorkerToDaemon, { type: 'codex_context_exhausted' }> = {
+      type: 'codex_context_exhausted',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-full',
+      interruptedUserGoal: 'finish the migration',
+    };
+    (ds.worker as any).emit('message', event);
+    await Promise.resolve();
+    expect(onCodexContextExhausted).toHaveBeenCalledWith(ds, event);
+
+    (ds.worker as any).emit('message', { ...event, sessionId: 'wrong-session' });
+    await Promise.resolve();
+    expect(onCodexContextExhausted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not auto-restart a Codex source that exits during handoff', async () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.pendingCodexFreshHandoff = {
+      requestId: 'request-1',
+      requestedAt: Date.now(),
+      reason: 'context_window_exceeded',
+      summaryTurnId: 'summary-turn',
+      phase: 'collecting',
+    };
+    const onCodexHandoffSourceExit = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCodexHandoffSourceExit,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 1, signal: null,
+    } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
+    await Promise.resolve();
+    expect(onCodexHandoffSourceExit).toHaveBeenCalledWith(ds);
+    expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'restart' });
+  });
+});

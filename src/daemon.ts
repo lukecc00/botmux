@@ -1,5 +1,5 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
@@ -96,6 +96,7 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  setActiveSessionSafe,
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
@@ -148,9 +149,14 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
+  buildFallbackCodexHandoffSummary,
   buildFreshCodexHandoffPrompt,
   buildFreshCodexHandoffTopic,
+  clearFreshCodexHandoffLineage,
+  CODEX_HANDOFF_TIMEOUT_MS,
   CODEX_HANDOFF_SUMMARY_PROMPT,
+  omitOldCodexSessionIds,
+  selectCodexHandoffSummary,
   shouldFreshHandoffCodex,
 } from './core/codex-handoff.js';
 import {
@@ -3252,25 +3258,82 @@ async function migrateCodexHandoffToFreshTopic(
   source: DaemonSession,
   summary: string,
 ): Promise<boolean> {
-  if (!source.pendingCodexFreshHandoff) return false;
-  source.pendingCodexFreshHandoff = undefined;
-
-  const trimmed = summary.trim();
-  if (!trimmed) return false;
-  const locale = localeForBot(source.larkAppId);
+  const handoff = source.pendingCodexFreshHandoff;
+  if (!handoff) return false;
+  if (handoff.migrationInFlight) return true;
+  handoff.migrationInFlight = true;
+  let freshStarted = false;
   try {
-    const anchor = await sendMessage(
-      source.larkAppId,
-      source.chatId,
-      buildFreshCodexHandoffTopic(trimmed, locale),
+    if (handoff.timeout) clearTimeout(handoff.timeout);
+    handoff.timeout = undefined;
+    handoff.phase = 'migrating';
+    handoff.selectedSummary ??= omitOldCodexSessionIds(
+      selectCodexHandoffSummary(summary, {
+        userGoal: handoff.interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+        title: source.session.title,
+        workingDir: source.workingDir ?? source.session.workingDir,
+      }),
+      [source.session.cliSessionId, source.session.sessionId],
     );
+    const selectedSummary = handoff.selectedSummary;
+    source.session.codexFreshHandoff = {
+      requestId: handoff.requestId,
+      reason: handoff.reason,
+      requestedAt: new Date(handoff.requestedAt).toISOString(),
+      interruptedTurnId: handoff.interruptedTurnId,
+      interruptedUserGoal: handoff.interruptedUserGoal,
+      summaryTurnId: handoff.summaryTurnId,
+      phase: handoff.phase,
+      selectedSummary,
+      newTopicAnchor: handoff.newTopicAnchor,
+      newSessionId: handoff.newSessionId,
+    };
+    sessionStore.updateSession(source.session);
+    const locale = localeForBot(source.larkAppId);
+    const anchor = handoff.newTopicAnchor ?? await sendMessage(
+        source.larkAppId,
+        source.chatId,
+        buildFreshCodexHandoffTopic(selectedSummary, locale),
+        'text',
+        handoff.requestId,
+      );
+    if (!handoff.newTopicAnchor) {
+      handoff.newTopicAnchor = anchor;
+      source.session.codexFreshHandoff.newTopicAnchor = anchor;
+      sessionStore.updateSession(source.session);
+    }
     const bot = getBot(source.larkAppId);
-    const promptText = buildFreshCodexHandoffPrompt(trimmed);
-    const session = sessionStore.createSession(
-      source.chatId,
-      anchor,
-      source.session.title || 'Handoff Summary',
-      source.chatType,
+    const promptText = buildFreshCodexHandoffPrompt(selectedSummary);
+    let session = handoff.newSessionId ? sessionStore.getSession(handoff.newSessionId) : undefined;
+    if (!session) {
+      session = sessionStore.listSessions().find(candidate =>
+        candidate.status === 'active'
+        && candidate.sessionId !== source.session.sessionId
+        && candidate.larkAppId === source.larkAppId
+        && candidate.rootMessageId === anchor,
+      );
+      if (session) {
+        handoff.newSessionId = session.sessionId;
+        source.session.codexFreshHandoff.newSessionId = session.sessionId;
+        sessionStore.updateSession(source.session);
+      }
+    }
+    if (session && (session.rootMessageId !== anchor || session.sessionId === source.session.sessionId)) {
+      session = undefined;
+    }
+    if (!session || session.status === 'closed') {
+      session = sessionStore.createSession(
+        source.chatId,
+        anchor,
+        source.session.title || 'Handoff Summary',
+        source.chatType,
+      );
+      handoff.newSessionId = session.sessionId;
+      source.session.codexFreshHandoff.newSessionId = session.sessionId;
+      sessionStore.updateSession(source.session);
+    }
+    const existingFresh = [...activeSessions.values()].find(candidate =>
+      candidate.session.sessionId === session!.sessionId,
     );
     const now = Date.now();
     session.larkAppId = source.larkAppId;
@@ -3288,10 +3351,15 @@ async function migrateCodexHandoffToFreshTopic(
     session.model = source.session.model;
     session.agentFrozen = true;
     session.lastMessageAt = new Date(now).toISOString();
+    // Hard no-lineage invariant. A newly-created handoff target never inherits
+    // any native/resume/adopt/remote-task identity from the source session.
+    if (!existingFresh) {
+      clearFreshCodexHandoffLineage(session);
+    }
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
-    const fresh: DaemonSession = {
+    const fresh: DaemonSession = existingFresh ?? {
       session,
       worker: null,
       workerPort: null,
@@ -3308,7 +3376,13 @@ async function migrateCodexHandoffToFreshTopic(
       ownerOpenId: session.ownerOpenId,
       currentTurnTitle: session.title,
     };
-    activeSessions.set(sessionKey(anchor, source.larkAppId), fresh);
+    fresh.session = session;
+    fresh.scope = 'thread';
+    fresh.chatId = source.chatId;
+    fresh.chatType = source.chatType;
+    fresh.workingDir = session.workingDir;
+    fresh.hasHistory = !!session.cliSessionId;
+    await setActiveSessionSafe(activeSessions, sessionKey(anchor, source.larkAppId), fresh);
     ensureSessionWhiteboard(fresh);
     const input = buildNewTopicCliInput(
       promptText,
@@ -3324,8 +3398,13 @@ async function migrateCodexHandoffToFreshTopic(
       undefined,
       { larkAppId: source.larkAppId, chatId: source.chatId, whiteboardId: session.whiteboardId },
     );
-    rememberLastCliInput(fresh, promptText, input);
-    forkWorker(fresh, input, { resume: false });
+    input.userGoal = selectedSummary;
+    if (!fresh.worker && !session.cliSessionId) {
+      rememberLastCliInput(fresh, promptText, input);
+      forkWorker(fresh, input, { resume: false });
+    }
+    freshStarted = !!fresh.worker || !!session.cliSessionId;
+    if (!freshStarted) throw new Error('fresh Codex worker did not start');
 
     const closeResult = await closeSessionHelper(source.session.sessionId);
     if (closeResult.alreadyClosed) {
@@ -3336,17 +3415,208 @@ async function migrateCodexHandoffToFreshTopic(
       activeSessions.delete(activeSessionKey(source));
       sessionStore.closeSession(source.session.sessionId);
     }
+    // Commit only after the source is durably closed. If the daemon dies after
+    // the fresh worker fork but before this close, the persisted intent makes
+    // boot recovery reuse the same topic anchor instead of resuming the old
+    // native Codex id.
+    source.session.codexFreshHandoff = {
+      requestId: handoff.requestId,
+      reason: handoff.reason,
+      requestedAt: new Date(handoff.requestedAt).toISOString(),
+      interruptedTurnId: handoff.interruptedTurnId,
+      interruptedUserGoal: handoff.interruptedUserGoal,
+      summaryTurnId: handoff.summaryTurnId,
+      phase: 'completed',
+      completedAt: new Date().toISOString(),
+      selectedSummary: handoff.selectedSummary,
+      newTopicAnchor: handoff.newTopicAnchor,
+      newSessionId: handoff.newSessionId,
+    };
+    source.pendingCodexFreshHandoff = undefined;
+    sessionStore.updateSession(source.session);
     logger.info(
       `[${tag(source)}] Codex /compact handoff → fresh topic ${anchor.substring(0, 12)} `
       + `(new session=${session.sessionId.substring(0, 8)}, resume=false)`,
     );
     return true;
   } catch (err) {
-    // The summary is still useful. Return false so worker-pool delivers it in
-    // the source topic through its ordinary retry path instead of losing it.
+    if (freshStarted) {
+      // The handoff target is already live/fresh; a source-close bookkeeping
+      // failure must never roll migration back or create another topic/session.
+      source.session.codexFreshHandoff = {
+        requestId: handoff.requestId,
+        reason: handoff.reason,
+        requestedAt: new Date(handoff.requestedAt).toISOString(),
+        interruptedTurnId: handoff.interruptedTurnId,
+        interruptedUserGoal: handoff.interruptedUserGoal,
+        summaryTurnId: handoff.summaryTurnId,
+        phase: 'completed',
+        completedAt: new Date().toISOString(),
+        selectedSummary: handoff.selectedSummary,
+        newTopicAnchor: handoff.newTopicAnchor,
+        newSessionId: handoff.newSessionId,
+      };
+      source.pendingCodexFreshHandoff = undefined;
+      try { sessionStore.updateSession(source.session); } catch { /* best effort */ }
+      try {
+        killWorker(source);
+        activeSessions.delete(activeSessionKey(source));
+        sessionStore.closeSession(source.session.sessionId);
+      } catch { /* the new fresh session remains authoritative */ }
+      logger.error(`[${tag(source)}] Fresh Codex started but source close cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+      return true;
+    }
+    // Preserve the durable intent + stable Lark uuid/anchor. A later timeout,
+    // CLI-exit recovery, or daemon restart retries the same migration without
+    // creating a second topic and without resuming the old native thread.
+    handoff.phase = 'migrating';
+    try {
+      source.session.codexFreshHandoff = {
+        requestId: handoff.requestId,
+        reason: handoff.reason,
+        requestedAt: new Date(handoff.requestedAt).toISOString(),
+        interruptedTurnId: handoff.interruptedTurnId,
+        interruptedUserGoal: handoff.interruptedUserGoal,
+        summaryTurnId: handoff.summaryTurnId,
+        phase: 'migrating',
+        selectedSummary: handoff.selectedSummary,
+        newTopicAnchor: handoff.newTopicAnchor,
+        newSessionId: handoff.newSessionId,
+      };
+      sessionStore.updateSession(source.session);
+    } catch (persistErr) {
+      logger.error(`[${tag(source)}] Failed to persist Codex handoff retry state: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+    }
     logger.error(`[${tag(source)}] Codex fresh handoff failed: ${err instanceof Error ? err.message : String(err)}`);
+    handoff.retryCount = (handoff.retryCount ?? 0) + 1;
+    const retryMs = handoff.retryCount <= 3
+      ? ([5_000, 15_000, 30_000][handoff.retryCount - 1] ?? 30_000)
+      : 5 * 60_000;
+    handoff.timeout = setTimeout(() => {
+      if (source.pendingCodexFreshHandoff !== handoff) return;
+      void migrateCodexHandoffToFreshTopic(source, handoff.selectedSummary ?? summary);
+    }, retryMs);
+    handoff.timeout.unref?.();
+    if (handoff.retryCount > 3 && !handoff.failureNotified) {
+      handoff.failureNotified = true;
+      void sessionReply(
+        sessionAnchorId(source),
+        localeForBot(source.larkAppId) === 'en'
+          ? 'Codex context handoff could not create or start the fresh topic after several retries. The old Codex thread will not be resumed; botmux will keep retrying at a low frequency.'
+          : 'Codex 上下文交接多次重试后仍未能创建或启动新话题。旧 Codex 会话不会被恢复；botmux 将继续低频自动重试。',
+        'text',
+        source.larkAppId,
+      ).catch(() => { /* already logged by migration path */ });
+    }
     return false;
+  } finally {
+    handoff.migrationInFlight = false;
   }
+}
+
+function persistCodexHandoff(source: DaemonSession): void {
+  const handoff = source.pendingCodexFreshHandoff;
+  if (!handoff) return;
+  try {
+    source.session.codexFreshHandoff = {
+      requestId: handoff.requestId,
+      reason: handoff.reason,
+      requestedAt: new Date(handoff.requestedAt).toISOString(),
+      interruptedTurnId: handoff.interruptedTurnId,
+      interruptedUserGoal: handoff.interruptedUserGoal,
+      summaryTurnId: handoff.summaryTurnId,
+      phase: handoff.phase,
+      selectedSummary: handoff.selectedSummary,
+      newTopicAnchor: handoff.newTopicAnchor,
+      newSessionId: handoff.newSessionId,
+    };
+    sessionStore.updateSession(source.session);
+  } catch (err) {
+    logger.error(`[${tag(source)}] Failed to persist Codex handoff intent; in-memory watchdog remains active: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function fallbackCodexHandoffSummary(source: DaemonSession): string {
+  const pending = source.pendingCodexFreshHandoff;
+  return buildFallbackCodexHandoffSummary({
+    userGoal: pending?.interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+    title: source.session.title,
+    workingDir: source.workingDir ?? source.session.workingDir,
+  });
+}
+
+function armCodexHandoffWatchdog(
+  source: DaemonSession,
+  pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']>,
+): void {
+  if (pending.timeout) clearTimeout(pending.timeout);
+  pending.timeout = setTimeout(() => {
+    if (source.pendingCodexFreshHandoff !== pending) return;
+    logger.warn(`[${tag(source)}] Codex /compact handoff summary timed out; using bounded fallback`);
+    void migrateCodexHandoffToFreshTopic(source, fallbackCodexHandoffSummary(source));
+  }, CODEX_HANDOFF_TIMEOUT_MS);
+  pending.timeout.unref?.();
+}
+
+async function beginAutomaticCodexContextHandoff(
+  source: DaemonSession,
+  interruptedTurnId: string,
+  interruptedUserGoal?: string,
+): Promise<void> {
+  if (source.pendingCodexFreshHandoff) {
+    logger.info(`[${tag(source)}] Codex context handoff already active; duplicate terminal ignored`);
+    return;
+  }
+  if (!source.worker || source.worker.killed) {
+    const fallback = buildFallbackCodexHandoffSummary({
+      userGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+      title: source.session.title,
+      workingDir: source.workingDir ?? source.session.workingDir,
+    });
+    // Arm the same migration gate even though there is no old worker left;
+    // migrateCodexHandoffToFreshTopic owns the fresh-topic invariant.
+    source.pendingCodexFreshHandoff = {
+      requestedAt: Date.now(),
+      requestId: randomUUID(),
+      reason: 'context_window_exceeded',
+      interruptedTurnId,
+      interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+      summaryTurnId: `codex-handoff-${randomUUID()}`,
+      phase: 'collecting',
+    };
+    persistCodexHandoff(source);
+    await migrateCodexHandoffToFreshTopic(source, fallback);
+    return;
+  }
+
+  const pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']> = {
+    requestedAt: Date.now(),
+    requestId: randomUUID(),
+    reason: 'context_window_exceeded',
+    interruptedTurnId,
+    interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+    summaryTurnId: `codex-handoff-${randomUUID()}`,
+    phase: 'collecting',
+  };
+  source.pendingCodexFreshHandoff = pending;
+  persistCodexHandoff(source);
+  beginNewTurn(source, 'Codex Handoff Summary');
+  armCodexHandoffWatchdog(source, pending);
+  try {
+    source.worker.send({
+      type: 'raw_input',
+      content: '/compact',
+      followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
+      followUpTurnId: pending.summaryTurnId,
+      followUpAfterIdle: true,
+    } as DaemonToWorker);
+  } catch (err) {
+    logger.warn(`[${tag(source)}] Failed to send /compact handoff command; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
+    await migrateCodexHandoffToFreshTopic(source, fallbackCodexHandoffSummary(source));
+    return;
+  }
+  markSessionActivity(source);
+  logger.info(`[${tag(source)}] Codex context exhausted → /compact handoff armed`);
 }
 
 /**
@@ -14444,6 +14714,18 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
+  const handoffSession = activeSessions.get(sessionKey(anchor, larkAppId));
+  if (handoffSession?.pendingCodexFreshHandoff) {
+    await sessionReply(
+      anchor,
+      localeForBot(larkAppId) === 'en'
+        ? 'Codex context handoff is in progress. A fresh topic will appear shortly; please continue there.'
+        : 'Codex 正在进行上下文交接，稍后会自动出现新话题；请在新话题中继续。',
+      'text',
+      larkAppId,
+    );
+    return;
+  }
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -14617,14 +14899,30 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
             );
             return;
           }
-          ds.pendingCodexFreshHandoff = { requestedAt: Date.now() };
+          ds.pendingCodexFreshHandoff = {
+            requestedAt: Date.now(),
+            requestId: randomUUID(),
+            reason: 'manual_compact',
+            interruptedUserGoal: ds.lastUserPrompt ?? ds.session.lastUserPrompt,
+            summaryTurnId: `codex-handoff-${randomUUID()}`,
+            phase: 'collecting',
+          };
+          persistCodexHandoff(ds);
           beginNewTurn(ds, 'Codex Handoff Summary');
-          ds.worker.send({
-            type: 'raw_input',
-            content: commandContent,
-            followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
-            followUpAfterIdle: true,
-          } as DaemonToWorker);
+          const pending = ds.pendingCodexFreshHandoff;
+          armCodexHandoffWatchdog(ds, pending);
+          try {
+            ds.worker.send({
+              type: 'raw_input',
+              content: commandContent,
+              followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
+              followUpTurnId: pending.summaryTurnId,
+              followUpAfterIdle: true,
+            } as DaemonToWorker);
+          } catch (err) {
+            logger.warn(`[${tag(ds)}] Failed to send manual /compact handoff; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
+            void migrateCodexHandoffToFreshTopic(ds, fallbackCodexHandoffSummary(ds));
+          }
           markSessionActivity(ds);
           logger.info(`[${anchor.substring(0, 12)}] Codex /compact → fresh-session handoff armed`);
           return;
@@ -15076,6 +15374,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           codexAppApplicationContext,
           codexAppMessageContext,
         });
+    cliInput.userGoal = parsed.content.slice(0, 4_000);
     beginNewTurn(ds, parsed.content);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, cliInput);
@@ -15156,6 +15455,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       queued: queuedDashboardTurn,
       queuedText: queuedCodexAppText,
     });
+    wrappedInput.userGoal = parsed.content.slice(0, 4_000);
     if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
       // Backlog sessions persisted before clean-input have no raw queued text.
       // Keep this activation entirely legacy: reforkContent already contains
@@ -15822,8 +16122,39 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
     onFinalOutput(ds, output) {
-      if (!ds.pendingCodexFreshHandoff) return false;
-      return migrateCodexHandoffToFreshTopic(ds, output.content);
+      if (!ds.pendingCodexFreshHandoff
+        || output.turnId !== ds.pendingCodexFreshHandoff.summaryTurnId) return false;
+      // Matching summary output is always consumed from the old topic. If the
+      // external migration step fails, its durable intent owns retries; falling
+      // back to ordinary final delivery would leak the handoff summary into the
+      // exhausted source topic and clear no state.
+      return migrateCodexHandoffToFreshTopic(ds, output.content).then(() => true);
+    },
+    onCodexContextExhausted(ds, output) {
+      const pending = ds.pendingCodexFreshHandoff;
+      if (pending && output.turnId === pending.summaryTurnId) {
+        const fallback = buildFallbackCodexHandoffSummary({
+          userGoal: pending.interruptedUserGoal ?? ds.lastUserPrompt ?? ds.session.lastUserPrompt,
+          title: ds.session.title,
+          workingDir: ds.workingDir ?? ds.session.workingDir,
+        });
+        return migrateCodexHandoffToFreshTopic(ds, fallback).then(migrated => {
+          if (!migrated) throw new Error('failed to migrate fallback Codex handoff');
+        });
+      }
+      return beginAutomaticCodexContextHandoff(ds, output.turnId, output.interruptedUserGoal);
+    },
+    onCodexHandoffSourceExit(ds) {
+      const pending = ds.pendingCodexFreshHandoff;
+      if (!pending) return;
+      const fallback = pending.selectedSummary ?? buildFallbackCodexHandoffSummary({
+        userGoal: pending.interruptedUserGoal ?? ds.session.lastUserPrompt,
+        title: ds.session.title,
+        workingDir: ds.workingDir ?? ds.session.workingDir,
+      });
+      return migrateCodexHandoffToFreshTopic(ds, fallback).then(migrated => {
+        if (!migrated) throw new Error('failed to migrate Codex handoff after source exit');
+      });
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onTurnTerminal(ds, terminal, context) {
@@ -16120,7 +16451,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   reapOrphanWorkers();
 
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions);
+  await restoreActiveSessions(activeSessions, {
+    recoverCodexHandoff: async (ds) => {
+      const pending = ds.pendingCodexFreshHandoff;
+      if (!pending) return;
+      const fallback = pending.selectedSummary ?? buildFallbackCodexHandoffSummary({
+        userGoal: pending.interruptedUserGoal ?? ds.session.lastUserPrompt,
+        title: ds.session.title,
+        workingDir: ds.workingDir ?? ds.session.workingDir,
+      });
+      const migrated = await migrateCodexHandoffToFreshTopic(ds, fallback);
+      if (!migrated) {
+        logger.error(`[${tag(ds)}] Failed to recover persisted Codex handoff on daemon boot`);
+      }
+    },
+  });
 
   try {
     await reconcileVcMeetingManagedActionsOnBoot(cfg.larkAppId);

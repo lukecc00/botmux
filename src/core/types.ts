@@ -83,10 +83,25 @@ export interface DaemonSession {
   pendingRawInput?: string;
   /** Codex-only /compact migration. While set, the next transcript-backed
    * final output is the requested Handoff Summary and is consumed by the
-   * daemon to seed a brand-new Lark topic + Codex session. In-memory only: a
-   * daemon restart must never replay a migration or resume the exhausted
-   * native Codex thread by accident. */
-  pendingCodexFreshHandoff?: { requestedAt: number };
+   * daemon to seed a brand-new Lark topic + Codex session. Its serializable
+   * fields mirror Session.codexFreshHandoff so daemon restart can recover the
+   * migration without resuming the exhausted native Codex thread. */
+  pendingCodexFreshHandoff?: {
+    requestedAt: number;
+    reason: 'manual_compact' | 'context_window_exceeded';
+    requestId: string;
+    interruptedTurnId?: string;
+    interruptedUserGoal?: string;
+    summaryTurnId: string;
+    phase: 'collecting' | 'migrating' | 'completed';
+    selectedSummary?: string;
+    newTopicAnchor?: string;
+    newSessionId?: string;
+    migrationInFlight?: boolean;
+    retryCount?: number;
+    failureNotified?: boolean;
+    timeout?: NodeJS.Timeout;
+  };
   /** Wrapped prompt for messages buffered while a pendingRawInput session
    *  waited for repo selection (pendingFollowUps / attachments). Built at the
    *  fork site (where prompt-building context lives) and delivered right

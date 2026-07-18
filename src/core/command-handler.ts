@@ -1323,6 +1323,10 @@ export async function handleCommand(
 
       case '/restart': {
         if (ds) {
+          if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+            await sessionReply(rootId, 'Codex 上下文交接正在进行中，旧会话不会重启。');
+            break;
+          }
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
             const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);

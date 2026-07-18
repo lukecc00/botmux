@@ -1492,6 +1492,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // already omits the restart button when adoptMode=true, but a stale
       // pre-fix card or a malformed action payload could still arrive.
       const locDs = localeForBot(ds.larkAppId);
+      if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
+        await sessionReply(rootId, locDs === 'en'
+          ? 'Codex context handoff is in progress; the old session will not be restarted.'
+          : 'Codex 上下文交接正在进行中，旧会话不会重启。');
+        return;
+      }
       if (ds.adoptedFrom) {
         logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));

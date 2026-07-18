@@ -21,10 +21,11 @@
  *     and avoids any chance of double-emit if both paths are present.
  *   - One narrow exception is `task_complete` with no `last_agent_message`.
  *     Codex writes that terminal both for intentionally answer-less turns and
- *     after exhausting reconnects (`stream closed before response.completed`).
- *     There is no assistant response_item in either shape, so this reader
- *     emits an ambiguous boundary; the worker combines it with the filtered
- *     terminal diagnostic to decide between silent completion and recovery.
+ *     failed turns. Current releases persist structured failures in
+ *     `task_complete.error.codex_error_info`; this reader preserves a known
+ *     context-window failure directly and otherwise emits an ambiguous
+ *     boundary for the worker to reconcile against the filtered terminal
+ *     output (needed for stream-disconnect compatibility).
  *   - role=developer (system instructions), reasoning, function_call*, and
  *     function_call_output remain excluded. Commentary is intentionally kept
  *     separate from final answers so callers can mirror only the model's clean
@@ -134,12 +135,12 @@ export interface CodexBridgeEvent {
   preserveMarkTimeMs?: boolean;
 }
 
-/** Codex renders transport failures in the terminal but does not persist the
- * error text in rollout JSONL.  `task_complete(last_agent_message=null)` alone
- * is therefore not an error signal: it also occurs after intentionally
+/** Codex renders some failed turn terminals in the TUI but does not persist
+ * their diagnostic text in rollout JSONL. `task_complete(last_agent_message=null)`
+ * alone is therefore not an error signal: it also occurs after intentionally
  * answer-less turns (for example a tool already delivered the response).
- * Keep the terminal wording check narrow so normal empty completions stay
- * silent while the known disconnected-stream failure enters recovery. */
+ * Keep the terminal wording checks narrow so normal empty completions stay
+ * silent while known interrupted turns enter fresh-session recovery. */
 export function isCodexAbnormalTerminationOutput(content: string): boolean {
   const normalized = content.replace(/\r/g, '').toLowerCase();
   return normalized.includes('stream disconnected before completion')
@@ -308,6 +309,18 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+function taskCompleteErrorInfo(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const error = (payload as any).error;
+  return error && typeof error === 'object' && typeof error.codex_error_info === 'string'
+    ? error.codex_error_info
+    : undefined;
+}
+
+function isContextWindowErrorInfo(value: string | undefined): boolean {
+  return value?.replace(/[-_]/g, '').toLowerCase() === 'contextwindowexceeded';
+}
+
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
@@ -351,13 +364,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && obj.payload?.type === 'task_complete'
       && (typeof obj.payload.last_agent_message !== 'string'
         || obj.payload.last_agent_message.trim().length === 0)) {
+      const errorInfo = taskCompleteErrorInfo(obj.payload);
+      const contextWindowExceeded = isContextWindowErrorInfo(errorInfo);
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
         text: '',
-        terminalStatus: 'ambiguous',
-        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+        terminalStatus: contextWindowExceeded ? 'failed' : 'ambiguous',
+        terminalErrorCode: contextWindowExceeded
+          ? 'codex_context_window_exceeded'
+          : 'codex_task_complete_without_final_candidate',
       });
       continue;
     }

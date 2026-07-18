@@ -82,11 +82,62 @@ describe('Codex empty task completion', () => {
     });
   });
 
-  it('recognizes only the known terminal stream-disconnect diagnostics', () => {
+  it('preserves a structured context-window failure from task_complete', () => {
+    writeFileSync(path,
+      ev(userResponseItem('keep working'))
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'native-turn',
+          last_agent_message: null,
+          error: {
+            message: "Codex ran out of room in the model's context window.",
+            codex_error_info: 'context_window_exceeded',
+          },
+        },
+      }),
+    );
+    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+    });
+  });
+
+  it('accepts the legacy PascalCase context-window error discriminator', () => {
+    writeFileSync(path,
+      ev(userResponseItem('keep working'))
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          last_agent_message: null,
+          error: { codex_error_info: 'ContextWindowExceeded' },
+        },
+      }),
+    );
+    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+    });
+  });
+
+  it('recognizes only known recoverable Codex terminal diagnostics', () => {
     expect(isCodexAbnormalTerminationOutput(
       '■ stream disconnected before completion: stream closed before response.completed',
     )).toBe(true);
     expect(isCodexAbnormalTerminationOutput('Stream closed before response.completed')).toBe(true);
+    // Context-window failures use task_complete.error.codex_error_info. Do not
+    // infer them from screen text: a user can paste this exact diagnostic.
+    expect(isCodexAbnormalTerminationOutput(
+      "■ Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+    )).toBe(false);
+    expect(isCodexAbnormalTerminationOutput('• Context compacted')).toBe(false);
+    expect(isCodexAbnormalTerminationOutput('Please explain the model context window')).toBe(false);
     expect(isCodexAbnormalTerminationOutput('已发送结果，等待下一条消息')).toBe(false);
     expect(isCodexAbnormalTerminationOutput('')).toBe(false);
   });

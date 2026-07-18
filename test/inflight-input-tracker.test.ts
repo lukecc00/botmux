@@ -111,6 +111,15 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
   });
 
+  it('freezes type-ahead inputs already written when context handoff starts', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'wrapped-1', userGoal: 'goal-1', turnId: 'a' });
+    t.onWrite({ content: 'wrapped-2', userGoal: 'goal-2', turnId: 'b' });
+
+    expect(t.takeForHandoff('a').map(i => i.userGoal)).toEqual(['goal-1', 'goal-2']);
+    expect(t.onCliExit()).toBe(0);
+  });
+
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('first'));

@@ -146,7 +146,7 @@ export function applyQueuedCodexAppLegacyFallback(
   args: { queued: boolean; queuedText?: unknown },
 ): CliTurnPayload {
   if (!args.queued || typeof args.queuedText === 'string' || !payload.codexAppInput) return payload;
-  return { content: payload.content };
+  return { content: payload.content, userGoal: payload.userGoal };
 }
 
 export interface SpawnRequest {
