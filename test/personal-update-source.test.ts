@@ -12,6 +12,9 @@ describe('personal distribution source invariants', () => {
     expect(installer).not.toContain('${BOTMUX_INSTALL_REPO');
     expect(installer).not.toContain('${BOTMUX_INSTALL_REF');
     expect(installer).toContain('.botmux-install.json');
+    expect(installer).toContain('--filter=blob:none');
+    expect(installer).toContain('attempt $attempt/3');
+    expect(installer).toContain('failed to download $REPO@$REF after 3 attempts');
   });
 
   it('publishes GitHub releases only and never the official npm package', () => {

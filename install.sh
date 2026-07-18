@@ -37,7 +37,17 @@ URL="https://github.com/$REPO.git"
 say "Downloading latest $REPO@$REF"
 # Git reports counting, compressing, receiving, and resolving percentages even
 # when GitHub's archive endpoint does not provide a Content-Length header.
-git clone --depth 1 --single-branch --branch "$REF" --progress "$URL" "$SOURCE_DIR"
+attempt=1
+while :; do
+  if git clone --depth 1 --filter=blob:none --single-branch --branch "$REF" --progress "$URL" "$SOURCE_DIR"; then
+    break
+  fi
+  rm -rf "$SOURCE_DIR"
+  [ "$attempt" -lt 3 ] || fail "failed to download $REPO@$REF after 3 attempts"
+  say "Download failed (attempt $attempt/3); retrying..."
+  attempt=$((attempt + 1))
+  sleep "$attempt"
+done
 REVISION="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
 SHORT_REVISION="$(printf '%.8s' "$REVISION")"
 VERSION="$(node -p "require(process.argv[1]).version" "$SOURCE_DIR/dev-version.json")"
