@@ -6,7 +6,8 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 describe('Codex missing-final recovery wiring', () => {
   it('keeps stream-disconnect recovery as a forced fresh in-place session once', () => {
     expect(workerSource).toContain("stripAnsiForLog(currentCodexTerminalOutputTail)");
-    expect(workerSource).toContain('isCodexAbnormalTerminationOutput(terminalEvidence)');
+    expect(workerSource).toContain("turn.terminalEvidence ?? ''");
+    expect(workerSource).toContain("terminalDiagnostic === 'stream_disconnected'");
     expect(workerSource).toContain("turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;");
     expect(workerSource).toContain("turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR");
     expect(workerSource).toContain('inflightInputs.onTurnFailed(');
@@ -18,6 +19,8 @@ describe('Codex missing-final recovery wiring', () => {
   });
 
   it('routes context exhaustion to daemon handoff without replaying in the old topic', () => {
+    expect(workerSource).toContain("terminalDiagnostic === 'context_window_exceeded'");
+    expect(workerSource).toContain('turn.terminalErrorCode = CODEX_CONTEXT_WINDOW_ERROR;');
     const marker = "turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR";
     const start = workerSource.indexOf(marker);
     expect(start).toBeGreaterThanOrEqual(0);
@@ -34,6 +37,29 @@ describe('Codex missing-final recovery wiring', () => {
   it('closes a normal empty completion silently instead of reporting an anomaly', () => {
     expect(workerSource).toContain("turn.terminalStatus = 'completed';");
     expect(workerSource).toContain('turn.terminalErrorCode = undefined;');
+  });
+
+  it('does not classify the stale whole viewport as the current turn terminal', () => {
+    const marker = 'const terminalDiagnostic = classifyCodexTerminalDiagnostic(';
+    const start = workerSource.indexOf(marker);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = workerSource.slice(start, start + 400);
+    expect(region).not.toContain('latestFilteredScreenContent');
+  });
+
+  it('freezes terminal evidence on the exact pending turn', () => {
+    expect(workerSource).toContain('terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail)');
+    expect(workerSource).toContain('terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent');
+    expect(workerSource).toContain('codexBridgeQueue.refreshLastAmbiguousTerminalEvidence({');
+    expect(workerSource).toContain('turn.terminalEvidence ??');
+    expect(workerSource).toContain('turn.terminalViewportEvidence ??');
+  });
+
+  it('waits for terminal paint before classifying an ambiguous empty completion', () => {
+    expect(workerSource).toContain('e.terminalErrorCode !== CODEX_MISSING_FINAL_CANDIDATE');
+    expect(workerSource).toContain('CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS = 750');
+    expect(workerSource).toContain('codexAmbiguousTerminalTimer = setTimeout(() => {');
+    expect(workerSource).toContain('idleDetector?.fireIdle();');
   });
 
   it('always publishes a user-visible terminal failure when recovery cannot finish', () => {

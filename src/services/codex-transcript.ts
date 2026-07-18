@@ -19,13 +19,13 @@
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
  *     Picking `response_item` keeps the reader to a single source of truth
  *     and avoids any chance of double-emit if both paths are present.
- *   - One narrow exception is `task_complete` with no `last_agent_message`.
- *     Codex writes that terminal both for intentionally answer-less turns and
- *     failed turns. Current releases persist structured failures in
- *     `task_complete.error.codex_error_info`; this reader preserves a known
- *     context-window failure directly and otherwise emits an ambiguous
- *     boundary for the worker to reconcile against the filtered terminal
- *     output (needed for stream-disconnect compatibility).
+ *   - Narrow exceptions are structured error records and `task_complete` with
+ *     no `last_agent_message`. Codex writes the latter both for intentionally
+ *     answer-less turns and failed turns. Some releases nest
+ *     `codex_error_info` below `task_complete.error`, while others can emit an
+ *     independent `error` / `stream_error` event. Preserve a known
+ *     context-window failure directly and otherwise emit an ambiguous boundary
+ *     for the worker to reconcile against the turn-scoped terminal output.
  *   - role=developer (system instructions), reasoning, function_call*, and
  *     function_call_output remain excluded. Commentary is intentionally kept
  *     separate from final answers so callers can mirror only the model's clean
@@ -133,18 +133,59 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+  /** Structured terminal upgrade that may arrive before or after the empty
+   * task_complete boundary. It upgrades the currently collecting or most
+   * recently closed ambiguous turn without creating a second final. */
+  terminalOnly?: boolean;
+  terminalEvidence?: string;
+  terminalViewportEvidence?: string;
+  submittedInputAtTerminal?: string;
 }
 
-/** Codex renders some failed turn terminals in the TUI but does not persist
- * their diagnostic text in rollout JSONL. `task_complete(last_agent_message=null)`
- * alone is therefore not an error signal: it also occurs after intentionally
- * answer-less turns (for example a tool already delivered the response).
- * Keep the terminal wording checks narrow so normal empty completions stay
- * silent while known interrupted turns enter fresh-session recovery. */
+export type CodexTerminalDiagnostic = 'context_window_exceeded' | 'stream_disconnected';
+
+const CODEX_CONTEXT_WINDOW_DIAGNOSTIC = "codex ran out of room in the model's context window";
+
+function normalizeTerminalDiagnosticText(content: string): string {
+  return content.replace(/\r/g, '').replace(/\s+/g, ' ').toLowerCase();
+}
+
+function hasExplicitContextDiagnosticLine(content: string): boolean {
+  return content.replace(/\r/g, '\n').split('\n').some(line => {
+    // Codex renders a terminal failure as an unindented `■ ...` line. TUI
+    // input echoes are prefixed by `› ` (first line) or indentation
+    // (continuations), even when the user pastes the same diagnostic text.
+    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
+    return normalizedLine.startsWith(`■ ${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`);
+  });
+}
+
+/** Classify the exact terminal diagnostics that can disambiguate an empty
+ * `task_complete`. Keep this deliberately narrow: this is only a fallback for
+ * releases that omit the structured failure from rollout JSONL. The worker
+ * applies it to the current turn's PTY tail after seeing an ambiguous terminal,
+ * never to arbitrary transcript/user text. */
+export function classifyCodexTerminalDiagnostic(
+  content: string,
+  opts: { ignoreContext?: boolean } = {},
+): CodexTerminalDiagnostic | undefined {
+  const normalized = normalizeTerminalDiagnosticText(content);
+  if (!opts.ignoreContext && hasExplicitContextDiagnosticLine(content)) {
+    return 'context_window_exceeded';
+  }
+  if (normalized.includes('stream disconnected before completion')
+    || normalized.includes('stream closed before response.completed')) {
+    return 'stream_disconnected';
+  }
+  return undefined;
+}
+
+/** Backwards-compatible predicate for callers that only care whether a
+ * terminal is abnormal. New routing must use classifyCodexTerminalDiagnostic
+ * so context exhaustion cannot fall into ordinary stream-retry recovery. */
 export function isCodexAbnormalTerminationOutput(content: string): boolean {
-  const normalized = content.replace(/\r/g, '').toLowerCase();
-  return normalized.includes('stream disconnected before completion')
-    || normalized.includes('stream closed before response.completed');
+  return classifyCodexTerminalDiagnostic(content) !== undefined;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -309,11 +350,14 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
-function taskCompleteErrorInfo(payload: unknown): string | undefined {
+function codexErrorInfo(payload: unknown): string | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
+  if (typeof (payload as any).codex_error_info === 'string') {
+    return (payload as any).codex_error_info;
+  }
   const error = (payload as any).error;
-  return error && typeof error === 'object' && typeof error.codex_error_info === 'string'
-    ? error.codex_error_info
+  return error && typeof error === 'object'
+    ? codexErrorInfo(error)
     : undefined;
 }
 
@@ -361,10 +405,24 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     const ts = typeof obj?.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     if (obj?.type === 'event_msg'
+      && (obj.payload?.type === 'error' || obj.payload?.type === 'stream_error')
+      && isContextWindowErrorInfo(codexErrorInfo(obj.payload))) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+        terminalOnly: true,
+      });
+      continue;
+    }
+    if (obj?.type === 'event_msg'
       && obj.payload?.type === 'task_complete'
       && (typeof obj.payload.last_agent_message !== 'string'
         || obj.payload.last_agent_message.trim().length === 0)) {
-      const errorInfo = taskCompleteErrorInfo(obj.payload);
+      const errorInfo = codexErrorInfo(obj.payload);
       const contextWindowExceeded = isContextWindowErrorInfo(errorInfo);
       events.push({
         uuid: `${path}:${lineStart}`,

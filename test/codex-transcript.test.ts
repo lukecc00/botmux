@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, classifyCodexTerminalDiagnostic, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -126,20 +126,45 @@ describe('Codex empty task completion', () => {
     });
   });
 
-  it('recognizes only known recoverable Codex terminal diagnostics', () => {
+  it('preserves an independent structured context-window error event', () => {
+    writeFileSync(path,
+      ev(userResponseItem('keep working'))
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'error',
+          message: "Codex ran out of room in the model's context window.",
+          codex_error_info: 'context_window_exceeded',
+        },
+      }),
+    );
+    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+      terminalOnly: true,
+    });
+  });
+
+  it('classifies known recoverable Codex terminal diagnostics', () => {
     expect(isCodexAbnormalTerminationOutput(
       '■ stream disconnected before completion: stream closed before response.completed',
     )).toBe(true);
-    expect(isCodexAbnormalTerminationOutput('Stream closed before response.completed')).toBe(true);
-    // Context-window failures use task_complete.error.codex_error_info. Do not
-    // infer them from screen text: a user can paste this exact diagnostic.
-    expect(isCodexAbnormalTerminationOutput(
+    expect(classifyCodexTerminalDiagnostic('Stream closed before response.completed'))
+      .toBe('stream_disconnected');
+    expect(classifyCodexTerminalDiagnostic(
       "■ Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
-    )).toBe(false);
-    expect(isCodexAbnormalTerminationOutput('• Context compacted')).toBe(false);
-    expect(isCodexAbnormalTerminationOutput('Please explain the model context window')).toBe(false);
-    expect(isCodexAbnormalTerminationOutput('已发送结果，等待下一条消息')).toBe(false);
-    expect(isCodexAbnormalTerminationOutput('')).toBe(false);
+    )).toBe('context_window_exceeded');
+    const pasted = "Codex ran out of room in the model's context window. Start a new thread before retrying.";
+    expect(classifyCodexTerminalDiagnostic(`› ${pasted}`)).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic(`› ${pasted}\n■ ${pasted}`))
+      .toBe('context_window_exceeded');
+    expect(classifyCodexTerminalDiagnostic(`■ ${pasted}`, { ignoreContext: true })).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic('• Context compacted')).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic('Please explain the model context window')).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic('已发送结果，等待下一条消息')).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic('')).toBeUndefined();
   });
 
   it('does not duplicate a normal task_complete that carries a final message', () => {

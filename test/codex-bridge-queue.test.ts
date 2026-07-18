@@ -114,6 +114,137 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('upgrades an ambiguous empty completion when a structured error follows', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('context-turn', 'keep working', 100);
+    q.ingest([
+      userEv('keep working', 'context-user', 101),
+      {
+        ...asstEv('', 'context-empty', 102),
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+      },
+      {
+        ...asstEv('', 'context-error', 103),
+        terminalOnly: true,
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+      },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'context-turn',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+      }),
+    ]);
+  });
+
+  it('upgrades an ambiguous empty completion across separate drains', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('context-turn', 'keep working', 100);
+    q.ingest([
+      userEv('keep working', 'context-user', 101),
+      {
+        ...asstEv('', 'context-empty', 102),
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+      },
+    ]);
+    q.ingest([{
+      ...asstEv('', 'context-error', 103),
+      terminalOnly: true,
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+    }]);
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'context-turn',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+    });
+  });
+
+  it('closes a collecting turn when its structured error precedes task_complete', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('context-turn', 'keep working', 100);
+    q.ingest([
+      userEv('keep working', 'context-user', 101),
+      {
+        ...asstEv('', 'context-error', 102),
+        terminalOnly: true,
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+      },
+      {
+        ...asstEv('', 'context-empty', 103),
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+      },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'context-turn',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+      }),
+    ]);
+  });
+
+  it('keeps a structured error authoritative when task_complete follows in a later drain', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('context-turn', 'keep working', 100);
+    q.ingest([
+      userEv('keep working', 'context-user', 101),
+      {
+        ...asstEv('', 'context-error', 102),
+        terminalOnly: true,
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+      },
+    ]);
+    q.ingest([{
+      ...asstEv('', 'context-empty', 103),
+      terminalStatus: 'ambiguous',
+      terminalErrorCode: 'codex_task_complete_without_final_candidate',
+    }]);
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'context-turn',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_context_window_exceeded',
+    });
+  });
+
+  it('refreshes terminal evidence only for the matching ambiguous turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-a', 'first', 100);
+    q.ingest([
+      userEv('first', 'first-user', 101),
+      {
+        ...asstEv('', 'first-empty', 102),
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+        terminalViewportEvidence: 'old viewport',
+      },
+    ]);
+    expect(q.refreshLastAmbiguousTerminalEvidence({
+      turnId: 'turn-b',
+      terminalEvidence: 'wrong raw',
+      terminalViewportEvidence: 'wrong viewport',
+      submittedInput: 'second',
+    })).toBe(false);
+    expect(q.refreshLastAmbiguousTerminalEvidence({
+      turnId: 'turn-a',
+      terminalEvidence: 'right raw',
+      terminalViewportEvidence: 'right viewport',
+      submittedInput: 'first',
+    })).toBe(true);
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'turn-a',
+      terminalEvidence: 'right raw',
+      terminalViewportEvidence: 'right viewport',
+    });
+  });
+
   it('drops only the retired dispatch attempt before the same turnId is replayed', () => {
     const q = new CodexBridgeQueue();
     q.mark('same-turn', 'durable prompt', 100, 1);

@@ -69,6 +69,9 @@ export interface CodexPendingTurn {
    *  assistant reply so the Lark thread sees both sides of the exchange. */
   userText?: string;
   sourceSessionId?: string;
+  terminalEvidence?: string;
+  terminalViewportEvidence?: string;
+  submittedInputAtTerminal?: string;
 }
 
 /** Clean model-authored progress prose attributed to one exact pending turn. */
@@ -87,6 +90,12 @@ export class CodexBridgeQueue {
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private progressOutputs: CodexProgressOutput[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
+  /** An empty task_complete can be followed by a separate structured error.
+   * Keep that just-closed turn upgradeable until it is drained/emitted. */
+  private lastAmbiguousTerminal: CodexPendingTurn | null = null;
+  /** Authoritative structured terminal that just closed a turn. A later empty
+   * task_complete for the same native turn is a duplicate boundary. */
+  private lastStructuredTerminal: CodexPendingTurn | null = null;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
@@ -139,6 +148,8 @@ export class CodexBridgeQueue {
     this.bufferedUnmatched = [];
     this.progressOutputs = [];
     this.lastClosedAssistantFinalTimeMs = undefined;
+    this.lastAmbiguousTerminal = null;
+    this.lastStructuredTerminal = null;
     return dropped;
   }
 
@@ -216,6 +227,7 @@ export class CodexBridgeQueue {
       }
 
       if (willStartNext) {
+        this.lastStructuredTerminal = null;
         next!.started = true;
         next!.sourceSessionId = ev.sourceSessionId;
         // Anchor the bridge-fallback suppression window to when the turn
@@ -254,6 +266,7 @@ export class CodexBridgeQueue {
         }
         this.collecting = next!;
       } else if (willSynthLocal) {
+        this.lastStructuredTerminal = null;
         // Adopt mode local input: user typed in iTerm, no Lark
         // fingerprint match. Synthesise a local turn so the assistant
         // reply still reaches Lark. Insert AHEAD of any unstarted Lark
@@ -291,17 +304,62 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'assistant_final') {
+      if (ev.terminalOnly) {
+        const target = this.collecting ?? this.lastAmbiguousTerminal;
+        if (!target) {
+          if (bufferUnmatched && !this.localTurnsEnabled) this.rememberUnmatched(ev);
+          return;
+        }
+        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+        target.terminalStatus = ev.terminalStatus;
+        target.terminalErrorCode = ev.terminalErrorCode;
+        if (this.collecting === target) {
+          target.finalText ??= ev.text;
+          this.collecting = null;
+        }
+        this.lastAmbiguousTerminal = null;
+        this.lastStructuredTerminal = target;
+        this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
+        return;
+      }
       if (this.collecting) {
         if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
         this.collecting.finalText = ev.text;
         this.collecting.terminalStatus = ev.terminalStatus;
         this.collecting.terminalErrorCode = ev.terminalErrorCode;
+        this.collecting.terminalEvidence = ev.terminalEvidence;
+        this.collecting.terminalViewportEvidence = ev.terminalViewportEvidence;
+        this.collecting.submittedInputAtTerminal = ev.submittedInputAtTerminal;
+        this.lastAmbiguousTerminal = ev.terminalStatus === 'ambiguous'
+          ? this.collecting
+          : null;
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
         this.collecting = null;
+      } else if (this.lastStructuredTerminal) {
+        // A separate structured terminal may have closed the turn first; the
+        // later empty task_complete is only a duplicate boundary and must not
+        // downgrade the authoritative failure to ambiguous.
+        return;
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
         this.rememberUnmatched(ev);
       }
     }
+  }
+
+  /** Refresh terminal evidence only for the exact still-upgradeable turn.
+   * Prevents type-ahead turn N+1's screen from being attributed to turn N. */
+  refreshLastAmbiguousTerminalEvidence(input: {
+    turnId?: string;
+    terminalEvidence: string;
+    terminalViewportEvidence: string;
+    submittedInput: string;
+  }): boolean {
+    const target = this.lastAmbiguousTerminal;
+    if (!target || !input.turnId || target.turnId !== input.turnId) return false;
+    target.terminalEvidence = input.terminalEvidence;
+    target.terminalViewportEvidence = input.terminalViewportEvidence;
+    target.submittedInputAtTerminal = input.submittedInput;
+    return true;
   }
 
   /** Drain progress independently of final-answer readiness. */
@@ -318,6 +376,8 @@ export class CodexBridgeQueue {
       if (!head.started || head.finalText === undefined) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
+      if (this.lastAmbiguousTerminal === head) this.lastAmbiguousTerminal = null;
+      if (this.lastStructuredTerminal === head) this.lastStructuredTerminal = null;
       out.push(head);
     }
     return out;

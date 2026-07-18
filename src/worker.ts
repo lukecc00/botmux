@@ -83,7 +83,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, classifyCodexTerminalDiagnostic, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -819,16 +819,18 @@ const codexMissingFinalRecoveryAttempts = new Map<string, number>();
 const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
 const CODEX_MISSING_FINAL_CANDIDATE = 'codex_task_complete_without_final_candidate';
 const CODEX_CONTEXT_WINDOW_ERROR = 'codex_context_window_exceeded';
+const CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS = 750;
 const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止或耗尽上下文。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentCodexSubmittedInput = '';
 /** Latest filtered terminal viewport. Codex records an empty task_complete for
- * both normal answer-less turns and some stream failures; only the viewport
- * carries the differentiating legacy `stream disconnected before completion`
- * diagnostic. Context-window failures use the structured task_complete error. */
+ * both normal answer-less turns and some failures. The turn-scoped PTY tail
+ * carries the differentiating diagnostic on versions that omit structured
+ * context/stream errors from rollout JSONL. */
 let latestFilteredScreenContent = '';
 let currentCodexTerminalOutputTail = '';
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
@@ -1177,6 +1179,7 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+let codexAmbiguousTerminalTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -2426,7 +2429,18 @@ function structuredBridgeIngestPath(path: string, offset: number) {
 /** Forward only transcript-native assistant commentary. Tool calls, command
  * output, reasoning, and the terminal viewport never enter this path. */
 function ingestStructuredBridgeEvents(events: CodexBridgeEvent[]): void {
-  codexBridgeQueue.ingest(events);
+  const attributedEvents = structuredBridgeIsCodex()
+    ? events.map(event => event.kind === 'assistant_final'
+      && event.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE
+      ? {
+          ...event,
+          terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
+          terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
+          submittedInputAtTerminal: currentCodexSubmittedInput,
+        }
+      : event)
+    : events;
+  codexBridgeQueue.ingest(attributedEvents);
   for (const progress of codexBridgeQueue.drainProgressOutputs()) {
     send({
       type: 'progress_output',
@@ -2917,8 +2931,30 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
-  if (opts.signalIdle !== false && result.events.some(e => e.kind === 'assistant_final')) {
+  // An empty task_complete without a structured error needs the terminal
+  // diagnostic to classify it. Delay the transcript-driven idle for that
+  // ambiguous shape: rollout can be flushed just before the TUI paints the
+  // error. Definitive finals keep the fast path.
+  const sawAmbiguousTerminal = result.events.some(e =>
+    e.kind === 'assistant_final'
+    && 'terminalErrorCode' in e
+    && e.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE
+  );
+  if (opts.signalIdle !== false && result.events.some(e =>
+    e.kind === 'assistant_final'
+    && (!('terminalErrorCode' in e)
+      || e.terminalErrorCode !== CODEX_MISSING_FINAL_CANDIDATE)
+  )) {
     idleDetector?.fireIdle();
+  } else if (opts.signalIdle !== false && sawAmbiguousTerminal && !codexAmbiguousTerminalTimer) {
+    // Some Codex builds flush task_complete just before painting the terminal
+    // diagnostic. Give the PTY a short bounded settle, then classify even when
+    // the ready-pattern detector does not produce another edge.
+    codexAmbiguousTerminalTimer = setTimeout(() => {
+      codexAmbiguousTerminalTimer = null;
+      idleDetector?.fireIdle();
+    }, CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS);
+    codexAmbiguousTerminalTimer.unref?.();
   }
 }
 
@@ -2955,6 +2991,14 @@ function codexBridgeDrainAndMaybeEmit(opts: { signalIdle?: boolean } = {}): void
 }
 
 function emitReadyCodexTurns(): void {
+  if (structuredBridgeIsCodex()) {
+    codexBridgeQueue.refreshLastAmbiguousTerminalEvidence({
+      turnId: currentBotmuxTurnId,
+      terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
+      terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
+      submittedInput: currentCodexSubmittedInput,
+    });
+  }
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
   const adoptMode = lastInitConfig?.adoptMode === true;
@@ -2977,8 +3021,18 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (turn.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE) {
-      const terminalEvidence = `${latestFilteredScreenContent}\n${stripAnsiForLog(currentCodexTerminalOutputTail)}`;
-      if (isCodexAbnormalTerminationOutput(terminalEvidence)) {
+      // Evidence is frozen on this exact queue turn. Raw PTY is used only for
+      // stream failures; context exhaustion requires the strict `■ ...` line
+      // in the reconstructed final viewport, so redraws/user echoes cannot be
+      // mistaken for a terminal belonging to another type-ahead turn.
+      const terminalDiagnostic = classifyCodexTerminalDiagnostic(
+        turn.terminalEvidence ?? '',
+        { ignoreContext: true },
+      ) ?? classifyCodexTerminalDiagnostic(turn.terminalViewportEvidence ?? '');
+      if (terminalDiagnostic === 'context_window_exceeded') {
+        turn.terminalStatus = 'failed';
+        turn.terminalErrorCode = CODEX_CONTEXT_WINDOW_ERROR;
+      } else if (terminalDiagnostic === 'stream_disconnected') {
         turn.terminalStatus = 'failed';
         turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;
       } else {
@@ -3124,6 +3178,10 @@ function stopCodexBridge(): void {
   if (codexBridgeTimer) {
     clearInterval(codexBridgeTimer);
     codexBridgeTimer = null;
+  }
+  if (codexAmbiguousTerminalTimer) {
+    clearTimeout(codexAmbiguousTerminalTimer);
+    codexAmbiguousTerminalTimer = null;
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
@@ -4668,7 +4726,10 @@ async function flushPending(): Promise<void> {
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       currentBotmuxDispatchAttempt = item.dispatchAttempt;
-      if (lastInitConfig?.cliId === 'codex') currentCodexTerminalOutputTail = '';
+      if (lastInitConfig?.cliId === 'codex') {
+        currentCodexTerminalOutputTail = '';
+        currentCodexSubmittedInput = msg;
+      }
       currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
       writeCliPidMarker();
       publishSandboxRelayCapability();
@@ -6800,6 +6861,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   readIsolationOriginCapabilityFile = null;
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
+  currentCodexSubmittedInput = '';
   currentVcMeetingImTurnOrigin = undefined;
   if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
