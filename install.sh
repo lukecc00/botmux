@@ -95,10 +95,22 @@ BOTMUX_META_PREFIX="$PREFIX" node -e '
 
 mkdir -p "$APP_HOME/releases" "$BIN_DIR"
 mv "$SOURCE_DIR" "$RELEASE_DIR"
-ln -sfn "$RELEASE_DIR" "$APP_HOME/current.new"
-mv -f "$APP_HOME/current.new" "$APP_HOME/current"
-ln -sfn "$APP_HOME/current/dist/cli.js" "$BIN_DIR/botmux.new"
-mv -f "$BIN_DIR/botmux.new" "$BIN_DIR/botmux"
+# `mv -f temp current` follows a destination symlink-to-directory on GNU mv
+# and moves temp INSIDE the old release instead of replacing the symlink. Node's
+# renameSync replaces the symlink inode itself, atomically and portably.
+BOTMUX_RELEASE_DIR="$RELEASE_DIR" BOTMUX_APP_HOME="$APP_HOME" BOTMUX_BIN_DIR="$BIN_DIR" node -e '
+  const fs = require("fs");
+  const path = require("path");
+  function replaceSymlink(target, link) {
+    const tmp = `${link}.${process.pid}.new`;
+    try { fs.unlinkSync(tmp); } catch {}
+    fs.symlinkSync(target, tmp);
+    try { fs.renameSync(tmp, link); }
+    catch (error) { try { fs.unlinkSync(tmp); } catch {} throw error; }
+  }
+  replaceSymlink(process.env.BOTMUX_RELEASE_DIR, path.join(process.env.BOTMUX_APP_HOME, "current"));
+  replaceSymlink(path.join(process.env.BOTMUX_APP_HOME, "current", "dist", "cli.js"), path.join(process.env.BOTMUX_BIN_DIR, "botmux"));
+'
 
 say "Installed v$VERSION ($REPO@$REF, $SHORT_REVISION)"
 case ":$PATH:" in

@@ -21,6 +21,8 @@ describe('personal distribution source invariants', () => {
     expect(installer).toContain('.cache/node/corepack/v1/pnpm/9.5.0/bin/pnpm.cjs');
     expect(installer).toContain('elif command -v pnpm');
     expect(installer).toContain('PNPM_CMD="npx --yes pnpm@9.5.0"');
+    expect(installer).toContain('fs.renameSync(tmp, link)');
+    expect(installer).not.toContain('mv -f "$APP_HOME/current.new"');
   });
 
   it('publishes GitHub releases only and never the official npm package', () => {
