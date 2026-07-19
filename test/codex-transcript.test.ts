@@ -153,6 +153,16 @@ describe('Codex empty task completion', () => {
     )).toBe(true);
     expect(classifyCodexTerminalDiagnostic('Stream closed before response.completed'))
       .toBe('stream_disconnected');
+    expect(classifyCodexTerminalDiagnostic('Stream closed before response.completed', {
+      requireTerminalLine: true,
+    })).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic('› stream disconnected before completion', {
+      requireTerminalLine: true,
+    })).toBeUndefined();
+    expect(classifyCodexTerminalDiagnostic(
+      '■ stream disconnected before completion: stream closed before response.completed',
+      { requireTerminalLine: true },
+    )).toBe('stream_disconnected');
     expect(classifyCodexTerminalDiagnostic(
       "■ Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
     )).toBe('context_window_exceeded');
@@ -387,6 +397,49 @@ describe('drainCodexRollout', () => {
       text: '已完成修复，正在跑边界测试。',
     });
     expect(r.events[1]).toMatchObject({ kind: 'assistant_final', text: 'done' });
+  });
+
+  it('keeps commentary on both sides of a tool call as two ordered progress events', () => {
+    writeFileSync(path,
+      ev(userResponseItem('修复新闻页并构建验证'))
+      + ev({
+        timestamp: '2026-04-29T07:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message', role: 'assistant', phase: 'commentary',
+          content: [{ type: 'output_text', text: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。' }],
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'response_item',
+        payload: { type: 'function_call', name: 'apply_patch', call_id: 'tool-1' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:03.000Z',
+        type: 'response_item',
+        payload: { type: 'function_call_output', call_id: 'tool-1', output: 'Success. Updated NewsChannelPage.kt' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message', role: 'assistant', phase: 'commentary',
+          content: [{ type: 'output_text', text: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。' }],
+        },
+      })
+      + ev(assistantFinalResponseItem('done', '2026-04-29T07:00:05.000Z')),
+    );
+
+    const events = drainCodexRollout(path, 0).events;
+    expect(events.map(event => event.kind)).toEqual([
+      'user', 'assistant_progress', 'assistant_progress', 'assistant_final',
+    ]);
+    expect(events.filter(event => event.kind === 'assistant_progress').map(event => event.text)).toEqual([
+      '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。',
+      '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。',
+    ]);
+    expect(events.map(event => event.text).join('\n')).not.toContain('Success. Updated');
   });
 
   it('skips reasoning / function_call / function_call_output / event_msg', () => {

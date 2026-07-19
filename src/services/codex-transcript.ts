@@ -145,6 +145,8 @@ export interface CodexBridgeEvent {
 export type CodexTerminalDiagnostic = 'context_window_exceeded' | 'stream_disconnected';
 
 const CODEX_CONTEXT_WINDOW_DIAGNOSTIC = "codex ran out of room in the model's context window";
+const CODEX_STREAM_DISCONNECTED_DIAGNOSTIC = 'stream disconnected before completion';
+const CODEX_STREAM_CLOSED_DIAGNOSTIC = 'stream closed before response.completed';
 
 function normalizeTerminalDiagnosticText(content: string): string {
   return content.replace(/\r/g, '').replace(/\s+/g, ' ').toLowerCase();
@@ -161,6 +163,16 @@ function hasExplicitContextDiagnosticLine(content: string): boolean {
   });
 }
 
+function hasExplicitStreamDiagnosticLine(content: string): boolean {
+  return content.replace(/\r/g, '\n').split('\n').some(line => {
+    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
+    return normalizedLine.startsWith(`■ ${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■ ${CODEX_STREAM_CLOSED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_STREAM_CLOSED_DIAGNOSTIC}`);
+  });
+}
+
 /** Classify the exact terminal diagnostics that can disambiguate an empty
  * `task_complete`. Keep this deliberately narrow: this is only a fallback for
  * releases that omit the structured failure from rollout JSONL. The worker
@@ -168,14 +180,15 @@ function hasExplicitContextDiagnosticLine(content: string): boolean {
  * never to arbitrary transcript/user text. */
 export function classifyCodexTerminalDiagnostic(
   content: string,
-  opts: { ignoreContext?: boolean } = {},
+  opts: { ignoreContext?: boolean; requireTerminalLine?: boolean } = {},
 ): CodexTerminalDiagnostic | undefined {
   const normalized = normalizeTerminalDiagnosticText(content);
   if (!opts.ignoreContext && hasExplicitContextDiagnosticLine(content)) {
     return 'context_window_exceeded';
   }
-  if (normalized.includes('stream disconnected before completion')
-    || normalized.includes('stream closed before response.completed')) {
+  if ((normalized.includes(CODEX_STREAM_DISCONNECTED_DIAGNOSTIC)
+    || normalized.includes(CODEX_STREAM_CLOSED_DIAGNOSTIC))
+    && (!opts.requireTerminalLine || hasExplicitStreamDiagnosticLine(content))) {
     return 'stream_disconnected';
   }
   return undefined;

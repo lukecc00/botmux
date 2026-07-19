@@ -60,6 +60,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { notifySessionStopped } from '../../core/session-stop-notice.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
@@ -1533,6 +1534,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      await notifySessionStopped(ds, deps.sessionReply, 'ended', { recipientOpenId: operatorOpenId });
       activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
@@ -1584,6 +1586,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (actionType === 'disconnect' && ds) {
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      await notifySessionStopped(ds, deps.sessionReply, 'ended', { recipientOpenId: operatorOpenId });
       activeSessions.delete(sKey);
       await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);

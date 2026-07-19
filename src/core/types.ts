@@ -8,6 +8,7 @@ import type {
   DisplayMode,
   StreamStatus,
   VcMeetingImTurnOrigin,
+  CodexFreshHandoffReason,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
@@ -88,7 +89,7 @@ export interface DaemonSession {
    * migration without resuming the exhausted native Codex thread. */
   pendingCodexFreshHandoff?: {
     requestedAt: number;
-    reason: 'manual_compact' | 'context_window_exceeded';
+    reason: CodexFreshHandoffReason;
     requestId: string;
     interruptedTurnId?: string;
     interruptedUserGoal?: string;
@@ -154,8 +155,21 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
-  /** In-memory reservation/dedupe for structured per-turn progress cards. */
+  /** Successfully delivered structured progress UUIDs (bounded, in-memory
+   * fast path; the durable outbox + provider UUID are authoritative). */
   progressOutputUuids?: Set<string>;
+  /** Structured progress records currently owned by this daemon process. */
+  progressOutputInFlight?: Set<string>;
+  /** Per-session promise chain keeps separate commentary cards in model order. */
+  progressDeliveryTail?: Promise<void>;
+  /** One terminal conversation-stop notice per session lifetime.  This is an
+   * in-memory fast path; the Lark request UUID is the cross-race dedupe fence. */
+  stopNoticeSent?: boolean;
+  stopNoticeInFlight?: Promise<void>;
+  stopNoticeLifecycleId?: string;
+  /** Set before close teardown starts so retry timers cannot post after the
+   * topic is closed, without mutating the persisted Session status early. */
+  progressDeliveryClosed?: boolean;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns

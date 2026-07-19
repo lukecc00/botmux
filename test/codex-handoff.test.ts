@@ -3,6 +3,7 @@ import {
   buildFreshCodexHandoffPrompt,
   buildFreshCodexHandoffTopic,
   buildFallbackCodexHandoffSummary,
+  claimCodexStreamRecovery,
   clearFreshCodexHandoffLineage,
   CODEX_HANDOFF_SUMMARY_MAX_CHARS,
   CODEX_HANDOFF_SUMMARY_PROMPT,
@@ -10,6 +11,7 @@ import {
   omitOldCodexSessionIds,
   selectCodexHandoffSummary,
   shouldFreshHandoffCodex,
+  freshCodexHandoffCliId,
 } from '../src/core/codex-handoff.js';
 
 describe('Codex /compact fresh handoff', () => {
@@ -47,6 +49,19 @@ describe('Codex /compact fresh handoff', () => {
     expect(fallback.length).toBeLessThanOrEqual(CODEX_HANDOFF_SUMMARY_MAX_CHARS);
   });
 
+  it('labels a stream-disconnect fallback and fresh topic explicitly', () => {
+    const fallback = buildFallbackCodexHandoffSummary({
+      userGoal: 'finish the migration',
+      workingDir: '/repo',
+      reason: 'stream_disconnected',
+    });
+    expect(fallback).toContain('response stream disconnected before completion');
+    expect(buildFreshCodexHandoffTopic(fallback, 'zh', 'stream_disconnected'))
+      .toContain('响应流在完成前断开');
+    expect(buildFreshCodexHandoffTopic(fallback, 'en', 'stream_disconnected'))
+      .toContain('brand-new Codex session');
+  });
+
   it('labels the visible topic and fresh prompt as non-resume handoff', () => {
     const summary = 'Handoff Summary\n\nGoal: finish the migration.';
     expect(buildFreshCodexHandoffTopic(summary, 'zh')).toContain('不会 resume');
@@ -75,5 +90,16 @@ describe('Codex /compact fresh handoff', () => {
     };
     clearFreshCodexHandoffLineage(session);
     expect(session).toEqual({});
+  });
+
+  it('preserves the Codex App surface only for app-server stream recovery', () => {
+    expect(freshCodexHandoffCliId('codex-app', 'stream_disconnected')).toBe('codex-app');
+    expect(freshCodexHandoffCliId('codex', 'stream_disconnected')).toBe('codex');
+    expect(freshCodexHandoffCliId('codex-app', 'context_window_exceeded')).toBe('codex');
+  });
+
+  it('bounds consecutive stream recovery to one migration', () => {
+    expect(claimCodexStreamRecovery(undefined)).toEqual({ allowed: true, nextCount: 1 });
+    expect(claimCodexStreamRecovery(1)).toEqual({ allowed: false, nextCount: 1 });
   });
 });

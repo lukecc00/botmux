@@ -4,18 +4,16 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('Codex missing-final recovery wiring', () => {
-  it('keeps stream-disconnect recovery as a forced fresh in-place session once', () => {
+  it('routes stream-disconnect recovery to the daemon-owned fresh-topic handoff', () => {
     expect(workerSource).toContain("stripAnsiForLog(currentCodexTerminalOutputTail)");
     expect(workerSource).toContain("turn.terminalEvidence ?? ''");
     expect(workerSource).toContain("terminalDiagnostic === 'stream_disconnected'");
     expect(workerSource).toContain("turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;");
     expect(workerSource).toContain("turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR");
-    expect(workerSource).toContain('inflightInputs.onTurnFailed(');
-    expect(workerSource).toContain("codexMissingFinalRecoveryAttempts.set(turn.turnId, 1);");
-    expect(workerSource).toContain("restartCliProcess('Codex task completed without final output', {");
-    expect(workerSource).toContain('forceFresh: true,');
-    expect(workerSource).toContain('resume: false,');
-    expect(workerSource).toContain('cliSessionId: undefined,');
+    expect(workerSource).toContain('beginCodexStreamDisconnectHandoff(turn.turnId, turn.userGoal);');
+    expect(workerSource).toContain("type: 'codex_stream_disconnected'");
+    expect(workerSource).toContain('codexBridgeQueue.lastAmbiguousTerminalTurnId()');
+    expect(workerSource).not.toContain("restartCliProcess('Codex task completed without final output'");
   });
 
   it('routes context exhaustion to daemon handoff without replaying in the old topic', () => {
@@ -63,12 +61,15 @@ describe('Codex missing-final recovery wiring', () => {
   });
 
   it('always publishes a user-visible terminal failure when recovery cannot finish', () => {
-    expect(workerSource).toContain('自动切换新会话后仍未能完成');
-    expect(workerSource).toContain('无法安全恢复原任务输入');
-    expect(workerSource).toContain("emitTurnTerminal(turn.turnId, 'failed', turn.terminalErrorCode);");
+    expect(workerSource).toContain("type: 'codex_stream_disconnected'");
+    expect(workerSource).toContain('interruptedUserGoal');
   });
 
   it('does not worker-locally replay durable dispatch attempts', () => {
-    expect(workerSource).toContain('item => item.dispatchAttempt === undefined,');
+    const start = workerSource.indexOf('function beginCodexStreamDisconnectHandoff(');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = workerSource.slice(start, start + 2_500);
+    expect(region).not.toContain('onTurnFailed(');
+    expect(region).not.toContain('restartCliProcess(');
   });
 });

@@ -138,7 +138,7 @@ describe('worker sendRawCommandLine helper', () => {
 });
 
 describe('daemon prompt_ready dispatch', () => {
-  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2000);
+  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2400);
 
   it('bundles the follow-up onto the raw_input IPC instead of a second message IPC', () => {
     expect(region).toContain('followUpContent: followUp?.cliInput');

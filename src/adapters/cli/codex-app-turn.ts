@@ -51,6 +51,33 @@ export function resolveCodexAppFinalTurnIdentity(
   };
 }
 
+/** Progress and final markers share the same trust boundary: the runner may
+ * redundantly assert the stable client id, but the worker-owned active turn is
+ * always authoritative. */
+export const resolveCodexAppProgressTurnIdentity = resolveCodexAppFinalTurnIdentity;
+
+/** Codex 0.144 app-server schema exposes these as structured
+ * `codexErrorInfo` variants. Keep a text fallback for older servers and for
+ * transport errors surfaced only through stderr/TurnError.message. */
+export function isCodexAppStreamDisconnectError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    const text = String(error ?? '').toLowerCase();
+    return text.includes('stream disconnected before completion')
+      || text.includes('stream closed before response.completed');
+  }
+  const value = error as Record<string, unknown>;
+  const info = value.codexErrorInfo;
+  if (info && typeof info === 'object' && !Array.isArray(info)) {
+    if ('responseStreamDisconnected' in info || 'responseTooManyFailedAttempts' in info) return true;
+  }
+  const text = [value.message, value.additionalDetails]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  return text.includes('stream disconnected before completion')
+    || text.includes('stream closed before response.completed');
+}
+
 export function parseCodexVersion(output: string): CodexVersion | undefined {
   const m = output.match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$|-)/);
   if (!m) return undefined;

@@ -91,6 +91,15 @@ import {
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
+import {
+  completeProgressDelivery,
+  discardProgressDeliveries,
+  listProgressDeliveries,
+  progressProviderUuid,
+  stageProgressDelivery,
+  type ProgressDeliveryRecord,
+} from '../services/progress-delivery-store.js';
+import { notifySessionStopped } from './session-stop-notice.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -153,6 +162,12 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     output: Extract<WorkerToDaemon, { type: 'codex_context_exhausted' }>,
   ) => void | Promise<void>;
+  /** Codex exhausted its response-stream reconnect budget. The daemon uses a
+   * persisted bounded summary to start a fresh topic/native session directly. */
+  onCodexStreamDisconnected?: (
+    ds: DaemonSession,
+    output: Extract<WorkerToDaemon, { type: 'codex_stream_disconnected' }>,
+  ) => void | Promise<void>;
   /** The old CLI exited while a Codex handoff intent was active. The daemon
    * must finalize via a bounded fallback rather than resume that native id. */
   onCodexHandoffSourceExit?: (ds: DaemonSession) => void | Promise<void>;
@@ -200,6 +215,10 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
+
+function callbacksIfInitialised(): WorkerPoolCallbacks | undefined {
+  return callbacks;
+}
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -1476,10 +1495,20 @@ export async function closeSession(
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
   if (ds) {
+    // Fence the live delivery pipeline before killing the worker or deleting
+    // the outbox.
+    // In-flight commentary retry timers and finals waiting behind that FIFO
+    // consult this exact object. Do not mutate Session.status here: the store
+    // transition below still needs to observe active -> closed and persist it.
+    ds.progressDeliveryClosed = true;
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
+    // The worker is stopped; notify before unregistering the live routing
+    // object so chat-scope aliases still resolve to the current topic.
+    const cb = callbacksIfInitialised();
+    if (cb) await notifySessionStopped(ds, cb.sessionReply, 'ended');
     // 文档入口清理：会话关闭即删除其绑定。只有旧
     // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
     // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
@@ -1507,6 +1536,9 @@ export async function closeSession(
       emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
     }
   }
+  // A deliberately closed conversation can never accept a replayed progress
+  // card. Remove any retained outbox entries instead of leaking them forever.
+  discardProgressDeliveries(config.session.dataDir, sessionId);
 
   // Persistence path — load → mark closed → save (delegated to sessionStore).
   const stored = sessionStore.getSession(sessionId);
@@ -2078,6 +2110,7 @@ export function forkWorker(
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
+    void notifySessionStopped(ds, cb.sessionReply, 'unexpected', { turnId: initTurnId });
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -2238,6 +2271,12 @@ function setupWorkerHandlers(
   const t = tag(ds);
   const workerGeneration = (ds.workerGeneration ?? 0) + 1;
   ds.workerGeneration = workerGeneration;
+  // Every concrete worker generation is a new stoppable lifecycle. Reset the
+  // in-memory/provider UUID fence before it can fail during startup, not only
+  // after prompt_ready (a replacement may die before reaching that message).
+  ds.stopNoticeSent = undefined;
+  ds.stopNoticeInFlight = undefined;
+  ds.stopNoticeLifecycleId = undefined;
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2305,6 +2344,110 @@ function setupWorkerHandlers(
     });
     return !decision.ok;
   };
+
+  /** Deliver one durable commentary record. Records are serialized per
+   * session, retried with the same provider UUID, and removed from disk only
+   * after Lark confirms the reply.
+   *
+   * Do not give up after the short foreground retry budget. Commentary is a
+   * one-shot structured event: the worker/transcript will usually never emit
+   * it again. Keeping the head record alive also gives us strict FIFO — card 2
+   * cannot overtake card 1 merely because card 1 hit a transient Lark outage. */
+  const enqueueProgressDelivery = (record: ProgressDeliveryRecord): void => {
+    if (record.sessionId !== ds.session.sessionId) return;
+    if (!record.content.trim()) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (managedAuxUiSuppressed(record.turnId, record.dispatchAttempt)
+      || ds.docCommentTurns?.has(record.turnId)) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (!ds.progressOutputUuids) ds.progressOutputUuids = new Set();
+    if (!ds.progressOutputInFlight) ds.progressOutputInFlight = new Set();
+    if (ds.progressOutputUuids.has(record.transcriptUuid)) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (ds.progressOutputInFlight.has(record.transcriptUuid)) return;
+    ds.progressOutputInFlight.add(record.transcriptUuid);
+
+    const run = async (): Promise<void> => {
+      const cardJson = buildMarkdownCard(
+        record.content,
+        undefined, // progress is deliberately low-attention: no owner @ footer
+        renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+        localeForBot(ds.larkAppId),
+        ds.workingDir,
+        daemonCardLocalHomeLinkMode(ds),
+      );
+      for (let attempt = 0; ; attempt++) {
+        const backoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
+          Math.min(attempt, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+        ] ?? 0;
+        if (backoff > 0) {
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, backoff);
+            // A retained outbox item must not by itself prevent an intentional
+            // daemon shutdown. The next daemon replays it from disk.
+            timer.unref?.();
+          });
+        }
+        if (isSessionClosed(ds)) {
+          completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+          return;
+        }
+        try {
+          await scopedReply(cardJson, 'interactive', record.turnId, {
+            uuid: progressProviderUuid(record.sessionId, record.transcriptUuid),
+          });
+          ds.progressOutputUuids!.add(record.transcriptUuid);
+          while (ds.progressOutputUuids!.size > 512) {
+            const oldest = ds.progressOutputUuids!.values().next().value;
+            if (oldest === undefined) break;
+            ds.progressOutputUuids!.delete(oldest);
+          }
+          completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+          logger.info(
+            `[${t}] Structured progress forwarded `
+            + `(turn ${record.turnId.substring(0, 8)}, ${record.content.length} chars, attempt ${attempt + 1})`,
+          );
+          return;
+        } catch (err: any) {
+          if (err instanceof MessageWithdrawnError) {
+            completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+            logger.warn(`[${t}] Structured progress abandoned — root message withdrawn`);
+            killWorker(ds);
+            cb.closeSession(ds);
+            return;
+          }
+          const nextBackoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
+            Math.min(attempt + 1, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+          ];
+          logger.warn(
+            `[${t}] Structured progress attempt ${attempt + 1} failed; retained at FIFO head `
+            + `and retrying in ${nextBackoff}ms (turn ${record.turnId.substring(0, 8)}): `
+            + `${err?.message ?? err}`,
+          );
+        }
+      }
+    };
+
+    const previous = ds.progressDeliveryTail ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(run).finally(() => {
+      ds.progressOutputInFlight?.delete(record.transcriptUuid);
+    });
+    ds.progressDeliveryTail = current;
+  };
+
+  /** Recovery re-forks baseline the transcript, so already-observed commentary
+   * will not be emitted by the new worker. Replay the daemon-owned outbox here.
+   * `suppressRecoveryCard` intentionally does not apply: it suppresses noisy
+   * terminal/status redraws, never explicit model-authored commentary. */
+  for (const record of listProgressDeliveries(config.session.dataDir, ds.session.sessionId)) {
+    enqueueProgressDelivery(record);
+  }
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
@@ -2338,6 +2481,7 @@ function setupWorkerHandlers(
     } catch (err: any) {
       logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
     }
+    void notifySessionStopped(ds, cb.sessionReply, 'unexpected', { turnId });
   };
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
@@ -2593,6 +2737,10 @@ function setupWorkerHandlers(
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        // An in-worker crash-loop restart begins a new stoppable lifecycle.
+        ds.stopNoticeSent = undefined;
+        ds.stopNoticeInFlight = undefined;
+        ds.stopNoticeLifecycleId = undefined;
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -2808,6 +2956,10 @@ function setupWorkerHandlers(
         // Progress must come from the same worker/session and exact managed
         // attempt as the turn it describes. Unlike screen_update, its content
         // is transcript-native assistant commentary, never a terminal scrape.
+        if (ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored progress_output from stale worker generation`);
+          break;
+        }
         if (msg.sessionId !== ds.session.sessionId) {
           logger.error(
             `[${t}] Dropped progress_output with mismatched sessionId `
@@ -2815,54 +2967,18 @@ function setupWorkerHandlers(
           );
           break;
         }
+        if (isSessionClosed(ds)) break;
         if (!msg.content.trim()) break;
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
-        if (ds.suppressRecoveryCard) break;
         if (ds.docCommentTurns?.has(msg.turnId)) break;
-
-        if (!ds.progressOutputUuids) ds.progressOutputUuids = new Set();
-        if (ds.progressOutputUuids.has(msg.uuid)) break;
-        ds.progressOutputUuids.add(msg.uuid); // reserve before async delivery
-        while (ds.progressOutputUuids.size > 512) {
-          const oldest = ds.progressOutputUuids.values().next().value;
-          if (oldest === undefined) break;
-          ds.progressOutputUuids.delete(oldest);
-        }
-
-        const cardJson = buildMarkdownCard(
-          msg.content,
-          undefined, // progress is deliberately low-attention: no owner @ footer
-          renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
-          localeForBot(ds.larkAppId),
-          ds.workingDir,
-          daemonCardLocalHomeLinkMode(ds),
-        );
-        const deliver = (attempt: number): void => {
-          const backoff = FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0;
-          setTimeout(() => {
-            if (ds.session.status === 'closed') return;
-            scopedReply(cardJson, 'interactive', msg.turnId)
-              .then(() => {
-                logger.info(
-                  `[${t}] Structured progress forwarded `
-                  + `(turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`,
-                );
-              })
-              .catch((err: any) => {
-                const next = attempt + 1;
-                if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
-                  ds.progressOutputUuids?.delete(msg.uuid);
-                  logger.error(
-                    `[${t}] Structured progress gave up after ${next} attempts `
-                    + `(turn ${msg.turnId.substring(0, 8)}): ${err?.message ?? err}`,
-                  );
-                  return;
-                }
-                deliver(next);
-              });
-          }, backoff);
-        };
-        deliver(0);
+        const record = stageProgressDelivery(config.session.dataDir, {
+          sessionId: msg.sessionId,
+          turnId: msg.turnId,
+          transcriptUuid: msg.uuid,
+          content: msg.content,
+          ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+        });
+        enqueueProgressDelivery(record);
         break;
       }
 
@@ -3000,8 +3116,9 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
-        if (effectiveCliId === 'codex' && ds.pendingCodexFreshHandoff) {
-          logger.warn(`[${t}] Codex exited during context handoff; skipping auto-resume of old native session`);
+        if ((effectiveCliId === 'codex' || effectiveCliId === 'codex-app')
+          && ds.pendingCodexFreshHandoff) {
+          logger.warn(`[${t}] Codex exited during fresh-session handoff; skipping auto-resume of old native session`);
           try {
             await cb.onCodexHandoffSourceExit?.(ds);
           } catch (err: any) {
@@ -3036,6 +3153,7 @@ function setupWorkerHandlers(
             try {
               await scopedReply(tr('worker.adopted_session_exited', undefined, loc), 'text', undefined);
             } catch { /* best effort */ }
+            void notifySessionStopped(ds, cb.sessionReply, msg.code === 0 ? 'ended' : 'unexpected');
           }
           break;
         }
@@ -3106,6 +3224,7 @@ function setupWorkerHandlers(
               }
             }
           }
+          if (!suppressExitUi) void notifySessionStopped(ds, cb.sessionReply, 'unexpected');
           break;
         }
 
@@ -3217,6 +3336,26 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_stream_disconnected': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored codex_stream_disconnected from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(
+            `[${t}] Dropped codex_stream_disconnected with mismatched sessionId `
+            + `(worker=${msg.sessionId}, daemon=${ds.session.sessionId})`,
+          );
+          break;
+        }
+        try {
+          await cb.onCodexStreamDisconnected?.(ds, msg);
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to begin Codex stream recovery: ${err.message}`);
+        }
+        break;
+      }
+
       case 'turn_terminal': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
@@ -3236,6 +3375,15 @@ function setupWorkerHandlers(
         if (ds.managedTurnOrigin?.turnId === msg.turnId
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
+        }
+        // A completed turn proves the replacement response stream is healthy.
+        // Reset the consecutive-recovery budget so a later, independent
+        // disconnect remains recoverable while an immediate repeat is bounded.
+        if (msg.status === 'completed' && (ds.session.codexStreamRecoveryCount ?? 0) > 0) {
+          delete ds.session.codexStreamRecoveryCount;
+          try { sessionStore.updateSession(ds.session); } catch (err: any) {
+            logger.warn(`[${t}] Failed to reset Codex stream recovery budget: ${err.message}`);
+          }
         }
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
@@ -3417,19 +3565,23 @@ function setupWorkerHandlers(
       && !worker.killed
       && ds.session.status !== 'closed'
       && !managedAuxUiSuppressed(startupState.initTurnId, startupState.initDispatchAttempt)) {
-      const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
-      const message = tr('worker.exited_unexpectedly', {
-        cliName,
-        code: code ?? 'null',
-        signal: signal ?? 'none',
-      }, loc);
-      emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'worker_unexpected_exit',
-        message,
-      });
-      void scopedReply(message, 'text').catch((err: any) => {
-        logger.error(`[${t}] Failed to deliver unexpected worker exit to Lark: ${err?.message ?? err}`);
-      });
+      const unexpected = code !== 0 || signal !== null;
+      if (unexpected) {
+        const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
+        const message = tr('worker.exited_unexpectedly', {
+          cliName,
+          code: code ?? 'null',
+          signal: signal ?? 'none',
+        }, loc);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'worker_unexpected_exit',
+          message,
+        });
+        void scopedReply(message, 'text').catch((err: any) => {
+          logger.error(`[${t}] Failed to deliver unexpected worker exit diagnostic to Lark: ${err?.message ?? err}`);
+        });
+      }
+      void notifySessionStopped(ds, cb.sessionReply, unexpected ? 'unexpected' : 'ended');
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.
@@ -3476,6 +3628,14 @@ function setupWorkerHandlers(
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+/** Commentary is not reproducible after its transcript event has passed.
+ * Retry forever (bounded at 30s) while the session is active; the durable
+ * outbox takes over across daemon restarts. */
+const PROGRESS_OUTPUT_RETRY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+
+function isSessionClosed(ds: DaemonSession): boolean {
+  return ds.progressDeliveryClosed === true || ds.session.status === 'closed';
+}
 
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
@@ -3569,6 +3729,7 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
+  earlierProgress: Promise<void> | undefined = ds.progressDeliveryTail,
 ): void {
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
@@ -3614,11 +3775,20 @@ function deliverFinalOutput(
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
-    if (ds.session.status === 'closed') {
+    if (isSessionClosed(ds)) {
       logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
       return;
     }
     try {
+      // IPC preserves worker emission order, but progress delivery is async.
+      // Wait for every earlier commentary card to be acknowledged before the
+      // final answer is posted, otherwise a transient failure can make final
+      // appear first and the recovered commentary arrive underneath it.
+      await earlierProgress;
+      if (isSessionClosed(ds)) {
+        logger.info(`[${t}] Bridge final_output abandoned after progress wait — session closed`);
+        return;
+      }
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = managedReceiver ? undefined : ds.docCommentTurns?.get(msg.turnId);
@@ -3847,7 +4017,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next);
+      deliverFinalOutput(ds, msg, t, next, earlierProgress);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -3937,6 +4107,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       ds.larkAppId,
       fallbackTurnId(ds, undefined),
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
+    void notifySessionStopped(ds, cb.sessionReply, 'unexpected');
   });
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,

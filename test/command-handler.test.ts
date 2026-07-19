@@ -1224,7 +1224,16 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
-      const replyArgs = (deps.sessionReply as any).mock.calls[0];
+      const stopNoticeCall = (deps.sessionReply as any).mock.calls.find((call: any[]) =>
+        String(call[1]).includes('当前对话已经停止'));
+      expect(stopNoticeCall).toEqual(expect.arrayContaining([
+        ROOT_ID,
+        expect.stringContaining('当前对话已经停止'),
+        'text',
+        LARK_APP_ID,
+      ]));
+      const replyArgs = (deps.sessionReply as any).mock.calls.find((call: any[]) => call[2] === 'interactive');
+      expect(replyArgs).toBeTruthy();
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');

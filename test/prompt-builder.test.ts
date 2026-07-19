@@ -309,9 +309,19 @@ describe('buildFollowUpContent', () => {
     expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
     expect(content).toContain('关键阶段写成面向用户的 commentary');
     expect(content).toContain('自动同步到飞书卡片');
+    expect(content).toContain('每完成一个可验证阶段');
+    expect(content).toContain('工具前后两段都必须分别输出');
     expect(content).toContain('<codex_delivery>');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
+  });
+
+  it('keeps the same per-card delivery memory for Codex App follow-ups', () => {
+    const content = buildFollowUpContent('继续完成', SESSION_ID, { cliId: 'codex-app' });
+
+    expect(content).toContain('<codex_delivery>');
+    expect(content).toContain('工具前后两段都必须分别输出');
+    expect(content).toContain('回复必须 botmux send');
   });
 
   it('uses final-output reminder for Hermes follow-ups', () => {

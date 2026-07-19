@@ -17,4 +17,10 @@ describe('worker app-runner control-channel wiring', () => {
     expect(workerSource).toContain('const dispatchAttempt = currentBotmuxDispatchAttempt;');
     expect(workerSource).not.toContain('const dispatchAttempt = payload.dispatchAttempt');
   });
+
+  it('routes structured app-server stream terminals through the durable handoff', () => {
+    expect(workerSource).toContain("kind === 'terminal' && payload.status === 'failed'");
+    expect(workerSource).toContain("payload.errorCode === 'codex_stream_disconnected'");
+    expect(workerSource).toContain('beginCodexStreamDisconnectHandoff(');
+  });
 });

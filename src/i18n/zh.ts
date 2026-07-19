@@ -598,7 +598,7 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
-  'ai.shell.codex_structured_delivery': 'Codex 专用交付规则：你明确写给用户的 commentary/进度和 final 会自动以 Markdown 卡片同步到飞书。普通进度和最终答案不要再调用 `botmux send` 重复发送；只在需要附件、@mention、跨群发送等显式能力时使用 `botmux send`。工具调用、命令输出和内部推理不会被同步。',
+  'ai.shell.codex_structured_delivery': 'Codex 专用交付规则：你明确写给用户的每段 commentary/进度和 final，都会分别自动成为一张话题内飞书 Markdown 卡片。长任务中，每完成一个可验证阶段、开始一次预计较久的构建/测试/等待、或得到会改变下一步的新结论，都要立即写一段自包含的 commentary；不要等到 final，也不要把多个里程碑合并。特别是“阶段结论 → 工具调用 → 下一阶段说明 → 长命令/等待”场景，工具前后的两段说明必须分别写成 commentary；工具调用、命令输出、Updated Plan 和 final 都不能替代或吞并这些说明。普通进度和最终答案不要再调用 `botmux send` 重复发送；只在附件、@mention、跨群发送等结构化通道无法表达时使用 `botmux send`。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -608,7 +608,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到',
-  'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者都会自动同步到飞书卡片。不要用 `botmux send` 重复发送普通进度/结果；附件、@mention 或跨群发送除外',
+  'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者都会自动同步到飞书卡片，并在当前话题内逐段回复。每段 commentary 和 final 都会分别成为一张独立卡片。长任务每完成一个可验证阶段、开始较久的构建/测试/等待、或新结论改变下一步时，立即写一段自包含的 commentary；不要等到 final、不要合并多个里程碑。尤其在 commentary → tool → commentary → tool/等待的序列中，工具前后两段都必须分别输出，后续工具或 final 不能替代前段。不要用 `botmux send` 重复发送普通进度/结果；仅附件、@mention 或跨群发送除外',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
@@ -717,6 +717,8 @@ export const messages: Record<string, string> = {
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'worker.exited_unexpectedly': '⚠️ {cliName} 会话异常结束（worker exit code: {code}，signal: {signal}），本轮结果可能不完整。请发送新消息重新启动并重试。',
+  'worker.session_stopped': '当前对话已经停止，请关注。',
+  'worker.session_stopped_unexpected': '当前对话因异常已经停止，本轮结果可能不完整，请关注。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

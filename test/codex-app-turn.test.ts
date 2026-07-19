@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCodexAppTurnStartParams,
   isCleanInputCapabilityError,
+  isCodexAppStreamDisconnectError,
   isCodexAppTurnInput,
   parseCodexVersion,
   resolveCodexAppFinalTurnIdentity,
@@ -96,6 +97,24 @@ describe('Codex App clean-input protocol mapping', () => {
     expect(isCleanInputCapabilityError(new Error('turn/start: {"code":-32600,"message":"additionalContext requires experimentalApi capability"}'))).toBe(true);
     expect(isCleanInputCapabilityError(new Error('turn/start: {"code":-32600,"message":"generic invalid request"}'))).toBe(false);
     expect(isCleanInputCapabilityError(new Error('network timeout'))).toBe(false);
+  });
+
+  it('classifies only terminal stream-disconnect protocol variants or exact diagnostics', () => {
+    expect(isCodexAppStreamDisconnectError({
+      message: 'retry budget exhausted',
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+    })).toBe(true);
+    expect(isCodexAppStreamDisconnectError({
+      message: 'too many attempts',
+      codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 502 } },
+    })).toBe(true);
+    expect(isCodexAppStreamDisconnectError(
+      new Error('stream disconnected before completion: stream closed before response.completed'),
+    )).toBe(true);
+    expect(isCodexAppStreamDisconnectError({
+      message: 'model overloaded',
+      codexErrorInfo: 'serverOverloaded',
+    })).toBe(false);
   });
 
   it('keeps stable marker identity and treats the app-server id as diagnostics only', () => {

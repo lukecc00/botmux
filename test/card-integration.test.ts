@@ -509,7 +509,15 @@ describe('Card integration: full event flow', () => {
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"closed"'),
       );
-      expect(deps.sessionReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ds.chatId,
+        expect.stringContaining('当前对话已经停止'),
+        'text',
+        APP_ID,
+        undefined,
+        expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
+      );
     });
 
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {

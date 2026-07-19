@@ -355,11 +355,59 @@ export class CodexBridgeQueue {
     submittedInput: string;
   }): boolean {
     const target = this.lastAmbiguousTerminal;
-    if (!target || !input.turnId || target.turnId !== input.turnId) return false;
+    if (!target) return false;
+    // A brand-new Lark topic can start without an inbound message id. The
+    // worker then mints the queue mark's `codex-*` id, while its outer
+    // currentBotmuxTurnId remains undefined. There is still exactly one
+    // upgradeable terminal here, so accepting an omitted id is safe; a
+    // supplied, different id continues to fail closed for type-ahead turns.
+    if (input.turnId && target.turnId !== input.turnId) return false;
     target.terminalEvidence = input.terminalEvidence;
     target.terminalViewportEvidence = input.terminalViewportEvidence;
     target.submittedInputAtTerminal = input.submittedInput;
     return true;
+  }
+
+  /** The exact id of the still-upgradeable empty completion. Used when the
+   * outer worker has no Lark message id for a new-topic initial prompt. */
+  lastAmbiguousTerminalTurnId(): string | undefined {
+    return this.lastAmbiguousTerminal?.turnId;
+  }
+
+  /** Close the current marked turn from a strict terminal diagnostic when a
+   * Codex release returns to the prompt without writing task_complete (or even
+   * without flushing the rollout's user record). */
+  failCurrentTurn(input: {
+    turnId?: string;
+    errorCode: string;
+    terminalEvidence: string;
+    terminalViewportEvidence: string;
+    submittedInput: string;
+  }): string | undefined {
+    let target = this.collecting;
+    if (!target && input.turnId) {
+      target = this.queue.find(turn =>
+        turn.turnId === input.turnId && turn.finalText === undefined,
+      ) ?? null;
+    }
+    if (!target && !input.turnId) {
+      const candidates = this.queue.filter(turn => turn.finalText === undefined);
+      if (candidates.length === 1) target = candidates[0] ?? null;
+    }
+    if (!target) return undefined;
+    if (input.turnId && target.turnId !== input.turnId) return undefined;
+    target.started = true;
+    target.finalText = '';
+    target.terminalStatus = 'failed';
+    target.terminalErrorCode = input.errorCode;
+    target.terminalEvidence = input.terminalEvidence;
+    target.terminalViewportEvidence = input.terminalViewportEvidence;
+    target.submittedInputAtTerminal = input.submittedInput;
+    this.collecting = null;
+    this.lastAmbiguousTerminal = null;
+    this.lastStructuredTerminal = target;
+    this.lastClosedAssistantFinalTimeMs = Date.now();
+    return target.turnId;
   }
 
   /** Drain progress independently of final-answer readiness. */

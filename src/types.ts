@@ -264,7 +264,7 @@ export interface Session {
    * and migration correlation state are persisted — never the old transcript. */
   codexFreshHandoff?: {
     requestId: string;
-    reason: 'manual_compact' | 'context_window_exceeded';
+    reason: CodexFreshHandoffReason;
     requestedAt: string;
     interruptedTurnId?: string;
     interruptedUserGoal?: string;
@@ -275,6 +275,10 @@ export interface Session {
     newTopicAnchor?: string;
     newSessionId?: string;
   };
+  /** Consecutive automatic stream-disconnect migrations consumed by this
+   * recovery lineage. Copied to the fresh session and cleared by the next
+   * completed turn, preventing an unbounded chain during a network outage. */
+  codexStreamRecoveryCount?: number;
   /**
    * Set true when the idle-worker sweeper suspends this session over the per-bot
    * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
@@ -518,6 +522,12 @@ export interface CliTurnPayload {
   codexAppInput?: CodexAppTurnInput;
 }
 
+/** Why an unfinished Codex task is moving to a brand-new native thread. */
+export type CodexFreshHandoffReason =
+  | 'manual_compact'
+  | 'context_window_exceeded'
+  | 'stream_disconnected';
+
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; prompt: string; promptUserGoal?: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
@@ -586,6 +596,9 @@ export type WorkerToDaemon =
    * The daemon owns the cross-Lark-topic handoff: /compact the old native
    * thread, collect a bounded summary, then start a fresh native thread. */
   | { type: 'codex_context_exhausted'; sessionId: string; turnId: string; interruptedUserGoal?: string }
+  /** Codex exhausted its reconnect budget before producing a final answer.
+   * The daemon owns the durable fresh-thread migration. */
+  | { type: 'codex_stream_disconnected'; sessionId: string; turnId: string; interruptedUserGoal?: string }
   | {
       type: 'progress_output';
       /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */

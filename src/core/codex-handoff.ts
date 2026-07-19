@@ -1,4 +1,5 @@
 import type { CliId } from '../adapters/cli/types.js';
+import type { CodexFreshHandoffReason } from '../types.js';
 import type { Session } from '../types.js';
 
 /**
@@ -49,6 +50,29 @@ export function clearFreshCodexHandoffLineage(
   delete session.riffParentTaskId;
 }
 
+/** Context compaction is a Codex CLI feature. Stream recovery also serves the
+ * app-server adapter, which must start a fresh app thread through codex-app
+ * rather than silently changing the bot's runtime. */
+export function freshCodexHandoffCliId(
+  sourceCliId: CliId | undefined,
+  reason: CodexFreshHandoffReason,
+): 'codex' | 'codex-app' {
+  return reason === 'stream_disconnected' && sourceCliId === 'codex-app'
+    ? 'codex-app'
+    : 'codex';
+}
+
+export function claimCodexStreamRecovery(
+  currentCount: number | undefined,
+): { allowed: true; nextCount: number } | { allowed: false; nextCount: number } {
+  const count = Number.isInteger(currentCount) && (currentCount ?? 0) > 0
+    ? currentCount!
+    : 0;
+  return count >= 1
+    ? { allowed: false, nextCount: count }
+    : { allowed: true, nextCount: count + 1 };
+}
+
 function bounded(value: string | undefined, max: number): string {
   const text = value?.trim() || '(not available)';
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
@@ -62,13 +86,17 @@ export function buildFallbackCodexHandoffSummary(input: {
   userGoal?: string;
   title?: string;
   workingDir?: string;
+  reason?: 'context_window_exceeded' | 'stream_disconnected';
 }): string {
+  const streamDisconnected = input.reason === 'stream_disconnected';
   return normalizeCodexHandoffSummary([
     'Handoff Summary',
     '',
     `Goal: ${bounded(input.userGoal ?? input.title, 2_000)}`,
     `Workspace: ${bounded(input.workingDir, 1_000)}`,
-    'State: The previous Codex thread exhausted its context window before it could produce a full handoff summary.',
+    streamDisconnected
+      ? 'State: The previous Codex response stream disconnected before completion and produced no final answer.'
+      : 'State: The previous Codex thread exhausted its context window before it could produce a full handoff summary.',
     'Next: Inspect the current workspace and git state, preserve completed changes, then continue the unfinished goal without repeating side effects.',
   ].join('\n'));
 }
@@ -85,17 +113,26 @@ export function selectCodexHandoffSummary(
 export function buildFreshCodexHandoffPrompt(summary: string): string {
   const normalized = normalizeCodexHandoffSummary(summary);
   return [
-    'A previous Codex thread reached its context limit. Continue the unfinished task in this NEW thread.',
+    'A previous Codex thread ended before it could finish. Continue the unfinished task in this NEW thread.',
     'The text below is a handoff record, not a request to resume or reopen the old Codex thread. Inspect the current workspace before relying on mutable details, then continue autonomously from the next unfinished step.',
     '',
     normalized,
   ].join('\n');
 }
 
-export function buildFreshCodexHandoffTopic(summary: string, locale: 'zh' | 'en'): string {
+export function buildFreshCodexHandoffTopic(
+  summary: string,
+  locale: 'zh' | 'en',
+  reason: CodexFreshHandoffReason = 'context_window_exceeded',
+): string {
   const normalized = normalizeCodexHandoffSummary(summary);
+  const streamDisconnected = reason === 'stream_disconnected';
   const note = locale === 'en'
-    ? 'A new topic and a brand-new Codex session have been created from this summary. The context-exhausted session was not resumed.'
-    : '已根据此摘要创建新话题和全新的 Codex 会话；不会 resume 已耗尽上下文的旧会话。';
+    ? streamDisconnected
+      ? 'The previous Codex response stream disconnected before completion. A new topic and a brand-new Codex session were created from this recovery record; the interrupted session was not resumed.'
+      : 'A new topic and a brand-new Codex session have been created from this summary. The previous session was not resumed.'
+    : streamDisconnected
+      ? '上一 Codex 响应流在完成前断开。已根据此恢复记录创建新话题和全新的 Codex 会话；不会 resume 已中断的旧会话。'
+      : '已根据此摘要创建新话题和全新的 Codex 会话；不会 resume 旧会话。';
   return `${normalized}\n\n---\n${note}`;
 }

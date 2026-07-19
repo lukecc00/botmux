@@ -26,6 +26,7 @@ import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { notifySessionStopped } from './session-stop-notice.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1222,6 +1223,10 @@ export async function handleCommand(
           const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
+          await notifySessionStopped(ds, deps.sessionReply, 'ended', {
+            recipientOpenId: message.senderType === 'user' ? message.senderId : undefined,
+            turnId: message.messageId,
+          });
           activeSessions.delete(sessionKey(rootId, larkAppId!));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
@@ -1315,6 +1320,10 @@ export async function handleCommand(
         const closedSessionId = ds.session.sessionId;
         killWorker(ds);
         sessionStore.closeSession(closedSessionId);
+        await notifySessionStopped(ds, deps.sessionReply, 'ended', {
+          recipientOpenId: message.senderType === 'user' ? message.senderId : undefined,
+          turnId: message.messageId,
+        });
         activeSessions.delete(sessionKey(rootId, larkAppId!));
         await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
         logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);

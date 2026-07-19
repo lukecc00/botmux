@@ -177,7 +177,10 @@ import { createHash } from 'node:crypto';
 import { installHook, type HookInstallConfig } from './adapters/hook-installer.js';
 import { hookCommandFor } from './adapters/hook-command.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
-import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
+import {
+  resolveCodexAppFinalTurnIdentity,
+  resolveCodexAppProgressTurnIdentity,
+} from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   managedOriginCapabilityPath,
@@ -815,12 +818,11 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
-const codexMissingFinalRecoveryAttempts = new Map<string, number>();
 const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
 const CODEX_MISSING_FINAL_CANDIDATE = 'codex_task_complete_without_final_candidate';
 const CODEX_CONTEXT_WINDOW_ERROR = 'codex_context_window_exceeded';
 const CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS = 750;
-const CODEX_RECOVERY_SUFFIX = `\n\n<botmux_recovery>\n上一 Codex 会话在没有产生最终答复时异常终止或耗尽上下文。你现在位于一个全新的 Codex 会话中。请检查当前工作区、已有修改和原任务，从中断处继续；不要重复已经完成的有副作用操作。完成后必须给出明确的 final 答复；若仍无法完成，明确说明阻塞原因。\n</botmux_recovery>`;
+const codexStreamHandoffTurnIds = new Set<string>();
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
@@ -2992,10 +2994,32 @@ function codexBridgeDrainAndMaybeEmit(opts: { signalIdle?: boolean } = {}): void
 
 function emitReadyCodexTurns(): void {
   if (structuredBridgeIsCodex()) {
+    const terminalEvidence = stripAnsiForLog(currentCodexTerminalOutputTail);
+    const terminalViewportEvidence = renderer?.rawSnapshot() ?? latestFilteredScreenContent;
+    const directTerminalDiagnostic = classifyCodexTerminalDiagnostic(
+      terminalEvidence,
+      { requireTerminalLine: true },
+    ) ?? classifyCodexTerminalDiagnostic(
+      terminalViewportEvidence,
+      { requireTerminalLine: true },
+    );
+    if (directTerminalDiagnostic) {
+      codexBridgeQueue.failCurrentTurn({
+        turnId: currentBotmuxTurnId,
+        errorCode: directTerminalDiagnostic === 'context_window_exceeded'
+          ? CODEX_CONTEXT_WINDOW_ERROR
+          : CODEX_MISSING_FINAL_ERROR,
+        terminalEvidence,
+        terminalViewportEvidence,
+        submittedInput: currentCodexSubmittedInput,
+      });
+    }
+    const evidenceTurnId = currentBotmuxTurnId
+      ?? codexBridgeQueue.lastAmbiguousTerminalTurnId();
     codexBridgeQueue.refreshLastAmbiguousTerminalEvidence({
-      turnId: currentBotmuxTurnId,
-      terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
-      terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
+      turnId: evidenceTurnId,
+      terminalEvidence,
+      terminalViewportEvidence,
       submittedInput: currentCodexSubmittedInput,
     });
   }
@@ -3027,8 +3051,11 @@ function emitReadyCodexTurns(): void {
       // mistaken for a terminal belonging to another type-ahead turn.
       const terminalDiagnostic = classifyCodexTerminalDiagnostic(
         turn.terminalEvidence ?? '',
-        { ignoreContext: true },
-      ) ?? classifyCodexTerminalDiagnostic(turn.terminalViewportEvidence ?? '');
+        { ignoreContext: true, requireTerminalLine: true },
+      ) ?? classifyCodexTerminalDiagnostic(
+        turn.terminalViewportEvidence ?? '',
+        { requireTerminalLine: true },
+      );
       if (terminalDiagnostic === 'context_window_exceeded') {
         turn.terminalStatus = 'failed';
         turn.terminalErrorCode = CODEX_CONTEXT_WINDOW_ERROR;
@@ -3066,7 +3093,6 @@ function emitReadyCodexTurns(): void {
       pendingRawInputs.length = 0;
       codexBridgeQueue.clearPending();
       inflightInputs.onTurnComplete();
-      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
       send({
         type: 'codex_context_exhausted',
         sessionId,
@@ -3079,43 +3105,7 @@ function emitReadyCodexTurns(): void {
       && turn.dispatchAttempt === undefined
       && turn.terminalStatus === 'failed'
       && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) {
-      const recoveryAttempts = codexMissingFinalRecoveryAttempts.get(turn.turnId) ?? 0;
-      if (recoveryAttempts === 0) {
-        const staged = inflightInputs.onTurnFailed(
-          turn.turnId,
-          item => ({
-            ...item,
-            content: `${item.content}${CODEX_RECOVERY_SUFFIX}`,
-            codexAppInput: item.codexAppInput
-              ? { ...item.codexAppInput, text: `${item.codexAppInput.text}${CODEX_RECOVERY_SUFFIX}` }
-              : undefined,
-          }),
-          item => item.dispatchAttempt === undefined,
-        );
-        if (staged > 0) {
-          codexMissingFinalRecoveryAttempts.set(turn.turnId, 1);
-          send({
-            type: 'user_notify',
-            turnId: turn.turnId,
-            message: '⚠️ Codex 运行流在生成最终答复前异常终止。已自动切换到全新 Codex 会话，不 resume 旧会话，并从当前工作区继续本轮任务。',
-          });
-          void restartCliProcess('Codex task completed without final output', {
-            preservePending: true,
-            forceFresh: true,
-          });
-          continue;
-        }
-      }
-      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
-      inflightInputs.onTurnComplete();
-      send({
-        type: 'user_notify',
-        turnId: turn.turnId,
-        message: recoveryAttempts > 0
-          ? '❌ Codex 运行流再次异常终止，自动切换新会话后仍未能完成。本轮已停止自动重试，请查看当前工作区；已完成的文件修改会保留。'
-          : '❌ Codex 运行流在生成最终答复前异常终止，且 botmux 无法安全恢复原任务输入，因此未自动重放。本轮已停止，请查看当前工作区；已完成的文件修改会保留。',
-      });
-      emitTurnTerminal(turn.turnId, 'failed', turn.terminalErrorCode);
+      beginCodexStreamDisconnectHandoff(turn.turnId, turn.userGoal);
       continue;
     }
     if (!turn.finalText) continue;
@@ -3158,9 +3148,6 @@ function emitReadyCodexTurns(): void {
       && turn.terminalStatus === 'failed'
       && (turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR
         || turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR)) continue;
-    if ((turn.terminalStatus ?? 'completed') === 'completed') {
-      codexMissingFinalRecoveryAttempts.delete(turn.turnId);
-    }
     emitTurnTerminal(
       turn.turnId,
       turn.terminalStatus ?? 'completed',
@@ -3168,6 +3155,38 @@ function emitReadyCodexTurns(): void {
       turn.dispatchAttempt,
     );
   }
+}
+
+/** Freeze the interrupted ordinary IM batch and hand ownership to the
+ * daemon's durable fresh-topic migration. Both the transcript bridge and the
+ * Codex App runner use this edge; the set prevents duplicate app-server
+ * `error` + `turn/completed` notifications from creating two migrations. */
+function beginCodexStreamDisconnectHandoff(turnId: string, userGoal?: string): void {
+  if (!turnId || codexStreamHandoffTurnIds.has(turnId)) return;
+  codexStreamHandoffTurnIds.add(turnId);
+  while (codexStreamHandoffTurnIds.size > 64) {
+    const oldest = codexStreamHandoffTurnIds.values().next().value;
+    if (oldest === undefined) break;
+    codexStreamHandoffTurnIds.delete(oldest);
+  }
+  const writtenGoals = inflightInputs.takeForHandoff(turnId)
+    .map(item => item.userGoal)
+    .filter((goal): goal is string => !!goal);
+  const interruptedUserGoal = [...new Set([
+    userGoal,
+    ...writtenGoals,
+    ...pendingMessages.map(item => item.userGoal).filter((goal): goal is string => !!goal),
+  ].filter((goal): goal is string => !!goal))].join('\n\n').slice(0, 4_000) || undefined;
+  pendingMessages.length = 0;
+  pendingRawInputs.length = 0;
+  codexBridgeQueue.clearPending();
+  inflightInputs.onTurnComplete();
+  send({
+    type: 'codex_stream_disconnected',
+    sessionId,
+    turnId,
+    interruptedUserGoal,
+  });
 }
 
 function stopCodexBridge(): void {
@@ -4083,6 +4102,87 @@ function handleCodexAppMarker(body: string): void {
     return;
   }
 
+  if (kind === 'progress' && typeof payload.content === 'string' && payload.content.trim()) {
+    const identity = resolveCodexAppProgressTurnIdentity(
+      payload,
+      currentBotmuxTurnId,
+      `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
+    );
+    if (!identity.ok) {
+      log(
+        `${cliName()} rejected progress marker with mismatched turn `
+        + `(marker=${identity.markerTurnId.substring(0, 12)}, `
+        + `current=${identity.currentBotmuxTurnId?.substring(0, 12) ?? '-'})`,
+      );
+      return;
+    }
+    if (payload.dispatchAttempt !== undefined
+      && payload.dispatchAttempt !== currentBotmuxDispatchAttempt) {
+      log(
+        `${cliName()} rejected progress marker with mismatched dispatch attempt `
+        + `(marker=${String(payload.dispatchAttempt)}, current=${currentBotmuxDispatchAttempt ?? '-'})`,
+      );
+      return;
+    }
+    const itemId = typeof payload.itemId === 'string' && payload.itemId
+      ? payload.itemId
+      : createHash('sha256').update(payload.content).digest('hex').slice(0, 24);
+    const nativeTurnId = identity.nativeTurnId ?? identity.turnId;
+    send({
+      type: 'progress_output',
+      sessionId,
+      content: payload.content,
+      uuid: `app:${nativeTurnId}:${itemId}`,
+      turnId: identity.turnId,
+      ...(currentBotmuxDispatchAttempt !== undefined
+        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+        : {}),
+    });
+    return;
+  }
+
+  if (kind === 'terminal' && payload.status === 'failed') {
+    const identity = resolveCodexAppFinalTurnIdentity(
+      payload,
+      currentBotmuxTurnId,
+      `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
+    );
+    if (!identity.ok) {
+      log(
+        `${cliName()} rejected terminal marker with mismatched turn `
+        + `(marker=${identity.markerTurnId.substring(0, 12)}, `
+        + `current=${identity.currentBotmuxTurnId?.substring(0, 12) ?? '-'})`,
+      );
+      return;
+    }
+    if (payload.dispatchAttempt !== undefined
+      && payload.dispatchAttempt !== currentBotmuxDispatchAttempt) return;
+    if (payload.errorCode === 'codex_stream_disconnected'
+      && currentBotmuxDispatchAttempt === undefined
+      && lastInitConfig?.adoptMode !== true) {
+      beginCodexStreamDisconnectHandoff(
+        identity.turnId,
+        lastInitConfig?.promptUserGoal,
+      );
+      return;
+    }
+    send({
+      type: 'user_notify',
+      turnId: identity.turnId,
+      ...(currentBotmuxDispatchAttempt !== undefined
+        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+        : {}),
+      message: `❌ ${String(payload.message ?? 'Codex App turn failed')}`,
+    });
+    emitTurnTerminal(
+      identity.turnId,
+      'failed',
+      String(payload.errorCode ?? 'codex_app_turn_failed'),
+      currentBotmuxDispatchAttempt,
+    );
+    return;
+  }
+
   if (kind === 'final' && typeof payload.content === 'string') {
     const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
     const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
@@ -4651,7 +4751,20 @@ async function flushPending(): Promise<void> {
     if (pendingMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
   if (!isPromptReady && pendingMessages.length === 0) return;
-  if (!isPromptReady && !typeAheadAllowed) return;
+  // Reuse the same startup/type-ahead gate as sendToPty(). An owned restart
+  // wakes flushPending() immediately after installing the replacement backend,
+  // while the tmux pane can still be running its transient shell wrapper. Even
+  // type-ahead-capable CLIs have no composer yet at that point: flushing would
+  // both lose the input and let detectBareShellLaunch() mistake that short-lived
+  // shell for a permanent launch failure. The real prompt edge (or the bounded
+  // first-prompt fallback, which clears awaitingFirstPrompt first) wakes the
+  // queue again once it is safe to inspect and write.
+  if (!shouldWriteNow({
+    isPromptReady,
+    isFlushing,
+    supportsTypeAhead: typeAheadAllowed,
+    awaitingFirstPrompt,
+  })) return;
 
   isFlushing = true;
   if (isPromptReady) {

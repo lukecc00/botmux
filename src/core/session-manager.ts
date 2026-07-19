@@ -829,11 +829,12 @@ export function buildFollowUpContent(
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
+    const structuredCodex = opts?.cliId === 'codex' || opts?.cliId === 'codex-app';
     const reminder = opts?.cliId === 'hermes'
       ? hermesFollowupReminder(opts?.locale)
       : t('ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
-    if (opts?.cliId === 'codex') {
+    if (structuredCodex) {
       parts.push(`<codex_delivery>${t('ai.followup.codex_structured_delivery', undefined, opts?.locale)}</codex_delivery>`);
     }
   }

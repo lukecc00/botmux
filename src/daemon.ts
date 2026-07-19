@@ -152,12 +152,14 @@ import {
   buildFallbackCodexHandoffSummary,
   buildFreshCodexHandoffPrompt,
   buildFreshCodexHandoffTopic,
+  claimCodexStreamRecovery,
   clearFreshCodexHandoffLineage,
   CODEX_HANDOFF_TIMEOUT_MS,
   CODEX_HANDOFF_SUMMARY_PROMPT,
   omitOldCodexSessionIds,
   selectCodexHandoffSummary,
   shouldFreshHandoffCodex,
+  freshCodexHandoffCliId,
 } from './core/codex-handoff.js';
 import {
   getSessionPersistentBackendType,
@@ -3293,7 +3295,7 @@ async function migrateCodexHandoffToFreshTopic(
     const anchor = handoff.newTopicAnchor ?? await sendMessage(
         source.larkAppId,
         source.chatId,
-        buildFreshCodexHandoffTopic(selectedSummary, locale),
+        buildFreshCodexHandoffTopic(selectedSummary, locale, handoff.reason),
         'text',
         handoff.requestId,
       );
@@ -3304,6 +3306,7 @@ async function migrateCodexHandoffToFreshTopic(
     }
     const bot = getBot(source.larkAppId);
     const promptText = buildFreshCodexHandoffPrompt(selectedSummary);
+    const freshCliId = freshCodexHandoffCliId(source.session.cliId, handoff.reason);
     let session = handoff.newSessionId ? sessionStore.getSession(handoff.newSessionId) : undefined;
     if (!session) {
       session = sessionStore.listSessions().find(candidate =>
@@ -3343,12 +3346,14 @@ async function migrateCodexHandoffToFreshTopic(
     session.creatorOpenId = source.session.creatorOpenId;
     session.lastCallerOpenId = source.session.lastCallerOpenId;
     session.workingDir = source.workingDir ?? source.session.workingDir;
-    // Freeze the same Codex launcher/model, but never copy the native thread
-    // id. cliSessionId therefore starts empty and Codex receives no `resume`.
-    session.cliId = 'codex';
+    // Freeze the same Codex launcher/model/surface, but never copy the native
+    // thread id. Context compaction stays on CLI Codex; app-server stream
+    // recovery starts a fresh codex-app thread instead of changing runtimes.
+    session.cliId = freshCliId;
     session.cliPathOverride = source.session.cliPathOverride;
     session.wrapperCli = source.session.wrapperCli;
     session.model = source.session.model;
+    session.codexStreamRecoveryCount = source.session.codexStreamRecoveryCount;
     session.agentFrozen = true;
     session.lastMessageAt = new Date(now).toISOString();
     // Hard no-lineage invariant. A newly-created handoff target never inherits
@@ -3387,7 +3392,7 @@ async function migrateCodexHandoffToFreshTopic(
     const input = buildNewTopicCliInput(
       promptText,
       session.sessionId,
-      'codex',
+      freshCliId,
       session.cliPathOverride,
       undefined,
       undefined,
@@ -3542,6 +3547,9 @@ function fallbackCodexHandoffSummary(source: DaemonSession): string {
     userGoal: pending?.interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
     title: source.session.title,
     workingDir: source.workingDir ?? source.session.workingDir,
+    reason: pending?.reason === 'stream_disconnected'
+      ? 'stream_disconnected'
+      : 'context_window_exceeded',
   });
 }
 
@@ -3617,6 +3625,67 @@ async function beginAutomaticCodexContextHandoff(
   }
   markSessionActivity(source);
   logger.info(`[${tag(source)}] Codex context exhausted → /compact handoff armed`);
+}
+
+/** A response-stream disconnect has no trustworthy old stream left from which
+ * to request /compact + a summary. Persist a bounded workspace-oriented
+ * handoff immediately, then reuse the same fresh-topic/session migration as
+ * context exhaustion. One migration is allowed per lineage; the count is
+ * copied to the fresh session, so another disconnect stops instead of opening
+ * an unbounded topic chain during a network outage. */
+async function beginAutomaticCodexStreamRecovery(
+  source: DaemonSession,
+  interruptedTurnId: string,
+  interruptedUserGoal?: string,
+): Promise<void> {
+  if (source.pendingCodexFreshHandoff) {
+    logger.info(`[${tag(source)}] Codex handoff already active; duplicate stream terminal ignored`);
+    return;
+  }
+  const recoveryClaim = claimCodexStreamRecovery(source.session.codexStreamRecoveryCount);
+  if (!recoveryClaim.allowed) {
+    const locale = localeForBot(source.larkAppId);
+    await sessionReply(
+      sessionAnchorId(source),
+      locale === 'en'
+        ? '❌ Codex response streaming disconnected again after the automatic fresh-session recovery. Botmux stopped to avoid an endless chain of new topics. Workspace changes are preserved; please retry after the connection is stable.'
+        : '❌ 自动切换全新会话后，Codex 响应流再次断开。为避免无限创建新话题，botmux 已停止自动续跑。当前工作区修改均已保留，请在网络稳定后重试。',
+      'text',
+      source.larkAppId,
+      interruptedTurnId,
+    );
+    return;
+  }
+  source.session.codexStreamRecoveryCount = recoveryClaim.nextCount;
+  const pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']> = {
+    requestedAt: Date.now(),
+    requestId: randomUUID(),
+    reason: 'stream_disconnected',
+    interruptedTurnId,
+    interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
+    summaryTurnId: `codex-stream-recovery-${randomUUID()}`,
+    phase: 'collecting',
+  };
+  source.pendingCodexFreshHandoff = pending;
+  persistCodexHandoff(source);
+  void sessionReply(
+    sessionAnchorId(source),
+    localeForBot(source.larkAppId) === 'en'
+      ? '⚠️ Codex response streaming disconnected before completion. Botmux is creating a new topic and a brand-new Codex session to continue this task. The interrupted session will not be resumed; workspace changes are preserved.'
+      : '⚠️ Codex 响应流在完成前异常断开。botmux 正在创建新话题和全新的 Codex 会话继续本轮任务；不会 resume 已中断的旧会话，当前工作区修改会保留。',
+    'text',
+    source.larkAppId,
+    interruptedTurnId,
+  ).catch(err => logger.warn(
+    `[${tag(source)}] Failed to notify stream recovery start: ${err instanceof Error ? err.message : String(err)}`,
+  ));
+  const fallback = buildFallbackCodexHandoffSummary({
+    userGoal: pending.interruptedUserGoal,
+    title: source.session.title,
+    workingDir: source.workingDir ?? source.session.workingDir,
+    reason: 'stream_disconnected',
+  });
+  await migrateCodexHandoffToFreshTopic(source, fallback);
 }
 
 /**
@@ -16143,6 +16212,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         });
       }
       return beginAutomaticCodexContextHandoff(ds, output.turnId, output.interruptedUserGoal);
+    },
+    onCodexStreamDisconnected(ds, output) {
+      return beginAutomaticCodexStreamRecovery(ds, output.turnId, output.interruptedUserGoal);
     },
     onCodexHandoffSourceExit(ds) {
       const pending = ds.pendingCodexFreshHandoff;

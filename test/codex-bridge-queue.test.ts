@@ -68,6 +68,34 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainEmittable()[0]).toMatchObject({ turnId: 't-progress', finalText: '全部完成' });
   });
 
+  it('drains multiple tool-separated commentary records once and in transcript order', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-layout-build', '修复新闻页并构建验证', 100);
+    q.ingest([
+      userEv('修复新闻页并构建验证', 'user-layout-build', 101),
+      progressEv('已核对原生 XML 和 Holder。', 'commentary-before-tool', 102),
+      progressEv('已完成首轮修复并开始构建。', 'commentary-after-tool', 104),
+      asstEv('最终完成', 'final-layout-build', 105),
+    ]);
+
+    expect(q.drainProgressOutputs()).toEqual([
+      expect.objectContaining({
+        uuid: 'commentary-before-tool',
+        content: '已核对原生 XML 和 Holder。',
+        turnId: 'turn-layout-build',
+      }),
+      expect.objectContaining({
+        uuid: 'commentary-after-tool',
+        content: '已完成首轮修复并开始构建。',
+        turnId: 'turn-layout-build',
+      }),
+    ]);
+    expect(q.drainProgressOutputs()).toEqual([]);
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'turn-layout-build', finalText: '最终完成',
+    });
+  });
+
   it('replays transcript-before-mark progress and dedupes its uuid', () => {
     const q = new CodexBridgeQueue();
     q.ingest([
@@ -242,6 +270,68 @@ describe('CodexBridgeQueue', () => {
       turnId: 'turn-a',
       terminalEvidence: 'right raw',
       terminalViewportEvidence: 'right viewport',
+    });
+  });
+
+  it('refreshes the sole synthetic initial turn when no outer Lark turn id exists', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('codex-synthetic-initial', 'initial goal', 100);
+    q.ingest([
+      userEv('initial goal', 'initial-user', 101),
+      {
+        ...asstEv('', 'initial-empty', 102),
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'codex_task_complete_without_final_candidate',
+      },
+    ]);
+
+    expect(q.lastAmbiguousTerminalTurnId()).toBe('codex-synthetic-initial');
+    expect(q.refreshLastAmbiguousTerminalEvidence({
+      turnId: undefined,
+      terminalEvidence: 'stream disconnected before completion',
+      terminalViewportEvidence: 'stream closed before response.completed',
+      submittedInput: 'initial goal',
+    })).toBe(true);
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'codex-synthetic-initial',
+      terminalEvidence: 'stream disconnected before completion',
+    });
+  });
+
+  it('closes a collecting turn from a strict terminal diagnostic without task_complete', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-no-boundary', 'continue', 100);
+    q.ingest([userEv('continue', 'user-no-boundary', 101)]);
+
+    expect(q.failCurrentTurn({
+      turnId: 'turn-no-boundary',
+      errorCode: 'codex_task_complete_without_final',
+      terminalEvidence: '■ stream disconnected before completion',
+      terminalViewportEvidence: '■ stream disconnected before completion',
+      submittedInput: 'continue',
+    })).toBe('turn-no-boundary');
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'turn-no-boundary',
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_task_complete_without_final',
+    });
+  });
+
+  it('closes the sole marked turn even when the rollout never flushes its user record', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-no-user-record', 'continue', 100);
+
+    expect(q.failCurrentTurn({
+      turnId: undefined,
+      errorCode: 'codex_task_complete_without_final',
+      terminalEvidence: '■ stream disconnected before completion',
+      terminalViewportEvidence: '■ stream disconnected before completion',
+      submittedInput: 'continue',
+    })).toBe('turn-no-user-record');
+    expect(q.drainEmittable()[0]).toMatchObject({
+      turnId: 'turn-no-user-record',
+      started: true,
+      terminalStatus: 'failed',
     });
   });
 

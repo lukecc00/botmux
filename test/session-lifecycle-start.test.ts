@@ -736,7 +736,7 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('nested codex dependency missing'),
@@ -744,6 +744,14 @@ describe('worker startup failure delivery', () => {
       'app_test',
       'turn-clean-start',
       undefined,
+    );
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('当前对话因异常已经停止'),
+      'text',
+      'app_test',
+      'turn-clean-start',
+      expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
     );
   });
 
@@ -779,7 +787,7 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('CLI relaunch dependency disappeared'),
@@ -787,6 +795,14 @@ describe('worker startup failure delivery', () => {
       'app_test',
       'turn-live-clean',
       undefined,
+    );
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('当前对话因异常已经停止'),
+      'text',
+      'app_test',
+      'turn-live-clean',
+      expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
     );
   });
 
@@ -809,7 +825,7 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('missing-agent'),
@@ -820,6 +836,14 @@ describe('worker startup failure delivery', () => {
       // added beforeQuoteFallback support; the startup-failure delivery is
       // otherwise unchanged.
       undefined,
+    );
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('当前对话因异常已经停止'),
+      'text',
+      'app_test',
+      'turn-start',
+      expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
     );
   });
 
@@ -924,8 +948,72 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('exit code: 9'))).toBe(true);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('当前对话因异常已经停止'))).toBe(true);
+  });
+
+  it('keeps the exit diagnostic and @s the latest caller when a ready worker crashes', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.lastCallerOpenId = 'ou_latest';
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+
+    worker.emit('exit', 137, 'SIGKILL');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply.mock.calls.some(call =>
+      String(call[1]).includes('worker exit code: 137'))).toBe(true);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('<at user_id="ou_latest"></at> 当前对话因异常已经停止'),
+      'text',
+      'app_test',
+      undefined,
+      expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
+    );
+  });
+
+  it('@s the latest caller with a normal stop notice when a ready worker exits cleanly', async () => {
+    const sessionReply = vi.fn(async () => 'om_stop_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.lastCallerOpenId = 'ou_latest';
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+
+    worker.emit('exit', 0, null);
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('exit code: 9');
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      '<at user_id="ou_latest"></at> 当前对话已经停止，请关注。',
+      'text',
+      'app_test',
+      undefined,
+      expect.objectContaining({ uuid: expect.stringMatching(/^bmxs_/) }),
+    );
   });
 
   it('keeps a fatal CLI relaunch error user-visible after the worker was ready', async () => {
@@ -948,11 +1036,11 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(sessionReply.mock.calls[0]?.[1]).toContain('CLI relaunch dependency disappeared');
   });
 
-  it('marks an adopt fork failure as requiring attention and replies once', async () => {
+  it('marks an adopt fork failure as requiring attention and sends the stop notice', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
@@ -976,8 +1064,9 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('adopt fork ENOENT');
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('adopt fork ENOENT'))).toBe(true);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('当前对话因异常已经停止'))).toBe(true);
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       sessionId: 'sid-start-test',
       reason: 'worker_fork_error',

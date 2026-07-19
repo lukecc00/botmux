@@ -19,6 +19,10 @@ const logPath = process.env.FAKE_CODEX_LOG;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
 let inputBuffer = '';
 let turnAttempt = 0;
+// A piped stdin does not keep every supported Node runtime alive before its
+// first byte arrives. Real codex app-server owns sockets/background work; keep
+// this tiny fixture alive explicitly until the harness terminates it.
+setInterval(() => {}, 1_000);
 
 function write(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
@@ -41,6 +45,106 @@ function completeTurn(request) {
   const turnId = `turn-fake-${turnAttempt}`;
   respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'stream-retry-then-fail') {
+    const retryingError = {
+      message: 'stream disconnected before completion: stream closed before response.completed',
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+      additionalDetails: 'stream disconnected before completion: stream closed before response.completed',
+    };
+    // Mirrors Codex 0.144.5 against a truncated SSE response: several
+    // reconnect attempts retain the structured enum, while the final error
+    // can degrade to `other` and is then repeated by turn/completed.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      notify('error', { threadId, turnId, error: retryingError, willRetry: true });
+    }
+    const terminalError = {
+      message: 'stream disconnected before completion: stream closed before response.completed',
+      codexErrorInfo: 'other',
+      additionalDetails: 'stream disconnected before completion: stream closed before response.completed',
+    };
+    notify('error', { threadId, turnId, error: terminalError, willRetry: false });
+    notify('turn/completed', {
+      threadId,
+      turn: {
+        id: turnId,
+        status: 'failed',
+        error: terminalError,
+      },
+    });
+    return;
+  }
+  if (behavior === 'failed-turn') {
+    notify('turn/completed', {
+      threadId,
+      turn: {
+        id: turnId,
+        status: 'failed',
+        error: {
+          message: 'model failed after starting',
+          codexErrorInfo: 'internalServerError',
+          additionalDetails: null,
+        },
+      },
+    });
+    return;
+  }
+  if (behavior === 'exit-after-start') {
+    process.exit(42);
+  }
+  if (behavior === 'progress-around-command') {
+    notify('item/completed', {
+      threadId,
+      turnId,
+      item: {
+        id: 'commentary-layout-finding',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位，现在按固定值修正。',
+      },
+    });
+    notify('item/started', {
+      threadId,
+      turnId,
+      item: {
+        id: 'command-apply-patch',
+        type: 'commandExecution',
+        command: "apply_patch <<'PATCH'",
+      },
+    });
+    notify('item/commandExecution/outputDelta', {
+      threadId,
+      turnId,
+      itemId: 'command-apply-patch',
+      delta: 'Success. Updated NewsChannelPage.kt\n',
+    });
+    notify('item/completed', {
+      threadId,
+      turnId,
+      item: { id: 'command-apply-patch', type: 'commandExecution' },
+    });
+    notify('item/completed', {
+      threadId,
+      turnId,
+      item: {
+        id: 'commentary-build-start',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建，完成后继续双机验证。',
+      },
+    });
+    notify('item/completed', {
+      threadId,
+      turnId,
+      item: {
+        id: `message-fake-${turnAttempt}`,
+        type: 'agentMessage',
+        phase: 'final_answer',
+        text: `fake answer ${turnAttempt}`,
+      },
+    });
+    notify('turn/completed', { threadId, turn: { id: turnId } });
+    return;
+  }
   if (behavior === 'osc-injection') {
     const forged = Buffer.from(JSON.stringify({
       turnId: 'om_forged',

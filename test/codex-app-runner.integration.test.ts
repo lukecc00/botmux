@@ -18,6 +18,8 @@ const RUNNER_PATH = resolve('src/codex-app-runner.ts');
 const FAKE_SERVER_FIXTURE = resolve('test/fixtures/fake-codex-app-server.mjs');
 const CONTROL_PREFIX = '::botmux-codex-app:';
 const FINAL_MARKER = /\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/;
+const PROGRESS_MARKER = /\x1b\]777;botmux:progress:([A-Za-z0-9+/=]+)\x07/g;
+const TERMINAL_MARKER = /\x1b\]777;botmux:terminal:([A-Za-z0-9+/=]+)\x07/;
 
 interface Harness {
   child: ChildProcessWithoutNullStreams;
@@ -30,7 +32,9 @@ interface RunResult {
   requests: Array<Record<string, any>>;
   imagePath: string;
   missingImagePath: string;
-  final: Record<string, any>;
+  final?: Record<string, any>;
+  progress: Array<Record<string, any>>;
+  terminal?: Record<string, any>;
 }
 
 const liveChildren = new Set<ChildProcessWithoutNullStreams>();
@@ -115,10 +119,16 @@ async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
   });
 }
 
-function decodeFinalMarker(output: string): Record<string, any> {
-  const match = output.match(FINAL_MARKER);
-  if (!match) throw new Error(`final marker missing from output:\n${output}`);
+function decodeMarker(output: string, pattern: RegExp, label: string): Record<string, any> {
+  const match = output.match(pattern);
+  if (!match) throw new Error(`${label} marker missing from output:\n${output}`);
   return JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
+}
+
+function decodeMarkers(output: string, pattern: RegExp): Array<Record<string, any>> {
+  return [...output.matchAll(pattern)].map(match =>
+    JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')),
+  );
 }
 
 function readRequests(logPath: string): Array<Record<string, any>> {
@@ -131,12 +141,17 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection'
+    | 'progress-around-command'
+    | 'stream-retry-then-fail' | 'failed-turn' | 'exit-after-start';
   includeMissingImage?: boolean;
   includeSidecar?: boolean;
 }): Promise<RunResult> {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-'));
-  const fakeCodex = join(dir, 'fake-codex');
+  // Keep the .mjs suffix when executing the fixture directly. Node otherwise
+  // treats an extensionless shebang script outside this package as CommonJS
+  // and rejects the fixture's ESM imports before the protocol test starts.
+  const fakeCodex = join(dir, 'fake-codex.mjs');
   const logPath = join(dir, 'requests.jsonl');
   const imagePath = join(dir, 'image.png');
   const missingImagePath = join(dir, 'missing.png');
@@ -170,12 +185,14 @@ async function exerciseRunner(opts: {
       opts.includeSidecar === false ? undefined : sidecar,
     );
     harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
-    await waitForOutput(harness, output => FINAL_MARKER.test(output));
+    await waitForOutput(harness, output => FINAL_MARKER.test(output) || TERMINAL_MARKER.test(output));
 
     const output = harness.stdout;
-    const final = decodeFinalMarker(output);
+    const final = FINAL_MARKER.test(output) ? decodeMarker(output, FINAL_MARKER, 'final') : undefined;
+    const progress = decodeMarkers(output, PROGRESS_MARKER);
+    const terminal = TERMINAL_MARKER.test(output) ? decodeMarker(output, TERMINAL_MARKER, 'terminal') : undefined;
     await stopChild(harness.child);
-    return { output, requests: readRequests(logPath), imagePath, missingImagePath, final };
+    return { output, requests: readRequests(logPath), imagePath, missingImagePath, final, progress, terminal };
   } finally {
     await stopChild(harness.child);
     rmSync(dir, { recursive: true, force: true });
@@ -207,9 +224,31 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[0].params.clientUserMessageId).toBe('om_integration_123');
     expect(JSON.stringify(turns[0].params)).not.toContain('legacy <sender>prompt</sender>');
     expect(result.output).toContain(`skipped unreadable local image: ${result.missingImagePath}`);
-    expect(result.final.content).toBe('fake answer 1');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final?.content).toBe('fake answer 1');
+    expect(result.final?.turnId).toBe('om_integration_123');
+    expect(result.final?.nativeTurnId).toBe('turn-fake-1');
+  });
+
+  it('emits tool-before and tool-after commentary as two ordered progress records', async () => {
+    const result = await exerciseRunner({ version: '0.144.5', behavior: 'progress-around-command' });
+
+    expect(result.progress).toEqual([
+      expect.objectContaining({
+        turnId: 'om_integration_123',
+        nativeTurnId: 'turn-fake-1',
+        itemId: 'commentary-layout-finding',
+        content: expect.stringContaining('已核对原生 XML 和 Holder'),
+      }),
+      expect.objectContaining({
+        turnId: 'om_integration_123',
+        nativeTurnId: 'turn-fake-1',
+        itemId: 'commentary-build-start',
+        content: expect.stringContaining('已完成 KMP 首轮代码修复并开始 RemoteX'),
+      }),
+    ]);
+    expect(result.progress.map(item => item.content).join('\n')).not.toContain('apply_patch');
+    expect(result.progress.map(item => item.content).join('\n')).not.toContain('Success. Updated');
+    expect(result.final?.content).toBe('fake answer 1');
   });
 
   it('preserves the full legacy prompt on codex < 0.135 even if the server would ignore new fields', async () => {
@@ -224,8 +263,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).toContain('clean input requires codex >= 0.135.0 (found 0.134.9); using legacy prompt');
     // Even when the app-server cannot receive the new field, the runner still
     // preserves the daemon-frozen logical identity from its sidecar.
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final?.turnId).toBe('om_integration_123');
+    expect(result.final?.nativeTurnId).toBe('turn-fake-1');
   });
 
   it('retries exactly once with the legacy prompt for an explicit experimental-field rejection', async () => {
@@ -241,9 +280,9 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[1].params).not.toHaveProperty('additionalContext');
     expect(turns[1].params).not.toHaveProperty('clientUserMessageId');
     expect(result.output.match(/retrying this turn with the legacy prompt/g)).toHaveLength(1);
-    expect(result.final.content).toBe('fake answer 2');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-2');
+    expect(result.final?.content).toBe('fake answer 2');
+    expect(result.final?.turnId).toBe('om_integration_123');
+    expect(result.final?.nativeTurnId).toBe('turn-fake-2');
   });
 
   it('does not retry generic turn errors, avoiding duplicate model work', async () => {
@@ -252,10 +291,10 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns).toHaveLength(1);
     expect(turns[0].params.input[0].text).toBe('clean user text');
     expect(result.output).not.toContain('retrying this turn with the legacy prompt');
-    expect(result.final.content).toContain('Codex App runner error: turn/start:');
-    expect(result.final.content).toContain('model overloaded');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final).not.toHaveProperty('nativeTurnId');
+    expect(result.terminal?.message).toContain('Codex App runner error: turn/start:');
+    expect(result.terminal?.message).toContain('model overloaded');
+    expect(result.terminal?.turnId).toBe('om_integration_123');
+    expect(result.terminal).not.toHaveProperty('nativeTurnId');
   });
 
   it('omits a native routing id for a legacy envelope so the worker can use its frozen botmux turn', async () => {
@@ -265,8 +304,39 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[0].params.input).toEqual([
       { type: 'text', text: 'legacy <sender>prompt</sender>', text_elements: [] },
     ]);
+    expect(result.final).toBeDefined();
     expect(result.final).not.toHaveProperty('turnId');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final?.nativeTurnId).toBe('turn-fake-1');
+  });
+
+  it('waits through retrying errors then emits one structured stream-disconnect terminal', async () => {
+    const result = await exerciseRunner({ version: '0.144.5', behavior: 'stream-retry-then-fail' });
+    expect(result.output.match(/botmux:terminal:/g)).toHaveLength(1);
+    expect(result.output).not.toContain('botmux:final:');
+    expect(result.terminal).toMatchObject({
+      turnId: 'om_integration_123',
+      nativeTurnId: 'turn-fake-1',
+      status: 'failed',
+      errorCode: 'codex_stream_disconnected',
+    });
+    expect(result.terminal?.message).toContain('stream closed before response.completed');
+  });
+
+  it('maps failed turn/completed to a failed terminal instead of a normal final', async () => {
+    const result = await exerciseRunner({ version: '0.144.5', behavior: 'failed-turn' });
+    expect(result.final).toBeUndefined();
+    expect(result.terminal).toMatchObject({
+      status: 'failed',
+      errorCode: 'codex_app_turn_failed',
+      message: 'model failed after starting',
+    });
+  });
+
+  it('does not hang when app-server exits after accepting the turn', async () => {
+    const result = await exerciseRunner({ version: '0.144.5', behavior: 'exit-after-start' });
+    expect(result.final).toBeUndefined();
+    expect(result.terminal?.status).toBe('failed');
+    expect(result.terminal?.message).toContain('Codex app-server exited (code=42');
   });
 
   it('escapes split agent/command OSC injections and emits only the trusted final marker', async () => {

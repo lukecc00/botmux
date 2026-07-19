@@ -49,6 +49,26 @@ describe('worker pipe initial screen ordering', () => {
     expect(probeIdx).toBeGreaterThan(releaseIdx);
   });
 
+  it('keeps replacement carry-over queued until the first prompt before probing for a bare shell', () => {
+    // restartCliProcess deliberately wakes flushPending immediately after a
+    // replacement spawn. At that instant tmux may still report the launch
+    // wrapper (bash/zsh) as the pane process. The flush itself must therefore
+    // share sendToPty's awaitingFirstPrompt gate; otherwise the bare-shell
+    // detector latches a healthy Codex launch as failed before it execs.
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const flushStart = source.indexOf('async function flushPending(): Promise<void>');
+    const flushEnd = source.indexOf('\nfunction sendToPty(', flushStart);
+    const flush = source.slice(flushStart, flushEnd);
+
+    const writeGateIdx = flush.indexOf('if (!shouldWriteNow({');
+    const awaitingGateIdx = flush.indexOf('awaitingFirstPrompt,', writeGateIdx);
+    const bareShellProbeIdx = flush.indexOf('if (!bareShellChecked)');
+
+    expect(writeGateIdx).toBeGreaterThan(-1);
+    expect(awaitingGateIdx).toBeGreaterThan(writeGateIdx);
+    expect(bareShellProbeIdx).toBeGreaterThan(awaitingGateIdx);
+  });
+
   it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
     // Pin the defer-then-hard-cap structure, not just the probe ordering. Without
     // this, reverting the closure to an unconditional 15s force-flush (the exact

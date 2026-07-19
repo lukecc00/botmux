@@ -5,6 +5,7 @@ import type { CodexAppTurnInput } from './types.js';
 import {
   buildCodexAppTurnStartParams,
   isCleanInputCapabilityError,
+  isCodexAppStreamDisconnectError,
   isCodexAppTurnInput,
   parseCodexVersion,
   type CodexVersion,
@@ -39,6 +40,9 @@ interface ActiveTurn {
   finalText: string;
   allAgentText: string;
   itemText: Map<string, string>;
+  /** Stable botmux/Lark turn id copied from clientUserMessageId. */
+  stableTurnId?: string;
+  terminalFailure?: { kind: 'stream_disconnected' | 'failed'; message: string };
   done: Promise<void>;
   resolveDone: () => void;
 }
@@ -98,8 +102,9 @@ function appDeveloperInstructions(args: Args): string {
   if (zh) {
     return [
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
-      '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
-      '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '你明确写给用户的每段 commentary/进度和最终 assistant message，都会由 botmux 分别自动转成独立飞书卡片；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
+      '长任务中，每完成一个可验证的阶段、开始一次预计较久的构建/测试/等待、或拿到影响下一步的新结论，都要立即写一段自包含、面向用户的 commentary；不要等到整轮 final，也不要把多次里程碑合并成一段。尤其是“阶段结论 → 工具调用 → 下一阶段说明 → 长命令/等待”，工具前后两段说明都必须分别写成 commentary；工具调用、命令输出、Updated Plan 和 final 都不能替代或吞并它们。',
+      '只有发送附件、需要 @ 某人/机器人、跨群发送等结构化通道无法表达的能力，才可以使用 `botmux send`。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
@@ -107,8 +112,9 @@ function appDeveloperInstructions(args: Args): string {
 
   return [
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
-    'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
-    'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'Every user-facing commentary/progress message and the final assistant message is automatically forwarded as a separate Lark card. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
+    'For long tasks, write a self-contained commentary immediately after each verifiable stage, before a long build/test/wait, and when a new finding changes the next step. Do not wait for the final answer or merge distinct milestones. In a “stage result → tool call → next-stage note → long command/wait” sequence, write both notes as separate commentary messages; tool calls, command output, Updated Plan, and final cannot replace or absorb them.',
+    'Use `botmux send` only for capabilities the structured channel cannot express, such as attachments, @mentions, or cross-chat delivery.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
@@ -123,6 +129,7 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  private fatalHandlers: Array<(error: Error) => void> = [];
 
   constructor(private readonly codexBin: string, private readonly cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
@@ -156,6 +163,10 @@ class AppServerClient {
 
   onRequest(handler: (msg: JsonObject) => boolean): void {
     this.requestHandlers.push(handler);
+  }
+
+  onFatal(handler: (error: Error) => void): void {
+    this.fatalHandlers.push(handler);
   }
 
   async initialize(): Promise<void> {
@@ -199,10 +210,14 @@ class AppServerClient {
   }
 
   private failAll(err: Error): void {
+    const firstFailure = !this.fatalError;
     this.fatalError = this.fatalError ?? err;
     const fatal = this.fatalError;
     for (const pending of this.pending.values()) pending.reject(fatal);
     this.pending.clear();
+    if (firstFailure) {
+      for (const handler of this.fatalHandlers) handler(fatal);
+    }
   }
 
   private onStdout(data: string): void {
@@ -284,7 +299,7 @@ function detectedCodexVersion(): CodexVersion | undefined {
   return codexVersion;
 }
 
-function makeTurn(): ActiveTurn {
+function makeTurn(stableTurnId?: string): ActiveTurn {
   let resolveDone!: () => void;
   const done = new Promise<void>(resolve => { resolveDone = resolve; });
   return {
@@ -293,6 +308,7 @@ function makeTurn(): ActiveTurn {
     finalText: '',
     allAgentText: '',
     itemText: new Map(),
+    ...(stableTurnId ? { stableTurnId } : {}),
     done,
     resolveDone,
   };
@@ -370,18 +386,43 @@ function handleNotification(msg: JsonObject): void {
     const item = params.item;
     if (item?.type === 'agentMessage') {
       if (item.phase === 'final_answer') activeTurn.finalText = String(item.text ?? '');
-      else if (!activeTurn.itemText.has(item.id) && item.text) {
+      else if (item.phase === 'commentary') {
+        const content = String(item.text ?? activeTurn.itemText.get(String(item.id ?? '')) ?? '').trim();
+        if (content) {
+          emitMarker('progress', {
+            ...(activeTurn.stableTurnId ? { turnId: activeTurn.stableTurnId } : {}),
+            ...(activeTurn.nativeTurnId ? { nativeTurnId: activeTurn.nativeTurnId } : {}),
+            itemId: String(item.id ?? ''),
+            content,
+          });
+        }
+      } else if (!activeTurn.itemText.has(item.id) && item.text) {
         activeTurn.allAgentText += String(item.text);
       }
     }
     return;
   }
 
+  if (msg.method === 'error') {
+    if (params.willRetry === true) return;
+    const error = params.error ?? {};
+    activeTurn.terminalFailure = {
+      kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
+      message: String(error.message ?? 'Codex App turn failed'),
+    };
+    activeTurn.resolveDone();
+    return;
+  }
+
   if (msg.method === 'turn/completed') {
     const turn = params.turn;
     if (turn?.id && activeTurn.nativeTurnId && turn.id !== activeTurn.nativeTurnId) return;
-    if (turn?.error?.message && !activeTurn.finalText) {
-      activeTurn.finalText = `Codex App turn failed: ${turn.error.message}`;
+    if ((turn?.status === 'failed' || turn?.error) && !activeTurn.finalText) {
+      const error = turn?.error ?? {};
+      activeTurn.terminalFailure = {
+        kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
+        message: String(error.message ?? `Codex App turn ${turn?.status ?? 'failed'}`),
+      };
     }
     activeTurn.resolveDone();
   }
@@ -444,7 +485,7 @@ async function ensureThread(): Promise<string> {
 
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
-  const turn = makeTurn();
+  const turn = makeTurn(message.codexAppInput?.clientUserMessageId);
   activeTurn = turn;
   const version = message.codexAppInput ? detectedCodexVersion() : undefined;
   let built = buildCodexAppTurnStartParams({
@@ -491,6 +532,23 @@ async function runTurn(message: QueuedInput): Promise<void> {
   turn.nativeTurnId = result.turn?.id ?? turn.nativeTurnId;
   await turn.done;
 
+  if (turn.terminalFailure) {
+    const stableTurnId = message.codexAppInput?.clientUserMessageId;
+    emitMarker('terminal', {
+      ...(stableTurnId ? { turnId: stableTurnId } : {}),
+      ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
+      status: 'failed',
+      errorCode: turn.terminalFailure.kind === 'stream_disconnected'
+        ? 'codex_stream_disconnected'
+        : 'codex_app_turn_failed',
+      message: turn.terminalFailure.message,
+    });
+    writeLine(`[codex-app] ${turn.terminalFailure.message}`);
+    writeLine();
+    activeTurn = null;
+    return;
+  }
+
   const finalText = (turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   if (finalText) {
@@ -526,10 +584,14 @@ async function drainQueue(): Promise<void> {
         const stableTurnId = next.codexAppInput?.clientUserMessageId;
         const nativeTurnId = activeTurn?.nativeTurnId;
         writeLine(message);
-        emitMarker('final', {
+        emitMarker('terminal', {
           ...(stableTurnId ? { turnId: stableTurnId } : {}),
           ...(nativeTurnId ? { nativeTurnId } : {}),
-          content: message,
+          status: 'failed',
+          errorCode: isCodexAppStreamDisconnectError(err)
+            ? 'codex_stream_disconnected'
+            : 'codex_app_runner_error',
+          message,
           startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
           completedAtMs,
         });
@@ -588,6 +650,14 @@ function handleInput(data: Buffer): void {
 async function main(): Promise<void> {
   client.onRequest(handleServerRequest);
   client.onNotification(handleNotification);
+  client.onFatal((error) => {
+    if (!activeTurn) return;
+    activeTurn.terminalFailure = {
+      kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
+      message: error.message,
+    };
+    activeTurn.resolveDone();
+  });
   await client.initialize();
   await ensureThread();
   writeLine('Codex App connected.');
