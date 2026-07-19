@@ -54,11 +54,19 @@ VERSION="$(node -p "require(process.argv[1]).version" "$SOURCE_DIR/dev-version.j
 rm -rf "$SOURCE_DIR/.git"
 [ -f "$SOURCE_DIR/package.json" ] || fail "downloaded archive is not a botmux source tree"
 
-# Use the repository-pinned pnpm version without relying on a globally working
-# Corepack installation. npx caches it after the first successful install.
-PNPM="npx --yes pnpm@9.5.0"
+# Prefer the repository-pinned pnpm from Corepack's local cache so updates keep
+# working when npm/raw.githubusercontent.com are temporarily unreachable. Fall
+# back to PATH, then npx only on a truly fresh machine.
+COREPACK_PNPM="$HOME/.cache/node/corepack/v1/pnpm/9.5.0/bin/pnpm.cjs"
+if [ -f "$COREPACK_PNPM" ]; then
+  PNPM_CMD="node $COREPACK_PNPM"
+elif command -v pnpm >/dev/null 2>&1; then
+  PNPM_CMD="pnpm"
+else
+  PNPM_CMD="npx --yes pnpm@9.5.0"
+fi
 say "Installing locked dependencies"
-(cd "$SOURCE_DIR" && $PNPM install --frozen-lockfile)
+(cd "$SOURCE_DIR" && $PNPM_CMD install --frozen-lockfile)
 say "Building botmux"
 (cd "$SOURCE_DIR" \
   && node scripts/clean-dist.mjs \

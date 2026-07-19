@@ -18,6 +18,9 @@ describe('personal distribution source invariants', () => {
     expect(installer).toContain('./node_modules/.bin/tsc');
     expect(installer).toContain('node scripts/build-dashboard.mjs');
     expect(installer).not.toContain('$PNPM build');
+    expect(installer).toContain('.cache/node/corepack/v1/pnpm/9.5.0/bin/pnpm.cjs');
+    expect(installer).toContain('elif command -v pnpm');
+    expect(installer).toContain('PNPM_CMD="npx --yes pnpm@9.5.0"');
   });
 
   it('publishes GitHub releases only and never the official npm package', () => {
