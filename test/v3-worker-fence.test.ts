@@ -173,6 +173,26 @@ describe('v3 attempt worker fence', () => {
     },
   );
 
+  it.runIf(process.platform === 'linux')(
+    'ignores a proven non-worker when its environ is unreadable',
+    () => {
+      const procRoot = join(root, 'proc');
+      const procDir = join(procRoot, '4242');
+      mkdirSync(join(procDir, 'environ'), { recursive: true });
+      writeFileSync(join(procDir, 'cmdline'), '/usr/lib/systemd/systemd\0--user\0');
+
+      expect(discoverV3AttemptWorker(attemptDir, procRoot)).toEqual({ status: 'none' });
+
+      // Once the command line is a worker, the same unreadable binding must
+      // remain fail-closed instead of being treated as an empty attempt.
+      writeFileSync(join(procDir, 'cmdline'), '/usr/bin/node\0/app/worker.js\0');
+      expect(discoverV3AttemptWorker(attemptDir, procRoot)).toMatchObject({
+        status: 'ambiguous',
+        unverifiablePids: [4242],
+      });
+    },
+  );
+
   it.runIf(process.platform === 'linux')('fails closed when exact discovery is ambiguous', async () => {
     await spawnDiscoverableWorker();
     await spawnDiscoverableWorker();

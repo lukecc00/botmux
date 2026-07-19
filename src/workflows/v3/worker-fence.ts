@@ -532,10 +532,14 @@ function isGoneProcError(err: unknown): boolean {
 /**
  * Linux-only conservative orphan discovery for the armed fork gap and legacy
  * runs without a fence. Both the exact attempt-dir environment binding and a
- * worker.js/worker.ts command-line argument are required. Same-uid unreadable matches
- * make the result ambiguous rather than being silently treated as absent.
+ * worker.js/worker.ts command-line argument are required. Same-uid processes
+ * whose worker command line or attempt binding cannot be verified make the
+ * result ambiguous rather than being silently treated as absent.
  */
-export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDiscovery {
+export function discoverV3AttemptWorker(
+  attemptDir: string,
+  procRoot = '/proc',
+): V3AttemptWorkerDiscovery {
   if (process.platform !== 'linux') return { status: 'unsupported' };
   if (!isAbsolute(attemptDir) || attemptDir.length === 0 || attemptDir.length > 4_096 || attemptDir.includes('\0')) {
     throw new V3AttemptWorkerFenceIntegrityError('v3 attempt worker discovery requires an absolute attemptDir');
@@ -545,11 +549,11 @@ export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDisc
   const workers: V3DiscoveredAttemptWorker[] = [];
   const unverifiablePids: number[] = [];
   const ownUid = process.getuid?.();
-  for (const name of readdirSync('/proc')) {
+  for (const name of readdirSync(procRoot)) {
     if (!/^\d+$/.test(name)) continue;
     const pid = Number(name);
     if (!Number.isSafeInteger(pid) || pid <= 1) continue;
-    const procDir = join('/proc', name);
+    const procDir = join(procRoot, name);
     if (ownUid !== undefined) {
       try {
         if (lstatSync(procDir).uid !== ownUid) continue;
@@ -560,6 +564,20 @@ export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDisc
       }
     }
 
+    // Filter by the worker entry point before reading environ. Linux hosts with
+    // hidepid/Yama restrictions commonly expose another same-uid process's
+    // cmdline but deny its environ (for example systemd --user and sshd). A
+    // readable non-worker command line proves that process is irrelevant; it
+    // must not make every attempt discovery ambiguous on those hosts.
+    try {
+      if (!isBotmuxWorkerCommandLine(readFileSync(join(procDir, 'cmdline')))) continue;
+    } catch (err) {
+      if (isGoneProcError(err)) continue;
+      // We cannot prove that an unreadable same-uid command is not a worker.
+      unverifiablePids.push(pid);
+      continue;
+    }
+
     let envMatches = false;
     try {
       envMatches = readFileSync(join(procDir, 'environ'))
@@ -568,20 +586,11 @@ export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDisc
         .some((entry) => entry === expectedEnv);
     } catch (err) {
       if (isGoneProcError(err)) continue;
-      // We cannot know whether an unreadable same-uid process carries the
-      // exact binding, so fail closed instead of returning a false `none`.
+      // This is a worker command, but its exact attempt binding is unknown.
       unverifiablePids.push(pid);
       continue;
     }
     if (!envMatches) continue;
-
-    try {
-      if (!isBotmuxWorkerCommandLine(readFileSync(join(procDir, 'cmdline')))) continue;
-    } catch (err) {
-      if (isGoneProcError(err)) continue;
-      unverifiablePids.push(pid);
-      continue;
-    }
     const procStart = readProcessStartIdentity(pid);
     if (!procStart) {
       if (processExists(pid) !== 'missing') unverifiablePids.push(pid);

@@ -17,27 +17,19 @@ import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
-// Codex 0.130 removed the "Yes, continue" trust dialog entirely (both with and
-// without --dangerously-bypass-approvals-and-sandbox). These tests spawn the
-// real codex binary to capture the dialog's PTY framing — meaningless on
-// versions that never emit it. The production TRUST_DIALOG_PATTERN in
-// worker.ts stays in place as a defensive layer for Claude Code (which still
-// prompts) and any older codex install.
-function codexEmitsTrustDialog(): boolean {
+// The trust dialog has appeared, disappeared, and reappeared across Codex
+// releases. Gate only on binary availability; each test detects the actual PTY
+// capability instead of guessing UI behavior from a version number.
+function codexIsAvailable(): boolean {
   try {
-    const out = execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim();
-    // Format observed: "codex-cli 0.130.0". Extract semver-like tail.
-    const m = out.match(/(\d+)\.(\d+)\.(\d+)/);
-    if (!m) return true; // unknown version → run the test, fail loudly if assumption wrong
-    const [maj, min] = [parseInt(m[1], 10), parseInt(m[2], 10)];
-    // Codex 0.130+ no longer shows the trust dialog.
-    return maj === 0 ? min < 130 : maj < 1;
+    execFileSync('codex', ['--version'], { stdio: 'ignore' });
+    return true;
   } catch {
-    return false; // codex not installed → skip
+    return false;
   }
 }
 
-const CODEX_HAS_TRUST_DIALOG = codexEmitsTrustDialog();
+const CODEX_AVAILABLE = codexIsAvailable();
 
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
@@ -77,7 +69,7 @@ function simpleStrip(data: string): string {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe('Codex first input submission', () => {
+describe.skipIf(!CODEX_AVAILABLE)('Codex first input submission', () => {
   let proc: pty.IPty | null = null;
   let tmpDir: string | null = null;
 
@@ -90,7 +82,7 @@ describe('Codex first input submission', () => {
     if (tmpDir) { try { rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
   });
 
-  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('chunk analysis: "Yes, continue" appears intact in a single PTY chunk', async () => {
+  it('startup exposes either a matchable trust choice or the ready composer', async () => {
     /**
      * Verifies that "Yes, continue" can be matched per-chunk (unlike
      * "Do you trust the contents of this directory" which splits across chunks
@@ -136,10 +128,15 @@ describe('Codex first input submission', () => {
       console.log(`>>> Match at +${matchingChunk.offset}ms`);
     }
 
-    expect(matchingChunk, '"Yes, continue" should appear in a single chunk').toBeTruthy();
+    const readyPattern = createCodexAdapter().readyPattern!;
+    const readyChunk = chunks.find(c => readyPattern.test(c.stripped));
+    expect(
+      matchingChunk ?? readyChunk,
+      'startup should expose a matchable trust choice or ready composer',
+    ).toBeTruthy();
   }, 30_000);
 
-  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('production flow: trust dialog detected and dismissed, prompt submitted', async () => {
+  it('production flow handles an optional trust dialog and submits the prompt', async () => {
     /**
      * Simulates the full production worker flow:
      * 1. Codex spawns → trust dialog appears
@@ -202,9 +199,12 @@ describe('Codex first input submission', () => {
     console.log(`Trust detected: ${trustDetectedAt ? `+${trustDetectedAt - spawnTime}ms` : 'NEVER'}`);
     console.log(`Idle fired:     ${idleFiredAt ? `+${idleFiredAt - spawnTime}ms` : 'NEVER'}`);
 
-    expect(trustDetectedAt, 'trust dialog should be detected').toBeTruthy();
     expect(idleFiredAt, 'idle should fire after trust dismissal').toBeTruthy();
 
+    const trustWasShown = chunks.some(c => TRUST_DIALOG_PATTERN.test(c.stripped));
+    if (trustWasShown) {
+      expect(trustDetectedAt, 'shown trust dialog should be detected').toBeTruthy();
+    }
     if (trustDetectedAt && idleFiredAt) {
       expect(
         trustDetectedAt < idleFiredAt,
@@ -238,7 +238,7 @@ describe('Codex first input submission', () => {
     idleDetector.dispose();
   }, 60_000);
 
-  it('control: already-trusted dir works without trust dialog', async () => {
+  it('control: /tmp reaches idle whether or not Codex requests trust', async () => {
     const spawnTime = Date.now();
     const chunks: Chunk[] = [];
     let idleFiredAt: number | null = null;
@@ -260,8 +260,14 @@ describe('Codex first input submission', () => {
       }
     });
 
+    let trustHandled = false;
     proc.onData((data) => {
       chunks.push({ time: Date.now(), offset: Date.now() - spawnTime, raw: data, stripped: simpleStrip(data) });
+      if (!trustHandled && TRUST_DIALOG_PATTERN.test(simpleStrip(data))) {
+        trustHandled = true;
+        proc!.write('\r');
+        return;
+      }
       idleDetector.feed(data);
     });
 
