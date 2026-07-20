@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
 import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
+import type { GithubGitFallback } from '../src/core/github-source.js';
 import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
 
 function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
@@ -208,5 +209,19 @@ describe('fetchChangelog', () => {
       },
     });
     expect(auth).toBe('Bearer ghp_from_file');
+  });
+
+  it('falls back to the SSH annotated-tag message when the API is rate-limited', async () => {
+    const gitFallback: GithubGitFallback = {
+      listTags: async () => ['v3.2.1'],
+      readTagAnnotations: async () => new Map([
+        ['v3.2.1', { body: '个人版 3.2.1 更新内容', createdAt: '2026-07-19T00:00:00+08:00' }],
+      ]),
+    };
+    const notes = await fetchChangelog('3.2.1', {
+      fetchImpl: async () => ({ ok: false, status: 403 }) as Response,
+      gitFallback,
+    });
+    expect(notes).toBe('个人版 3.2.1 更新内容');
   });
 });

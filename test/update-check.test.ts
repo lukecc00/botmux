@@ -8,6 +8,7 @@ import {
   fetchLatestVersion,
   fetchReleasesSince,
 } from '../src/core/update-check.js';
+import type { GithubGitFallback, GithubTagAnnotation } from '../src/core/github-source.js';
 
 describe('parseVersion', () => {
   it('parses plain and v-prefixed stable versions', () => {
@@ -112,21 +113,58 @@ function jsonResponse(status: number, body: unknown): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response;
 }
 
+function gitFallback(
+  tags: string[] | null,
+  annotations: Record<string, GithubTagAnnotation> = {},
+): GithubGitFallback {
+  return {
+    listTags: async () => tags,
+    readTagAnnotations: async () => new Map(Object.entries(annotations)),
+  };
+}
+
 describe('fetchLatestVersion', () => {
   it('returns the personal branch manifest version', async () => {
-    let requested = '';
+    const requested: string[] = [];
     const v = await fetchLatestVersion({ fetchImpl: async (input) => {
-      requested = String(input);
-      return jsonResponse(200, { version: '2.85.1' });
-    } });
+      requested.push(String(input));
+      return String(input).includes('/releases/latest')
+        ? jsonResponse(404, {})
+        : jsonResponse(200, { version: '2.85.1' });
+    }, gitFallback: null });
     expect(v).toBe('2.85.1');
-    expect(requested).toBe('https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json');
+    expect(requested).toContain('https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json');
+  });
+  it('uses the latest stable GitHub release when the API is available', async () => {
+    const v = await fetchLatestVersion({
+      fetchImpl: async (input) => String(input).includes('/releases/latest')
+        ? jsonResponse(200, { tag_name: 'v3.2.2', prerelease: false, draft: false })
+        : jsonResponse(503, {}),
+      gitFallback: null,
+    });
+    expect(v).toBe('3.2.2');
+  });
+  it('falls back to stable SSH tags when GitHub HTTPS is unavailable', async () => {
+    const v = await fetchLatestVersion({
+      fetchImpl: async () => { throw new Error('https blocked'); },
+      gitFallback: gitFallback(['v3.2.0', 'v3.2.2-rc.1', 'v3.2.1']),
+    });
+    expect(v).toBe('3.2.1');
+  });
+  it('uses the highest stable version when update sources briefly disagree', async () => {
+    const v = await fetchLatestVersion({
+      fetchImpl: async (input) => String(input).includes('/releases/latest')
+        ? jsonResponse(200, { tag_name: 'v3.2.0' })
+        : jsonResponse(200, { version: '3.2.1' }),
+      gitFallback: gitFallback(['v3.2.2']),
+    });
+    expect(v).toBe('3.2.2');
   });
   it('null on non-200 / malformed / unparseable / throw', async () => {
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'latest' }) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => { throw new Error('offline'); } })).toBeNull();
+    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}), gitFallback: null })).toBeNull();
+    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, {}), gitFallback: null })).toBeNull();
+    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'latest' }), gitFallback: null })).toBeNull();
+    expect(await fetchLatestVersion({ fetchImpl: async () => { throw new Error('offline'); }, gitFallback: null })).toBeNull();
   });
 });
 
@@ -137,7 +175,7 @@ describe('fetchReleasesSince', () => {
     const out = await fetchReleasesSince('2.85.0', { fetchImpl: async (input) => {
       requested = String(input);
       return jsonResponse(200, releases);
-    } });
+    }, gitFallback: null });
     expect(out.ok).toBe(true);
     expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
     expect(requested).toContain('api.github.com/repos/lukecc00/botmux/releases');
@@ -152,6 +190,7 @@ describe('fetchReleasesSince', () => {
         auth = headers?.Authorization ?? headers?.authorization ?? null;
         return jsonResponse(200, []);
       },
+      gitFallback: null,
     });
     expect(auth).toBe('Bearer ghp_secret');
   });
@@ -165,6 +204,7 @@ describe('fetchReleasesSince', () => {
         auth = headers?.Authorization ?? headers?.authorization ?? null;
         return jsonResponse(200, []);
       },
+      gitFallback: null,
     });
     expect(auth).toBeNull();
   });
@@ -183,19 +223,40 @@ describe('fetchReleasesSince', () => {
         auth = headers?.Authorization ?? headers?.authorization ?? null;
         return jsonResponse(200, []);
       },
+      gitFallback: null,
     });
     expect(auth).toBe('Bearer ghp_from_file');
   });
 
   it('ok:true with an empty list when already latest (genuinely empty)', async () => {
-    const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });
+    const out = await fetchReleasesSince('2.85.1', {
+      fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]),
+      gitFallback: null,
+    });
     expect(out).toMatchObject({ ok: true, releases: [] });
   });
+  it('falls back to SSH annotated tags when the releases API is rate-limited', async () => {
+    const out = await fetchReleasesSince('3.1.9', {
+      fetchImpl: async () => jsonResponse(403, {}),
+      gitFallback: gitFallback(
+        ['v3.2.0', 'v3.2.1', 'v3.3.0-rc.1'],
+        {
+          'v3.2.0': { body: '二开说明 3.2.0', createdAt: '2026-07-18T00:00:00+08:00' },
+          'v3.2.1': { body: '二开说明 3.2.1', createdAt: '2026-07-19T00:00:00+08:00' },
+        },
+      ),
+    });
+    expect(out.ok).toBe(true);
+    expect(out.rateLimited).toBeUndefined();
+    expect(out.releases.map(release => release.version)).toEqual(['3.2.1', '3.2.0']);
+    expect(out.releases[0]).toMatchObject({ body: '二开说明 3.2.1', publishedAt: '2026-07-19T00:00:00+08:00' });
+    expect(out.releases[0].url).toBe('https://github.com/lukecc00/botmux/releases/tag/v3.2.1');
+  });
   it('ok:false on failure, flags rate-limit on 403', async () => {
-    const rl = await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(403, {}) });
+    const rl = await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(403, {}), gitFallback: null });
     expect(rl).toMatchObject({ ok: false, rateLimited: true, releases: [] });
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(404, {}) })).toMatchObject({ ok: false, releases: [] });
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, { not: 'array' }) })).toMatchObject({ ok: false, releases: [] });
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => { throw new Error('x'); } })).toMatchObject({ ok: false, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(404, {}), gitFallback: null })).toMatchObject({ ok: false, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, { not: 'array' }), gitFallback: null })).toMatchObject({ ok: false, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => { throw new Error('x'); }, gitFallback: null })).toMatchObject({ ok: false, releases: [] });
   });
 });

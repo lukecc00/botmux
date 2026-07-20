@@ -9,12 +9,16 @@ describe('personal distribution source invariants', () => {
     const installer = read('install.sh');
     expect(installer).toContain('REPO="lukecc00/botmux"');
     expect(installer).toContain('REF="p/ai_open"');
+    expect(installer).toContain('SSH_URL="git@github.com:$REPO.git"');
+    expect(installer).toContain('HTTPS_URL="https://github.com/$REPO.git"');
+    expect(installer).toContain('GIT_TERMINAL_PROMPT=0');
+    expect(installer).toContain('BatchMode=yes');
     expect(installer).not.toContain('${BOTMUX_INSTALL_REPO');
     expect(installer).not.toContain('${BOTMUX_INSTALL_REF');
     expect(installer).toContain('.botmux-install.json');
     expect(installer).toContain('--filter=blob:none');
-    expect(installer).toContain('attempt $attempt/3');
-    expect(installer).toContain('failed to download $REPO@$REF after 3 attempts');
+    expect(installer).toContain('attempt $attempt/2');
+    expect(installer).toContain('failed to download $REPO@$REF over SSH and HTTPS');
     expect(installer).toContain('./node_modules/.bin/tsc');
     expect(installer).toContain('node scripts/build-dashboard.mjs');
     expect(installer).not.toContain('$PNPM build');
@@ -34,7 +38,10 @@ describe('personal distribution source invariants', () => {
   });
 
   it('keeps CLI and update checks on the personal repository', () => {
-    expect(read('src/core/restart-report.ts')).toContain("GITHUB_REPO = 'lukecc00/botmux'");
-    expect(read('src/core/update-check.ts')).toContain('raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json');
+    expect(read('src/core/restart-report.ts')).toContain('GITHUB_REPO = PERSONAL_UPDATE_REPO');
+    expect(read('src/utils/install-info.ts')).toContain("PERSONAL_UPDATE_REPO = 'lukecc00/botmux'");
+    expect(read('src/utils/install-info.ts')).toContain("PERSONAL_UPDATE_REF = 'p/ai_open'");
+    expect(read('src/core/update-check.ts')).toContain('raw.githubusercontent.com/${GITHUB_REPO}/${PERSONAL_UPDATE_REF}/dev-version.json');
+    expect(read('src/core/github-source.ts')).toContain('git@github.com:${repo}.git');
   });
 });

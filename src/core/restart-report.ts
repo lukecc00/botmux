@@ -7,13 +7,15 @@
  * daemon startup wiring.
  */
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
+import { defaultGithubGitFallback, type GithubGitFallback } from './github-source.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
 import { consumeRestartIntent } from '../services/restart-intent-store.js';
 import { countActiveSessionsOnDisk } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
+import { PERSONAL_UPDATE_REPO } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
-export const GITHUB_REPO = 'lukecc00/botmux';
+export const GITHUB_REPO = PERSONAL_UPDATE_REPO;
 
 export interface RestartReportInput {
   kind: RestartKind;
@@ -135,9 +137,16 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
  *  rate-limited, release not yet published) — caller falls back to a link. */
 export async function fetchChangelog(
   newVersion: string,
-  opts?: { auth?: GithubAuthResolveOptions; fetchImpl?: typeof fetch; timeoutMs?: number },
+  opts?: {
+    auth?: GithubAuthResolveOptions;
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    /** null disables the SSH annotated-tag fallback (unit-test seam). */
+    gitFallback?: GithubGitFallback | null;
+  },
 ): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
+  const gitFallback = opts?.gitFallback === undefined ? defaultGithubGitFallback : opts.gitFallback;
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${vtag(newVersion)}`, {
       headers: {
@@ -147,11 +156,24 @@ export async function fetchChangelog(
       },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return gitFallback
+      ? fetchChangelogViaGit(newVersion, gitFallback, opts?.timeoutMs)
+      : null;
     const body = await res.json() as { body?: string };
     const notes = (body?.body ?? '').trim();
     return notes || null;
   } catch {
-    return null;
+    return gitFallback ? fetchChangelogViaGit(newVersion, gitFallback, opts?.timeoutMs) : null;
   }
+}
+
+async function fetchChangelogViaGit(
+  newVersion: string,
+  gitFallback: GithubGitFallback,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const tag = vtag(newVersion);
+  const annotations = await gitFallback.readTagAnnotations(GITHUB_REPO, [tag], timeoutMs);
+  const notes = annotations?.get(tag)?.body.trim() ?? '';
+  return notes || null;
 }

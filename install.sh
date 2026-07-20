@@ -32,22 +32,38 @@ NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])")"
 [ "$NODE_MAJOR" -ge 22 ] || fail "Node.js 22+ is required (found $(node --version))"
 
 SOURCE_DIR="$TMP_DIR/source"
-URL="https://github.com/$REPO.git"
+SSH_URL="git@github.com:$REPO.git"
+HTTPS_URL="https://github.com/$REPO.git"
 
 say "Downloading latest $REPO@$REF"
 # Git reports counting, compressing, receiving, and resolving percentages even
 # when GitHub's archive endpoint does not provide a Content-Length header.
-attempt=1
-while :; do
-  if git clone --depth 1 --filter=blob:none --single-branch --branch "$REF" --progress "$URL" "$SOURCE_DIR"; then
-    break
-  fi
-  rm -rf "$SOURCE_DIR"
-  [ "$attempt" -lt 3 ] || fail "failed to download $REPO@$REF after 3 attempts"
-  say "Download failed (attempt $attempt/3); retrying..."
-  attempt=$((attempt + 1))
-  sleep "$attempt"
-done
+clone_source() {
+  label="$1"
+  url="$2"
+  attempt=1
+  while [ "$attempt" -le 2 ]; do
+    # The personal remote normally uses SSH. It remains reachable on hosts
+    # where github.com/raw.githubusercontent.com HTTPS is filtered. BatchMode
+    # prevents a Dashboard-triggered update from waiting for an interactive
+    # password prompt; an operator-provided GIT_SSH_COMMAND is preserved.
+    if GIT_TERMINAL_PROMPT=0 \
+      GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new}" \
+      git clone --depth 1 --filter=blob:none --single-branch --branch "$REF" --progress "$url" "$SOURCE_DIR"; then
+      return 0
+    fi
+    rm -rf "$SOURCE_DIR"
+    say "$label download failed (attempt $attempt/2)"
+    attempt=$((attempt + 1))
+    [ "$attempt" -gt 2 ] || sleep "$attempt"
+  done
+  return 1
+}
+
+# SSH is the primary path for the personal repository; HTTPS remains useful on
+# machines without a GitHub SSH key.
+clone_source "SSH" "$SSH_URL" || clone_source "HTTPS" "$HTTPS_URL" \
+  || fail "failed to download $REPO@$REF over SSH and HTTPS"
 REVISION="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
 SHORT_REVISION="$(printf '%.8s' "$REVISION")"
 VERSION="$(node -p "require(process.argv[1]).version" "$SOURCE_DIR/dev-version.json")"
