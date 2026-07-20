@@ -272,6 +272,9 @@ export interface Session {
     phase: 'collecting' | 'migrating' | 'completed';
     completedAt?: string;
     selectedSummary?: string;
+    /** Lark topic that receives the fresh native Codex session. New handoffs
+     * keep the source topic anchor; a different value is supported only to
+     * finish durable handoffs persisted by older botmux versions. */
     newTopicAnchor?: string;
     newSessionId?: string;
   };
@@ -593,7 +596,7 @@ export type WorkerToDaemon =
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   /** Codex ended an ordinary turn because its model context window is full.
-   * The daemon owns the cross-Lark-topic handoff: /compact the old native
+   * The daemon owns the same-Lark-topic handoff: /compact the old native
    * thread, collect a bounded summary, then start a fresh native thread. */
   | { type: 'codex_context_exhausted'; sessionId: string; turnId: string; interruptedUserGoal?: string }
   /** Codex exhausted its reconnect budget before producing a final answer.

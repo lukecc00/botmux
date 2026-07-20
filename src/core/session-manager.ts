@@ -1219,8 +1219,28 @@ export async function restoreActiveSessions(
 
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
   const codexHandoffsToRecover: DaemonSession[] = [];
+  // A crash can land after the fresh Session row is created but before the
+  // superseded source row is closed. Same-topic handoffs make those two rows
+  // share one activeSessions key, so ordinary restore collision handling would
+  // close whichever row happened to be iterated first. Keep referenced targets
+  // parked; the durable source intent below will reuse and register exactly
+  // that target while atomically replacing the source.
+  const parkedCodexHandoffTargetIds = new Set(
+    active.flatMap(session => session.codexFreshHandoff
+      && session.codexFreshHandoff.phase !== 'completed'
+      && session.codexFreshHandoff.newSessionId
+      ? [session.codexFreshHandoff.newSessionId]
+      : []),
+  );
 
   for (const session of active) {
+    if (parkedCodexHandoffTargetIds.has(session.sessionId)) {
+      logger.warn(
+        `[${session.sessionId.substring(0, 8)}] Parking partially-created Codex handoff target `
+        + 'until its durable source intent is recovered',
+      );
+      continue;
+    }
     if (session.codexFreshHandoff?.phase === 'completed') {
       logger.warn(`[${session.sessionId.substring(0, 8)}] Closing superseded Codex source session during restore`);
       sessionStore.closeSession(session.sessionId);
@@ -1402,10 +1422,10 @@ export async function restoreActiveSessions(
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
 
-  // Recover only after every active row (including a partially-created fresh
-  // target session) has been registered. This lets the daemon reuse the exact
-  // new session/topic instead of racing the later restore iteration and
-  // accidentally closing/replacing it.
+  // Recover only after every ordinary active row has been registered. A
+  // partially-created target referenced by the durable intent remains parked
+  // above; the recovery callback reuses that exact row and installs it in one
+  // step instead of letting same-anchor collision order decide the winner.
   for (const ds of codexHandoffsToRecover) {
     await opts.recoverCodexHandoff?.(ds);
   }

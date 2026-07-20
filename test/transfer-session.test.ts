@@ -640,4 +640,5 @@ describe('setActiveSessionSafe', () => {
     expect(registry.get(key)).toBe(ds);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
   });
+
 });

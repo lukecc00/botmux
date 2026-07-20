@@ -3298,10 +3298,10 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   persistStreamCardState(ds);
 }
 
-/** Consume a Codex-generated Handoff Summary into a new Lark topic backed by
- * a genuinely fresh Codex session. This deliberately does not copy
- * cliSessionId and calls forkWorker with resume=false. */
-async function migrateCodexHandoffToFreshTopic(
+/** Consume a Codex-generated Handoff Summary in the current Lark topic while
+ * replacing only the underlying Codex session. This deliberately does not
+ * copy cliSessionId and calls forkWorker with resume=false. */
+async function migrateCodexHandoffToFreshSession(
   source: DaemonSession,
   summary: string,
 ): Promise<boolean> {
@@ -3337,14 +3337,21 @@ async function migrateCodexHandoffToFreshTopic(
     };
     sessionStore.updateSession(source.session);
     const locale = localeForBot(source.larkAppId);
-    const anchor = handoff.newTopicAnchor ?? await sendMessage(
-        source.larkAppId,
-        source.chatId,
+    // Keep the Lark conversation stable. The hard boundary we need is a fresh
+    // Codex native thread, not a new Lark topic: creating a top-level message
+    // here used to move every later commentary/final card out of the topic the
+    // user was reading. `newTopicAnchor` retains its historical persisted name
+    // for schema compatibility; new migrations store the source topic anchor.
+    const anchor = handoff.newTopicAnchor ?? sessionAnchorId(source);
+    if (!handoff.newTopicAnchor) {
+      await sessionReply(
+        anchor,
         buildFreshCodexHandoffTopic(selectedSummary, locale, handoff.reason),
         'text',
-        handoff.requestId,
+        source.larkAppId,
+        undefined,
+        { uuid: handoff.requestId },
       );
-    if (!handoff.newTopicAnchor) {
       handoff.newTopicAnchor = anchor;
       source.session.codexFreshHandoff.newTopicAnchor = anchor;
       sessionStore.updateSession(source.session);
@@ -3432,7 +3439,12 @@ async function migrateCodexHandoffToFreshTopic(
     fresh.chatType = source.chatType;
     fresh.workingDir = session.workingDir;
     fresh.hasHistory = !!session.cliSessionId;
-    await setActiveSessionSafe(activeSessions, sessionKey(anchor, source.larkAppId), fresh);
+    await setActiveSessionSafe(
+      activeSessions,
+      sessionKey(anchor, source.larkAppId),
+      fresh,
+      { suppressPreviousStopNotice: true },
+    );
     ensureSessionWhiteboard(fresh);
     const input = buildNewTopicCliInput(
       promptText,
@@ -3456,13 +3468,18 @@ async function migrateCodexHandoffToFreshTopic(
     freshStarted = !!fresh.worker || !!session.cliSessionId;
     if (!freshStarted) throw new Error('fresh Codex worker did not start');
 
-    const closeResult = await closeSessionHelper(source.session.sessionId);
-    if (closeResult.alreadyClosed) {
-      // Unit-level/direct callers can invoke this before the daemon registers
-      // the activeSessions map with worker-pool. Keep the source lifecycle
-      // correct even then; production normally closes through the helper.
+    // Same-topic setActiveSessionSafe already closed the source occupant before
+    // installing `fresh`. Older persisted migrations may still target a
+    // different anchor, so close a source that remains registered separately.
+    if ([...activeSessions.values()].some(candidate => candidate === source)) {
+      await closeSessionHelper(source.session.sessionId, {
+        suppressStopNotice: true,
+      });
+    } else if (sessionStore.getSession(source.session.sessionId)?.status !== 'closed') {
+      // Unit-level/direct callers can invoke this without registering the
+      // worker-pool map. Keep that source lifecycle correct without deleting
+      // the fresh same-anchor entry we just installed.
       killWorker(source);
-      activeSessions.delete(activeSessionKey(source));
       sessionStore.closeSession(source.session.sessionId);
     }
     // Commit only after the source is durably closed. If the daemon dies after
@@ -3485,7 +3502,7 @@ async function migrateCodexHandoffToFreshTopic(
     source.pendingCodexFreshHandoff = undefined;
     sessionStore.updateSession(source.session);
     logger.info(
-      `[${tag(source)}] Codex /compact handoff → fresh topic ${anchor.substring(0, 12)} `
+      `[${tag(source)}] Codex handoff → fresh native session in topic ${anchor.substring(0, 12)} `
       + `(new session=${session.sessionId.substring(0, 8)}, resume=false)`,
     );
     return true;
@@ -3510,7 +3527,9 @@ async function migrateCodexHandoffToFreshTopic(
       try { sessionStore.updateSession(source.session); } catch { /* best effort */ }
       try {
         killWorker(source);
-        activeSessions.delete(activeSessionKey(source));
+        if (activeSessions.get(activeSessionKey(source)) === source) {
+          activeSessions.delete(activeSessionKey(source));
+        }
         sessionStore.closeSession(source.session.sessionId);
       } catch { /* the new fresh session remains authoritative */ }
       logger.error(`[${tag(source)}] Fresh Codex started but source close cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3544,7 +3563,7 @@ async function migrateCodexHandoffToFreshTopic(
       : 5 * 60_000;
     handoff.timeout = setTimeout(() => {
       if (source.pendingCodexFreshHandoff !== handoff) return;
-      void migrateCodexHandoffToFreshTopic(source, handoff.selectedSummary ?? summary);
+      void migrateCodexHandoffToFreshSession(source, handoff.selectedSummary ?? summary);
     }, retryMs);
     handoff.timeout.unref?.();
     if (handoff.retryCount > 3 && !handoff.failureNotified) {
@@ -3552,8 +3571,8 @@ async function migrateCodexHandoffToFreshTopic(
       void sessionReply(
         sessionAnchorId(source),
         localeForBot(source.larkAppId) === 'en'
-          ? 'Codex context handoff could not create or start the fresh topic after several retries. The old Codex thread will not be resumed; botmux will keep retrying at a low frequency.'
-          : 'Codex 上下文交接多次重试后仍未能创建或启动新话题。旧 Codex 会话不会被恢复；botmux 将继续低频自动重试。',
+          ? 'Codex context handoff could not start the fresh session in this topic after several retries. The old Codex thread will not be resumed; botmux will keep retrying at a low frequency.'
+          : 'Codex 上下文交接多次重试后仍未能在当前话题启动全新会话。旧 Codex 会话不会被恢复；botmux 将继续低频自动重试。',
         'text',
         source.larkAppId,
       ).catch(() => { /* already logged by migration path */ });
@@ -3606,7 +3625,7 @@ function armCodexHandoffWatchdog(
   pending.timeout = setTimeout(() => {
     if (source.pendingCodexFreshHandoff !== pending) return;
     logger.warn(`[${tag(source)}] Codex /compact handoff summary timed out; using bounded fallback`);
-    void migrateCodexHandoffToFreshTopic(source, fallbackCodexHandoffSummary(source));
+    void migrateCodexHandoffToFreshSession(source, fallbackCodexHandoffSummary(source));
   }, CODEX_HANDOFF_TIMEOUT_MS);
   pending.timeout.unref?.();
 }
@@ -3627,7 +3646,7 @@ async function beginAutomaticCodexContextHandoff(
       workingDir: source.workingDir ?? source.session.workingDir,
     });
     // Arm the same migration gate even though there is no old worker left;
-    // migrateCodexHandoffToFreshTopic owns the fresh-topic invariant.
+    // migrateCodexHandoffToFreshSession owns the fresh-native-session invariant.
     source.pendingCodexFreshHandoff = {
       requestedAt: Date.now(),
       requestId: randomUUID(),
@@ -3638,7 +3657,7 @@ async function beginAutomaticCodexContextHandoff(
       phase: 'collecting',
     };
     persistCodexHandoff(source);
-    await migrateCodexHandoffToFreshTopic(source, fallback);
+    await migrateCodexHandoffToFreshSession(source, fallback);
     return;
   }
 
@@ -3665,7 +3684,7 @@ async function beginAutomaticCodexContextHandoff(
     } as DaemonToWorker);
   } catch (err) {
     logger.warn(`[${tag(source)}] Failed to send /compact handoff command; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
-    await migrateCodexHandoffToFreshTopic(source, fallbackCodexHandoffSummary(source));
+    await migrateCodexHandoffToFreshSession(source, fallbackCodexHandoffSummary(source));
     return;
   }
   markSessionActivity(source);
@@ -3674,7 +3693,7 @@ async function beginAutomaticCodexContextHandoff(
 
 /** A response-stream disconnect has no trustworthy old stream left from which
  * to request /compact + a summary. Persist a bounded workspace-oriented
- * handoff immediately, then reuse the same fresh-topic/session migration as
+ * handoff immediately, then reuse the same same-topic fresh-session migration as
  * context exhaustion. One migration is allowed per lineage; the count is
  * copied to the fresh session, so another disconnect stops instead of opening
  * an unbounded topic chain during a network outage. */
@@ -3693,8 +3712,8 @@ async function beginAutomaticCodexStreamRecovery(
     await sessionReply(
       sessionAnchorId(source),
       locale === 'en'
-        ? '❌ Codex response streaming disconnected again after the automatic fresh-session recovery. Botmux stopped to avoid an endless chain of new topics. Workspace changes are preserved; please retry after the connection is stable.'
-        : '❌ 自动切换全新会话后，Codex 响应流再次断开。为避免无限创建新话题，botmux 已停止自动续跑。当前工作区修改均已保留，请在网络稳定后重试。',
+        ? '❌ Codex response streaming disconnected again after the automatic fresh-session recovery. Botmux stopped to avoid an endless recovery loop. Workspace changes are preserved; please retry after the connection is stable.'
+        : '❌ 自动切换全新会话后，Codex 响应流再次断开。为避免无限恢复循环，botmux 已停止自动续跑。当前工作区修改均已保留，请在网络稳定后重试。',
       'text',
       source.larkAppId,
       interruptedTurnId,
@@ -3716,8 +3735,8 @@ async function beginAutomaticCodexStreamRecovery(
   void sessionReply(
     sessionAnchorId(source),
     localeForBot(source.larkAppId) === 'en'
-      ? '⚠️ Codex response streaming disconnected before completion. Botmux is creating a new topic and a brand-new Codex session to continue this task. The interrupted session will not be resumed; workspace changes are preserved.'
-      : '⚠️ Codex 响应流在完成前异常断开。botmux 正在创建新话题和全新的 Codex 会话继续本轮任务；不会 resume 已中断的旧会话，当前工作区修改会保留。',
+      ? '⚠️ Codex response streaming disconnected before completion. Botmux is creating a brand-new Codex session in this topic to continue the task. The interrupted session will not be resumed; workspace changes are preserved.'
+      : '⚠️ Codex 响应流在完成前异常断开。botmux 正在当前话题内创建全新的 Codex 会话继续本轮任务；不会 resume 已中断的旧会话，当前工作区修改会保留。',
     'text',
     source.larkAppId,
     interruptedTurnId,
@@ -3730,7 +3749,7 @@ async function beginAutomaticCodexStreamRecovery(
     workingDir: source.workingDir ?? source.session.workingDir,
     reason: 'stream_disconnected',
   });
-  await migrateCodexHandoffToFreshTopic(source, fallback);
+  await migrateCodexHandoffToFreshSession(source, fallback);
 }
 
 /**
@@ -15387,8 +15406,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     await sessionReply(
       anchor,
       localeForBot(larkAppId) === 'en'
-        ? 'Codex context handoff is in progress. A fresh topic will appear shortly; please continue there.'
-        : 'Codex 正在进行上下文交接，稍后会自动出现新话题；请在新话题中继续。',
+        ? 'Codex context handoff is in progress. A fresh Codex session will continue in this topic shortly.'
+        : 'Codex 正在进行上下文交接，稍后会在当前话题内由全新会话继续。',
       'text',
       larkAppId,
     );
@@ -15589,7 +15608,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
             } as DaemonToWorker);
           } catch (err) {
             logger.warn(`[${tag(ds)}] Failed to send manual /compact handoff; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
-            void migrateCodexHandoffToFreshTopic(ds, fallbackCodexHandoffSummary(ds));
+            void migrateCodexHandoffToFreshSession(ds, fallbackCodexHandoffSummary(ds));
           }
           markSessionActivity(ds);
           logger.info(`[${anchor.substring(0, 12)}] Codex /compact → fresh-session handoff armed`);
@@ -16797,7 +16816,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // external migration step fails, its durable intent owns retries; falling
       // back to ordinary final delivery would leak the handoff summary into the
       // exhausted source topic and clear no state.
-      return migrateCodexHandoffToFreshTopic(ds, output.content).then(() => true);
+      return migrateCodexHandoffToFreshSession(ds, output.content).then(() => true);
     },
     onCodexContextExhausted(ds, output) {
       const pending = ds.pendingCodexFreshHandoff;
@@ -16807,7 +16826,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           title: ds.session.title,
           workingDir: ds.workingDir ?? ds.session.workingDir,
         });
-        return migrateCodexHandoffToFreshTopic(ds, fallback).then(migrated => {
+        return migrateCodexHandoffToFreshSession(ds, fallback).then(migrated => {
           if (!migrated) throw new Error('failed to migrate fallback Codex handoff');
         });
       }
@@ -16824,7 +16843,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         title: ds.session.title,
         workingDir: ds.workingDir ?? ds.session.workingDir,
       });
-      return migrateCodexHandoffToFreshTopic(ds, fallback).then(migrated => {
+      return migrateCodexHandoffToFreshSession(ds, fallback).then(migrated => {
         if (!migrated) throw new Error('failed to migrate Codex handoff after source exit');
       });
     },
@@ -17132,7 +17151,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         title: ds.session.title,
         workingDir: ds.workingDir ?? ds.session.workingDir,
       });
-      const migrated = await migrateCodexHandoffToFreshTopic(ds, fallback);
+      const migrated = await migrateCodexHandoffToFreshSession(ds, fallback);
       if (!migrated) {
         logger.error(`[${tag(ds)}] Failed to recover persisted Codex handoff on daemon boot`);
       }

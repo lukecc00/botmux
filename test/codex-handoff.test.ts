@@ -49,7 +49,7 @@ describe('Codex /compact fresh handoff', () => {
     expect(fallback.length).toBeLessThanOrEqual(CODEX_HANDOFF_SUMMARY_MAX_CHARS);
   });
 
-  it('labels a stream-disconnect fallback and fresh topic explicitly', () => {
+  it('labels a stream-disconnect fallback and same-topic fresh session explicitly', () => {
     const fallback = buildFallbackCodexHandoffSummary({
       userGoal: 'finish the migration',
       workingDir: '/repo',
@@ -60,12 +60,16 @@ describe('Codex /compact fresh handoff', () => {
       .toContain('响应流在完成前断开');
     expect(buildFreshCodexHandoffTopic(fallback, 'en', 'stream_disconnected'))
       .toContain('brand-new Codex session');
+    expect(buildFreshCodexHandoffTopic(fallback, 'zh', 'stream_disconnected'))
+      .toContain('当前飞书话题内');
+    expect(buildFreshCodexHandoffTopic(fallback, 'en', 'stream_disconnected'))
+      .toContain('current Lark topic');
   });
 
   it('labels the visible topic and fresh prompt as non-resume handoff', () => {
     const summary = 'Handoff Summary\n\nGoal: finish the migration.';
-    expect(buildFreshCodexHandoffTopic(summary, 'zh')).toContain('不会 resume');
-    expect(buildFreshCodexHandoffTopic(summary, 'en')).toContain('was not resumed');
+    expect(buildFreshCodexHandoffTopic(summary, 'zh')).toContain('当前飞书话题内');
+    expect(buildFreshCodexHandoffTopic(summary, 'en')).toContain('current Lark topic');
     const prompt = buildFreshCodexHandoffPrompt(summary);
     expect(prompt).toContain('NEW thread');
     expect(prompt).toContain('not a request to resume');

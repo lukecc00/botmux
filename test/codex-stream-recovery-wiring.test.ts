@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('Codex missing-final recovery wiring', () => {
-  it('routes stream-disconnect recovery to the daemon-owned fresh-topic handoff', () => {
+  it('routes stream-disconnect recovery to the daemon-owned fresh-session handoff', () => {
     expect(workerSource).toContain("stripAnsiForLog(currentCodexTerminalOutputTail)");
     expect(workerSource).toContain("turn.terminalEvidence ?? ''");
     expect(workerSource).toContain("terminalDiagnostic === 'stream_disconnected'");

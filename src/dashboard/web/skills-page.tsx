@@ -50,6 +50,16 @@ interface InstallSkillCandidate {
   description?: string;
 }
 
+interface SkillInstallHistoryRow {
+  id: string;
+  source: string;
+  path?: string;
+  ref?: string;
+  skillNames: string[];
+  installedSkillNames: string[];
+  updatedAt: string;
+}
+
 type StatusMessage = { text: string; ok: boolean } | null;
 type DeliveryMode = 'auto' | 'prompt' | 'native';
 type ProjectTrustMode = 'off' | 'all';
@@ -162,12 +172,17 @@ interface SkillsInstallPanelProps {
   installStatus: StatusMessage;
   installBusy: boolean;
   installDiscovering?: boolean;
+  installHistory?: SkillInstallHistoryRow[];
+  selectedInstallHistoryId?: string;
+  installHistoryBusy?: boolean;
   installSelectionOpen?: boolean;
   installCandidates?: InstallSkillCandidate[];
   selectedInstallSkills?: Set<string>;
   onInstallSourceChange: (value: string) => void;
   onInstallPathChange: (value: string) => void;
   onInstallRefChange: (value: string) => void;
+  onSelectInstallHistory?: (id: string) => void;
+  onUpdateInstallHistory?: () => void;
   onToggleInstallSkill?: (name: string) => void;
   onSelectAllInstallSkills?: (selected: boolean) => void;
   onConfirmInstallSelection?: () => void;
@@ -182,7 +197,9 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const candidates = props.installCandidates ?? [];
   const selectedInstallSkills = props.selectedInstallSkills ?? new Set<string>();
   const allSelected = candidates.length > 0 && candidates.every(candidate => selectedInstallSkills.has(candidate.name));
-  const busy = props.installBusy || props.installDiscovering;
+  const installHistory = props.installHistory ?? [];
+  const selectedHistory = installHistory.find(entry => entry.id === props.selectedInstallHistoryId);
+  const busy = props.installBusy || props.installDiscovering || props.installHistoryBusy;
 
   useEffect(() => {
     const dialog = selectionDialogRef.current;
@@ -204,7 +221,7 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
         </h3>
       </div>}
       <div className="skills-install-grid">
-        <label className="skills-source-label">
+        <div className="skills-source-label">
           <FieldTitle
             help={(
               <span className="skills-source-help">
@@ -217,6 +234,33 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
           >
             {tr('skills.source')}
           </FieldTitle>
+          {installHistory.length > 0 ? (
+            <div className="skills-install-history-control">
+              <select
+                data-action="select-install-history"
+                aria-label={tr('skills.history')}
+                value={props.selectedInstallHistoryId ?? ''}
+                disabled={busy}
+                onChange={event => props.onSelectInstallHistory?.(event.currentTarget.value)}
+              >
+                <option value="">{tr('skills.historyPlaceholder')}</option>
+                {installHistory.map(entry => (
+                  <option value={entry.id} key={entry.id}>
+                    {entry.source}{entry.path ? ` · ${entry.path}` : ''}{entry.ref ? ` · ${entry.ref}` : ''}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                data-action="update-install-history"
+                disabled={busy || !selectedHistory || selectedHistory.installedSkillNames.length === 0}
+                title={selectedHistory && selectedHistory.installedSkillNames.length === 0 ? tr('skills.historyNoInstalled') : undefined}
+                onClick={() => props.onUpdateInstallHistory?.()}
+              >
+                {props.installHistoryBusy ? tr('skills.updating') : tr('skills.updateFromHistory')}
+              </button>
+            </div>
+          ) : null}
           <div className="skills-source-control">
             <input
               type="text"
@@ -227,7 +271,7 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               onChange={e => props.onInstallSourceChange(e.currentTarget.value)}
             />
           </div>
-        </label>
+        </div>
         <label className="skills-install-field-wide skills-install-path-field"><span>{tr('skills.path')}</span>
           <input
             type="text"
@@ -742,6 +786,9 @@ function SkillsPage() {
   const [installSource, setInstallSource] = useState('');
   const [installPath, setInstallPath] = useState('');
   const [installRef, setInstallRef] = useState('');
+  const [installHistory, setInstallHistory] = useState<SkillInstallHistoryRow[]>([]);
+  const [selectedInstallHistoryId, setSelectedInstallHistoryId] = useState('');
+  const [installHistoryBusy, setInstallHistoryBusy] = useState(false);
   const [installStatus, setInstallStatus] = useState<StatusMessage>(null);
   const [installBusy, setInstallBusy] = useState(false);
   const [installDiscovering, setInstallDiscovering] = useState(false);
@@ -808,6 +855,7 @@ function SkillsPage() {
     return {
       skills: Array.isArray(skillsBody.skills) ? skillsBody.skills as SkillRow[] : [],
       nativeSkillGroups: Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups as NativeSkillGroup[] : [],
+      installHistory: Array.isArray(skillsBody.installHistory) ? skillsBody.installHistory as SkillInstallHistoryRow[] : [],
       bots: Array.isArray(botsBody.bots) ? botsBody.bots as BotRow[] : [],
       trustProjectSkills: skillsBody.trustProjectSkills === 'all' ? 'all' as const : 'off' as const,
       delivery: (skillsBody.delivery === 'prompt' || skillsBody.delivery === 'native' ? skillsBody.delivery : 'auto') as DeliveryMode,
@@ -821,6 +869,8 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       setSkills(next.skills);
       setNativeSkillGroups(next.nativeSkillGroups);
+      setInstallHistory(next.installHistory);
+      setSelectedInstallHistoryId(current => next.installHistory.some(entry => entry.id === current) ? current : '');
       setBots(next.bots);
       setTrustProjectSkills(next.trustProjectSkills);
       setDelivery(next.delivery);
@@ -902,6 +952,40 @@ function SkillsPage() {
     setInstallCandidates([]);
     setSelectedInstallSkills(new Set());
     setInstallSelectionOpen(false);
+  }
+
+  function selectInstallHistory(id: string): void {
+    setSelectedInstallHistoryId(id);
+    const entry = installHistory.find(item => item.id === id);
+    if (!entry) return;
+    setInstallSource(entry.source);
+    setInstallPath(entry.path ?? '');
+    setInstallRef(entry.ref ?? '');
+    setInstallStatus(null);
+    clearInstallDiscovery();
+  }
+
+  async function updateInstallHistory(): Promise<void> {
+    const entry = installHistory.find(item => item.id === selectedInstallHistoryId);
+    if (!entry) return;
+    if (entry.installedSkillNames.length === 0) {
+      setInstallStatus({ text: tr('skills.historyNoInstalled'), ok: false });
+      return;
+    }
+    setInstallHistoryBusy(true);
+    try {
+      const body = await jsonRequest(`/api/skills/install-history/${encodeURIComponent(entry.id)}/update`, {
+        method: 'POST',
+        body: '{}',
+      });
+      if (!mountedRef.current) return;
+      setInstallStatus({ text: tr('skills.updatingCount', { count: entry.installedSkillNames.length }), ok: true });
+      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
+    } catch (err: any) {
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
+    } finally {
+      if (mountedRef.current) setInstallHistoryBusy(false);
+    }
   }
 
   function sourceRequestBody(): Record<string, unknown> {
@@ -1259,21 +1343,29 @@ function SkillsPage() {
                 installStatus={installStatus}
                 installBusy={installBusy}
                 installDiscovering={installDiscovering}
+                installHistory={installHistory}
+                selectedInstallHistoryId={selectedInstallHistoryId}
+                installHistoryBusy={installHistoryBusy}
                 installSelectionOpen={installSelectionOpen}
                 installCandidates={installCandidates}
                 selectedInstallSkills={selectedInstallSkills}
                 onInstallSourceChange={(value) => {
                   setInstallSource(value);
+                  setSelectedInstallHistoryId('');
                   clearInstallDiscovery();
                 }}
                 onInstallPathChange={(value) => {
                   setInstallPath(value);
+                  setSelectedInstallHistoryId('');
                   clearInstallDiscovery();
                 }}
                 onInstallRefChange={(value) => {
                   setInstallRef(value);
+                  setSelectedInstallHistoryId('');
                   clearInstallDiscovery();
                 }}
+                onSelectInstallHistory={selectInstallHistory}
+                onUpdateInstallHistory={() => void updateInstallHistory()}
                 onToggleInstallSkill={toggleInstallCandidate}
                 onSelectAllInstallSkills={selectAllInstallCandidates}
                 onConfirmInstallSelection={() => void confirmInstallSelection()}

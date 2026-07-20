@@ -9245,6 +9245,33 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-items: center;
 }
 
+.skills-install-history-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.skills-install-history-control select {
+  width: 100%;
+  min-width: 0;
+  height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.skills-install-history-control button {
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  white-space: nowrap;
+}
+
 .skills-candidate-list,
 .skills-install-bottom-row,
 .skills-local-discovery-panel {
@@ -15084,7 +15111,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
   .skills-pager-button,
   .skills-discovery-dialog footer button,
   .skills-card-actions button
-) {
+),
+.skills-page .skills-install-history-control button {
   min-height: var(--button-height);
   padding: 0 var(--button-padding-x);
   border: 1px solid color-mix(in srgb, var(--accent) 58%, var(--border-soft));
@@ -15106,7 +15134,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
   .skills-pager-button,
   .skills-discovery-dialog footer button,
   .skills-card-actions button
-):hover:not(:disabled) {
+):hover:not(:disabled),
+.skills-page .skills-install-history-control button:hover:not(:disabled) {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
@@ -15121,7 +15150,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
   .skills-pager-button,
   .skills-discovery-dialog footer button,
   .skills-card-actions button
-):disabled {
+):disabled,
+.skills-page .skills-install-history-control button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

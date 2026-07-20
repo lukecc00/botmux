@@ -100,6 +100,32 @@ export class Aggregator {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
+
+  /**
+   * Subscribe to session events and immediately replay the current session
+   * snapshot through the same callback.
+   *
+   * The dashboard SPA hydrates from REST before opening its EventSource. A
+   * status edge in that gap used to be lost forever in the browser cache (most
+   * visibly during Codex context/stream handoff, where idle -> working happens
+   * quickly). Registering the listener before replay makes the hand-off
+   * race-free: an older row is either present in this synchronous snapshot, or
+   * its later transition is delivered by the live listener. Reconnects also
+   * self-heal any event missed while the browser was offline.
+   */
+  onWithSessionSnapshot(
+    fn: (e: DashboardEvent & { larkAppId: string }) => void,
+  ): () => void {
+    this.listeners.add(fn);
+    for (const session of this.sessions.values()) {
+      fn({
+        type: 'session.spawned',
+        body: { session },
+        larkAppId: session.larkAppId,
+      });
+    }
+    return () => this.listeners.delete(fn);
+  }
 }
 
 /**

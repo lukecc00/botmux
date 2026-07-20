@@ -222,6 +222,16 @@ describe('agentbuddy skill install', () => {
     expect(result).toMatchObject({ ok: true, skill: { name: 'deploy', source: { type: 'agentbuddy' } } });
   });
 
+  it('does not reinstall removed collection siblings during an async member update', async () => {
+    installAgentbuddySkill({ collection: 'col1' });
+    expect(removeInstalledSkill('col1-beta')).toEqual({ ok: true });
+
+    const result = await updateInstalledSkillAsync('col1-alpha');
+
+    expect(result).toMatchObject({ ok: true, skill: { name: 'col1-alpha' } });
+    expect(readSkillRegistry().skills['col1-beta']).toBeUndefined();
+  });
+
   it('update aborts with no side effects when the target skill was renamed upstream', () => {
     installAgentbuddySkill({ group: 'g/h', skill: 'deploy' });
     vi.stubEnv('FAKE_AB_PRODUCE', 'renamed'); // upstream renamed the skill

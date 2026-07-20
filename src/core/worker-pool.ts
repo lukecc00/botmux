@@ -156,21 +156,21 @@ export interface WorkerPoolCallbacks {
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
   /** Give the daemon first refusal over a transcript-backed final. Used by
-   * Codex /compact handoff to consume the summary into a new topic instead of
-   * publishing it as an ordinary reply in the exhausted source topic. */
+   * Codex /compact handoff to consume the summary into a fresh native session
+   * instead of publishing it as an ordinary reply. */
   onFinalOutput?: (
     ds: DaemonSession,
     output: Extract<WorkerToDaemon, { type: 'final_output' }>,
   ) => boolean | Promise<boolean>;
   /** Codex reported a structured context-window terminal. The daemon uses
-   * the still-live old native thread only to compact/summarize, then migrates
-   * to a brand-new Lark topic + native Codex session. */
+   * the still-live old native thread only to compact/summarize, then replaces
+   * it with a brand-new native Codex session in the same Lark topic. */
   onCodexContextExhausted?: (
     ds: DaemonSession,
     output: Extract<WorkerToDaemon, { type: 'codex_context_exhausted' }>,
   ) => void | Promise<void>;
   /** Codex exhausted its response-stream reconnect budget. The daemon uses a
-   * persisted bounded summary to start a fresh topic/native session directly. */
+   * persisted bounded summary to start a fresh native session directly. */
   onCodexStreamDisconnected?: (
     ds: DaemonSession,
     output: Extract<WorkerToDaemon, { type: 'codex_stream_disconnected' }>,
@@ -1495,6 +1495,7 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
  */
 export async function closeSession(
   sessionId: string,
+  options: { suppressStopNotice?: boolean } = {},
 ): Promise<{ ok: true; alreadyClosed: boolean }> {
   const ds = findActiveBySessionId(sessionId);
   let killedLive = false;
@@ -1515,7 +1516,14 @@ export async function closeSession(
     // The worker is stopped; notify before unregistering the live routing
     // object so chat-scope aliases still resolve to the current topic.
     const cb = callbacksIfInitialised();
-    if (cb) await notifySessionStopped(ds, cb.sessionReply, 'ended');
+    // A Codex recovery handoff retires one botmux/CLI generation while the
+    // conversation itself continues immediately in a fresh native session.
+    // Treating that internal replacement as a user-visible conversation stop
+    // is both misleading and, for same-topic replacement, races the new
+    // worker's first progress card. Ordinary close callers keep the notice.
+    if (cb && !options.suppressStopNotice) {
+      await notifySessionStopped(ds, cb.sessionReply, 'ended');
+    }
     // 文档入口清理：会话关闭即删除其绑定。只有旧
     // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
     // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
@@ -1595,6 +1603,7 @@ export async function setActiveSessionSafe(
   map: Map<string, DaemonSession>,
   key: string,
   ds: DaemonSession,
+  options: { suppressPreviousStopNotice?: boolean } = {},
 ): Promise<void> {
   const prev = map.get(key);
   if (prev && prev !== ds) {
@@ -1602,7 +1611,9 @@ export async function setActiveSessionSafe(
       `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
       `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
     );
-    await closeSession(prev.session.sessionId);
+    await closeSession(prev.session.sessionId, {
+      suppressStopNotice: options.suppressPreviousStopNotice,
+    });
   }
   map.set(key, ds);
 }
@@ -1892,7 +1903,7 @@ export function sendWorkerInput(
   } = {},
 ): boolean {
   if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
-    logger.warn(`[${tag(ds)}] Refused worker input while Codex fresh-topic handoff is active`);
+    logger.warn(`[${tag(ds)}] Refused worker input while Codex fresh-session handoff is active`);
     return false;
   }
   if (!ds.worker || ds.worker.killed) return false;
@@ -1924,7 +1935,7 @@ export function forkWorker(
 ): void {
   const cb = requireCallbacks();
   if (ds.pendingCodexFreshHandoff || ds.session.codexFreshHandoff) {
-    logger.warn(`[${tag(ds)}] Refused worker fork/reattach while Codex fresh-topic handoff is active`);
+    logger.warn(`[${tag(ds)}] Refused worker fork/reattach while Codex fresh-session handoff is active`);
     return;
   }
   const bot = getBot(ds.larkAppId);

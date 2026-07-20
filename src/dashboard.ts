@@ -105,6 +105,12 @@ import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
+import {
+  findSkillInstallHistory,
+  installedSkillsForHistory,
+  listSkillInstallHistory,
+  recordSkillInstallHistory,
+} from './services/skill-install-history-store.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
@@ -1949,15 +1955,26 @@ function dashboardSkillCliIds(): CliId[] {
 
 function dashboardSkillsPayload(): Record<string, unknown> {
   const globalSkills = readGlobalConfig().skills ?? {};
+  const installedSkills = readSkillRegistry().skills;
   const nativeSkillGroups = discoverNativeCliSkillGroups(dashboardSkillCliIds())
     .map(group => ({
       ...group,
       skills: group.skills.map(sanitizeSkillForDashboard),
     }));
   return {
-    skills: Object.values(readSkillRegistry().skills)
+    skills: Object.values(installedSkills)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(sanitizeSkillForDashboard),
+    installHistory: listSkillInstallHistory().map(entry => ({
+      id: entry.id,
+      source: entry.source,
+      path: entry.path,
+      ref: entry.ref,
+      skillNames: entry.skillNames,
+      installedSkillNames: installedSkillsForHistory(entry, installedSkills),
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+    })),
     nativeSkillGroups,
     trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
     delivery: globalSkills.delivery ?? 'auto',
@@ -2634,7 +2651,11 @@ const server = createServer(async (req, res) => {
       const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
       try {
         const installRequest = parseDashboardSkillInstallRequest(body);
-        const job = startSkillJob('install', () => installDashboardSkill(installRequest));
+        const job = startSkillJob('install', async () => {
+          const installed = await installDashboardSkill(installRequest);
+          recordSkillInstallHistory(installRequest, installed);
+          return installed;
+        });
         return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
@@ -2667,6 +2688,40 @@ const server = createServer(async (req, res) => {
       const job = skillJobs.get(decodeURIComponent(mSkillJob[1]));
       if (!job) return jsonRes(res, 404, { ok: false, error: 'job_not_found' });
       return jsonRes(res, 200, { ok: true, job: publicSkillJob(job) });
+    }
+
+    let mSkillHistoryUpdate: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mSkillHistoryUpdate = url.pathname.match(/^\/api\/skills\/install-history\/([^/]+)\/update$/))) {
+      const id = decodeURIComponent(mSkillHistoryUpdate[1]);
+      const history = findSkillInstallHistory(id);
+      if (!history) return jsonRes(res, 404, { ok: false, error: 'skill_install_history_not_found' });
+      const installed = readSkillRegistry().skills;
+      const names = installedSkillsForHistory(history, installed);
+      if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'no_installed_skills_for_history' });
+      const job = startSkillJob('update', async () => {
+        const request = parseDashboardSkillInstallRequest({
+          source: history.source,
+          path: history.path,
+          ref: history.ref,
+          skillNames: names,
+        });
+        const updated: SkillPackage[] = [];
+        if (request.kind === 'agentbuddy') {
+          // AgentBuddy collection discovery owns its member set, so update each
+          // currently installed member through its recorded source. The store's
+          // targeted update path registers only that member, not removed peers.
+          for (const name of names) {
+            const result = await updateInstalledSkillAsync(name);
+            if (!result.ok) throw new Error(`${name}:${result.reason}`);
+            updated.push(result.skill);
+          }
+        } else {
+          updated.push(...await installDashboardSkill(request));
+        }
+        recordSkillInstallHistory(request, updated);
+        return updated;
+      });
+      return jsonRes(res, 202, { ok: true, names, job: publicSkillJob(job) });
     }
 
     let mSkillUpdate: RegExpMatchArray | null;
@@ -4024,7 +4079,7 @@ const server = createServer(async (req, res) => {
         'connection': 'keep-alive',
       });
       res.write('retry: 5000\n\n');
-      const off = aggregator.on(ev => {
+      const off = aggregator.onWithSessionSnapshot(ev => {
         // Mirror the GET /api/schedules carve-out: schedule events carry the
         // full task object — strip the prompt AND workingDir for anonymous SSE
         // listeners, or the REST-side scrub would be trivially bypassed by

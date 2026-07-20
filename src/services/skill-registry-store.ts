@@ -765,7 +765,13 @@ function registerAgentbuddyStaging(
   const now = new Date().toISOString();
   const registry = readSkillRegistry();
   const installed: SkillPackage[] = [];
-  for (const [name, dir] of byName) {
+  // Update is intentionally target-scoped. A collection CLI invocation emits
+  // every member, but re-registering the whole collection here would silently
+  // reinstall siblings the user had removed and mutate unrelated entries.
+  const selected = register.requireSkillName
+    ? [[register.requireSkillName, byName.get(register.requireSkillName)!] as const]
+    : [...byName.entries()];
+  for (const [name, dir] of selected) {
     // A collection member re-installs via its collection; a single skill via
     // its own group/skill/version — record whichever lets `update` re-run it.
     const proto = opts.protocol ? { protocol: opts.protocol } : {};

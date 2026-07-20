@@ -430,6 +430,49 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(closeSession).not.toHaveBeenCalled();
   });
 
+  it('parks a same-topic partial target until the durable Codex handoff recovers it', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex';
+    const source = makeActivePersistentSession('om_handoff_same_topic');
+    const target = sessionStore.createSession(
+      source.chatId,
+      source.rootMessageId,
+      'fresh target',
+      source.chatType,
+    );
+    target.larkAppId = source.larkAppId;
+    target.scope = 'thread';
+    target.cliId = 'codex';
+    source.codexFreshHandoff = {
+      requestId: 'handoff-same-topic',
+      reason: 'stream_disconnected',
+      requestedAt: new Date().toISOString(),
+      interruptedTurnId: 'turn-stream',
+      interruptedUserGoal: 'continue here',
+      summaryTurnId: 'summary-stream',
+      phase: 'migrating',
+      newTopicAnchor: source.rootMessageId,
+      newSessionId: target.sessionId,
+    };
+    sessionStore.updateSession(source);
+    sessionStore.updateSession(target);
+
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const recoverCodexHandoff = vi.fn(async (restoredSource: DaemonSession) => {
+      expect(restoredSource.session.sessionId).toBe(source.sessionId);
+      expect([...map.values()].some(ds => ds.session.sessionId === target.sessionId)).toBe(false);
+    });
+
+    await restoreActiveSessions(map, { recoverCodexHandoff });
+
+    expect(recoverCodexHandoff).toHaveBeenCalledOnce();
+    expect(map.get(sessionKey(source.rootMessageId, 'app_test'))?.session.sessionId)
+      .toBe(source.sessionId);
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('restores only the latest clean Codex App sidecar after a disk reload and re-attaches it', async () => {
     probe.result = 'exists';
     bot.cliId = 'codex-app';

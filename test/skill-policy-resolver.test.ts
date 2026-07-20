@@ -114,4 +114,15 @@ describe('skill policy resolver', () => {
     expect(globalDefault.delivery).toBe('prompt');
     expect(botOverride.delivery).toBe('prompt');
   });
+
+  it('defaults Skill delivery to auto when no explicit global choice exists', () => {
+    const result = resolveSkillPolicy({
+      registrySkills: [pkg('deploy', ['sre'], { type: 'user', root: '/tmp/deploy' })],
+      projectSkills: [],
+      botPolicy: { include: ['skill:deploy'] },
+      workingDir: '/repo',
+    });
+
+    expect(result.delivery).toBe('auto');
+  });
 });

@@ -96,6 +96,8 @@ export interface DaemonSession {
     summaryTurnId: string;
     phase: 'collecting' | 'migrating' | 'completed';
     selectedSummary?: string;
+    /** Same as Session.codexFreshHandoff.newTopicAnchor. New handoffs retain
+     * the source Lark topic; the legacy field name remains persistence ABI. */
     newTopicAnchor?: string;
     newSessionId?: string;
     migrationInFlight?: boolean;

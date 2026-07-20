@@ -69,4 +69,59 @@ describe('Aggregator cache merge', () => {
     expect(seen[0].larkAppId).toBe('appB');
     expect(seen[0].type).toBe('session.spawned');
   });
+
+  it('replays current session state after subscribing so REST-to-SSE gaps self-heal', () => {
+    const a = new Aggregator();
+    a.hydrateSessions('appA', [
+      { sessionId: 's1', larkAppId: 'appA', status: 'idle' } as any,
+    ]);
+
+    // Simulate the browser receiving an idle REST snapshot, then missing the
+    // idle -> working edge before its EventSource connected.
+    a.applyEvent('appA', {
+      type: 'session.update',
+      body: { sessionId: 's1', patch: { status: 'working' } },
+    });
+
+    const seen: any[] = [];
+    const off = a.onWithSessionSnapshot(e => seen.push(e));
+    expect(seen).toEqual([
+      expect.objectContaining({
+        type: 'session.spawned',
+        larkAppId: 'appA',
+        body: { session: expect.objectContaining({ sessionId: 's1', status: 'working' }) },
+      }),
+    ]);
+
+    a.applyEvent('appA', {
+      type: 'session.update',
+      body: { sessionId: 's1', patch: { status: 'idle' } },
+    });
+    expect(seen.at(-1)).toMatchObject({
+      type: 'session.update',
+      body: { sessionId: 's1', patch: { status: 'idle' } },
+    });
+    off();
+  });
+
+  it('subscribes before snapshot replay so a reconnect has no blind window', () => {
+    const a = new Aggregator();
+    a.hydrateSessions('appA', [
+      { sessionId: 's1', larkAppId: 'appA', status: 'idle' } as any,
+    ]);
+
+    const seen: any[] = [];
+    a.onWithSessionSnapshot(e => {
+      seen.push(e);
+      if (seen.length === 1) {
+        a.applyEvent('appA', {
+          type: 'session.update',
+          body: { sessionId: 's1', patch: { status: 'working' } },
+        });
+      }
+    });
+
+    expect(seen.map(e => e.type)).toEqual(['session.spawned', 'session.update']);
+    expect(a.getSessions()[0].status).toBe('working');
+  });
 });

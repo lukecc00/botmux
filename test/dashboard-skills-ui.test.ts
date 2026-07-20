@@ -143,6 +143,48 @@ describe('dashboard skills install panel', () => {
     expect(install.parent?.parent).toBe(installGrid);
   });
 
+  it('selects a saved install location and exposes its update action', () => {
+    const onSelectInstallHistory = vi.fn();
+    const onUpdateInstallHistory = vi.fn();
+    const renderer = renderInstallPanel({
+      installHistory: [{
+        id: 'recent-1',
+        source: 'https://github.com/acme/skills',
+        path: 'skills/deploy',
+        ref: 'main',
+        skillNames: ['deploy'],
+        installedSkillNames: ['deploy'],
+        updatedAt: '2026-07-20T00:00:00.000Z',
+      }],
+      selectedInstallHistoryId: 'recent-1',
+      onSelectInstallHistory,
+      onUpdateInstallHistory,
+    });
+    const root = renderer.root;
+
+    act(() => root.findByProps({ 'data-action': 'select-install-history' }).props.onChange({ currentTarget: { value: 'recent-1' } }));
+    act(() => root.findByProps({ 'data-action': 'update-install-history' }).props.onClick());
+
+    expect(onSelectInstallHistory).toHaveBeenCalledWith('recent-1');
+    expect(onUpdateInstallHistory).toHaveBeenCalledTimes(1);
+    expect(root.findByProps({ 'data-action': 'update-install-history' }).props.disabled).toBe(false);
+  });
+
+  it('disables history update when no installed Skill still matches that location', () => {
+    const renderer = renderInstallPanel({
+      installHistory: [{
+        id: 'old-1',
+        source: '/tmp/removed-skill',
+        skillNames: ['removed'],
+        installedSkillNames: [],
+        updatedAt: '2026-07-20T00:00:00.000Z',
+      }],
+      selectedInstallHistoryId: 'old-1',
+    });
+
+    expect(renderer.root.findByProps({ 'data-action': 'update-install-history' }).props.disabled).toBe(true);
+  });
+
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {
     const renderer = renderInstallPanel({
       installSource: 'https://github.com/acme/skills',

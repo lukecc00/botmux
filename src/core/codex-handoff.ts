@@ -6,8 +6,9 @@ import type { Session } from '../types.js';
  * Codex's native /compact keeps the same thread id.  That is useful for an
  * ordinary compaction, but it cannot recover a thread which has already hit
  * the model's hard context ceiling.  Botmux therefore treats /compact as a
- * cross-thread handoff for Codex: compact first, ask the old thread for a
- * bounded summary, then seed a brand-new thread from that summary.
+ * cross-native-session handoff for Codex: compact first, ask the old thread
+ * for a bounded summary, then seed a brand-new Codex thread from that summary
+ * while keeping the surrounding Lark topic stable.
  */
 export function shouldFreshHandoffCodex(cliId: CliId, command: string): boolean {
   return cliId === 'codex' && command.trim().toLowerCase() === '/compact';
@@ -129,10 +130,10 @@ export function buildFreshCodexHandoffTopic(
   const streamDisconnected = reason === 'stream_disconnected';
   const note = locale === 'en'
     ? streamDisconnected
-      ? 'The previous Codex response stream disconnected before completion. A new topic and a brand-new Codex session were created from this recovery record; the interrupted session was not resumed.'
-      : 'A new topic and a brand-new Codex session have been created from this summary. The previous session was not resumed.'
+      ? 'The previous Codex response stream disconnected before completion. A brand-new Codex session was created from this recovery record in the current Lark topic; the interrupted session was not resumed.'
+      : 'A brand-new Codex session has been created from this summary in the current Lark topic. The previous session was not resumed.'
     : streamDisconnected
-      ? '上一 Codex 响应流在完成前断开。已根据此恢复记录创建新话题和全新的 Codex 会话；不会 resume 已中断的旧会话。'
-      : '已根据此摘要创建新话题和全新的 Codex 会话；不会 resume 旧会话。';
+      ? '上一 Codex 响应流在完成前断开。已根据此恢复记录在当前飞书话题内创建全新的 Codex 会话；不会 resume 已中断的旧会话。'
+      : '已根据此摘要在当前飞书话题内创建全新的 Codex 会话；不会 resume 旧会话。';
   return `${normalized}\n\n---\n${note}`;
 }
