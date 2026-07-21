@@ -31,6 +31,12 @@ const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
+export type RecipientMentionMode = 'footer' | 'body';
+
+export interface MarkdownCardSessionControls {
+  terminalUrl?: string;
+  stopValue?: Record<string, string>;
+}
 
 interface LocalHomeCandidate {
   id: number;
@@ -239,6 +245,26 @@ export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux
 export function brandFooterSegment(brand: string | undefined): string | null {
   if (brand === undefined) return DEFAULT_BRAND_LABEL;
   return brand.trim() ? brand : null;
+}
+
+function footerBrandSegment(brand: string | undefined, controls?: MarkdownCardSessionControls): string | null {
+  if (controls?.terminalUrl && brand === undefined) {
+    return `[botmux](${controls.terminalUrl})`;
+  }
+  return brandFooterSegment(brand);
+}
+
+function sessionControlElements(controls: MarkdownCardSessionControls | undefined, locale?: Locale): any[] {
+  const actions: any[] = [];
+  if (controls?.stopValue) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.stop_conversation', undefined, locale) },
+      type: 'danger',
+      behaviors: [{ type: 'callback', value: controls.stopValue }],
+    });
+  }
+  return actions.length > 0 ? [{ tag: 'action', actions }] : [];
 }
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
@@ -654,12 +680,20 @@ export function buildMarkdownCard(
   locale?: Locale,
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  recipientMentionMode: RecipientMentionMode = 'footer',
+  controls?: MarkdownCardSessionControls,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
+  if (recipientOpenId && recipientMentionMode === 'body') {
+    elements.unshift({ tag: 'markdown', content: `<at id=${recipientOpenId}></at>` });
+  }
+  elements.push(...sessionControlElements(controls, locale));
   const footerParts: string[] = [];
-  const brandSeg = brandFooterSegment(brand);
+  const brandSeg = footerBrandSegment(brand, controls);
   if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
+  if (recipientOpenId && recipientMentionMode === 'footer') {
+    footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
+  }
   // Empty brand + no recipient → no footer at all (skip the orphan HR too).
   if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
@@ -706,10 +740,12 @@ export function buildContextualReplyCard(opts: {
   assistantText: string;
   assistantLabel: string;
   recipientOpenId?: string;
+  recipientMentionMode?: RecipientMentionMode;
   brand?: string;
   locale?: Locale;
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
+  controls?: MarkdownCardSessionControls;
 }): string {
   const {
     title,
@@ -717,10 +753,12 @@ export function buildContextualReplyCard(opts: {
     assistantText,
     assistantLabel,
     recipientOpenId,
+    recipientMentionMode = 'footer',
     brand,
     locale,
     workingDir,
     localHomeLinkMode = 'filesystem',
+    controls,
   } = opts;
   const elements: any[] = [];
 
@@ -729,6 +767,10 @@ export function buildContextualReplyCard(opts: {
     text_size: 'heading_2_v2',
     content: title,
   });
+
+  if (recipientOpenId && recipientMentionMode === 'body') {
+    elements.push({ tag: 'markdown', content: `<at id=${recipientOpenId}></at>` });
+  }
 
   if (userText !== undefined) {
     const u = userText.trim();
@@ -748,11 +790,14 @@ export function buildContextualReplyCard(opts: {
     ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
+  elements.push(...sessionControlElements(controls, locale));
 
   const footerParts: string[] = [];
-  const brandSeg = brandFooterSegment(brand);
+  const brandSeg = footerBrandSegment(brand, controls);
   if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
+  if (recipientOpenId && recipientMentionMode === 'footer') {
+    footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
+  }
   if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
     elements.push({

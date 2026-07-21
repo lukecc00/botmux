@@ -84,7 +84,7 @@ export interface DaemonSession {
   pendingRawInput?: string;
   /** Codex-only /compact migration. While set, the next transcript-backed
    * final output is the requested Handoff Summary and is consumed by the
-   * daemon to seed a brand-new Lark topic + Codex session. Its serializable
+   * daemon to seed a brand-new Codex session in the same Lark topic. Its serializable
    * fields mirror Session.codexFreshHandoff so daemon restart can recover the
    * migration without resuming the exhausted native Codex thread. */
   pendingCodexFreshHandoff?: {
@@ -97,9 +97,11 @@ export interface DaemonSession {
     phase: 'collecting' | 'migrating' | 'completed';
     selectedSummary?: string;
     /** Same as Session.codexFreshHandoff.newTopicAnchor. New handoffs retain
-     * the source Lark topic; the legacy field name remains persistence ABI. */
+     * the source Lark topic; legacy values are repaired to that topic. */
     newTopicAnchor?: string;
     newSessionId?: string;
+    /** Mirrors Session.codexFreshHandoff.sourceTopicNoticeSentAt. */
+    sourceTopicNoticeSentAt?: string;
     migrationInFlight?: boolean;
     retryCount?: number;
     failureNotified?: boolean;

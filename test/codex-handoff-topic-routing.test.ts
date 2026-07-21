@@ -14,10 +14,23 @@ function migrationSource(): string {
 describe('Codex handoff Lark routing', () => {
   it('replaces the native session without creating another Lark topic', () => {
     const source = migrationSource();
-    expect(source).toContain('const anchor = handoff.newTopicAnchor ?? sessionAnchorId(source);');
+    expect(source).toContain('const anchor = sessionAnchorId(source);');
     expect(source).toContain('sessionReply(\n        anchor,\n        buildFreshCodexHandoffTopic(');
     expect(source).not.toContain('await sendMessage(');
     expect(source).not.toContain("sendMessage(\n        source.larkAppId,\n        source.chatId");
+  });
+
+  it('repairs a legacy persisted new-topic route back to the source topic', () => {
+    const source = migrationSource();
+    expect(source).toContain('const persistedAnchor = handoff.newTopicAnchor;');
+    expect(source).toContain('if (persistedAnchor && persistedAnchor !== anchor)');
+    expect(source).toContain('handoff.newTopicAnchor = anchor;');
+    expect(source).toContain('if (!sourceTopicNoticeSentAt)');
+    expect(source).toContain('codexHandoffSourceNoticeUuid(handoff.requestId, anchor)');
+    expect(source).toContain('sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt');
+    expect(source).toContain('session.rootMessageId === persistedAnchor');
+    expect(source).toContain('session.rootMessageId = anchor;');
+    expect(source).toContain("session.scope = 'thread';");
   });
 
   it('atomically replaces the same-topic runtime and suppresses a false stop notice', () => {

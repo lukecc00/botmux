@@ -11,6 +11,7 @@ export const messages: Record<string, string> = {
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
   'card.btn.close_session': '❌ Close Session',
+  'card.btn.stop_conversation': '⏹️ Stop',
   'card.btn.resume_session': '▶️ Resume Session',
   'card.btn.show_output': '📖 Show Output',
   'card.btn.hide_output': '📕 Hide Output',

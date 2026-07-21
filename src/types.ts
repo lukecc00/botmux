@@ -222,6 +222,10 @@ export interface Session {
    * back to the single-slot behavior.
    */
   replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  /** Per-turn inbound sender attribution. Final-output delivery uses this map
+   * to @ the human who triggered that exact turn instead of the topic owner or
+   * a later queued caller. Bounded alongside replyTargets. */
+  turnCallers?: Record<string, { openId: string; updatedAt: string; isBot?: boolean }>;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /**
@@ -273,10 +277,14 @@ export interface Session {
     completedAt?: string;
     selectedSummary?: string;
     /** Lark topic that receives the fresh native Codex session. New handoffs
-     * keep the source topic anchor; a different value is supported only to
-     * finish durable handoffs persisted by older botmux versions. */
+     * keep the source topic anchor; legacy different values are canonicalized
+     * back to the source topic during recovery. */
     newTopicAnchor?: string;
     newSessionId?: string;
+    /** Set once the handoff/recovery notice has been delivered to the source
+     * Lark topic. Prevents daemon-restart recovery from repeatedly narrating
+     * the same native-session replacement. */
+    sourceTopicNoticeSentAt?: string;
   };
   /** Consecutive automatic stream-disconnect migrations consumed by this
    * recovery lineage. Copied to the fresh session and cleared by the next

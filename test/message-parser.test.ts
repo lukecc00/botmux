@@ -303,6 +303,43 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('botmux');
   });
 
+  it('drops a session-terminal botmux footer and its internal stop control', () => {
+    const terminalUrl = 'https://terminal.example/s/session-1?viewToken=read-only';
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'action', actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '⏹️ 停止' },
+          type: 'danger',
+          behaviors: [{
+            type: 'callback',
+            value: { action: 'close', botmux_control: 'reply_stop' },
+          }],
+        }] },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: `<font color='grey'>[botmux](${terminalUrl})</font>` },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('停止');
+  });
+
+  it('drops the simplified session-terminal botmux footer', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [{ tag: 'a', text: 'botmux', href: 'https://terminal.example/s/session-1?viewToken=read-only' }],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+  });
+
   it('round-trips a real buildMarkdownCard output without footer leakage', () => {
     const raw = buildMarkdownCard('帮我看下这个 bug', 'ou_owner');
     const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));

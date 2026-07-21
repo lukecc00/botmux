@@ -14,6 +14,7 @@ export const messages: Record<string, string> = {
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
+  'card.btn.stop_conversation': '⏹️ 停止',
   'card.btn.resume_session': '▶️ 恢复会话',
   'card.btn.show_output': '📖 显示输出',
   'card.btn.hide_output': '📕 隐藏输出',

@@ -544,6 +544,22 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   }
 }
 
+function daemonFinalRecipientOpenId(
+  ds: DaemonSession,
+  turnId: string,
+  effectiveCliId?: string,
+): string | undefined {
+  const caller = ds.session.turnCallers?.[turnId];
+  if (!caller?.openId) return daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+  if (caller.isBot) return isRunnerDeliveryCli(effectiveCliId) ? caller.openId : undefined;
+  try {
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(caller.openId)) {
+      return isRunnerDeliveryCli(effectiveCliId) ? caller.openId : undefined;
+    }
+  } catch { /* identity cache is best-effort; event attribution still wins */ }
+  return caller.openId;
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
@@ -2393,6 +2409,17 @@ function setupWorkerHandlers(
     ds.progressOutputInFlight.add(record.transcriptUuid);
 
     const run = async (): Promise<void> => {
+      const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+      const controls = {
+        terminalUrl: buildTerminalUrl(ds),
+        stopValue: {
+          action: 'close',
+          root_id: sessionAnchorId(ds),
+          session_id: ds.session.sessionId,
+          cli_id: effectiveCliId,
+          botmux_control: 'reply_stop',
+        },
+      };
       const cardJson = buildMarkdownCard(
         record.content,
         undefined, // progress is deliberately low-attention: no owner @ footer
@@ -2400,6 +2427,8 @@ function setupWorkerHandlers(
         localeForBot(ds.larkAppId),
         ds.workingDir,
         daemonCardLocalHomeLinkMode(ds),
+        'footer',
+        controls,
       );
       for (let attempt = 0; ; attempt++) {
         const backoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
@@ -2439,6 +2468,15 @@ function setupWorkerHandlers(
             logger.warn(`[${t}] Structured progress abandoned — root message withdrawn`);
             killWorker(ds);
             cb.closeSession(ds);
+            return;
+          }
+          if (isPermanentProgressDeliveryError(err)) {
+            completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+            logger.error(
+              `[${t}] Structured progress permanently rejected by Lark; dropped so later commentary/final can continue `
+              + `(HTTP ${larkHttpStatus(err)}, turn ${record.turnId.substring(0, 8)}): `
+              + `${err?.message ?? err}`,
+            );
             return;
           }
           const nextBackoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
@@ -3652,6 +3690,41 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
  * outbox takes over across daemon restarts. */
 const PROGRESS_OUTPUT_RETRY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
 
+function larkHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const response = (error as { response?: unknown }).response;
+  const responseStatus = response && typeof response === 'object'
+    ? (response as { status?: unknown }).status
+    : undefined;
+  const status = responseStatus ?? (error as { status?: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function larkBusinessCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const response = (error as { response?: unknown }).response;
+  const data = response && typeof response === 'object'
+    ? (response as { data?: unknown }).data
+    : undefined;
+  const responseCode = data && typeof data === 'object'
+    ? (data as { code?: unknown }).code
+    : undefined;
+  const directCode = (error as { code?: unknown }).code;
+  const code = responseCode ?? directCode;
+  return typeof code === 'number' ? code : undefined;
+}
+
+/** Provider validation/routing failures cannot heal by retrying the same
+ * payload and UUID. Keeping one at the commentary FIFO head forever also
+ * prevents the turn's final answer from ever reaching Lark. */
+function isPermanentProgressDeliveryError(error: unknown): boolean {
+  const status = larkHttpStatus(error);
+  const code = larkBusinessCode(error);
+  const rateLimited = status === 429
+    || code === 99991400; // request trigger frequency limit (often wrapped in HTTP 400)
+  return status !== undefined && status >= 400 && status < 500 && status !== 408 && !rateLimited;
+}
+
 function isSessionClosed(ds: DaemonSession): boolean {
   return ds.progressDeliveryClosed === true || ds.session.status === 'closed';
 }
@@ -3902,8 +3975,18 @@ function deliverFinalOutput(
       const recipientOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
-          ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+          ?? daemonFinalRecipientOpenId(ds, msg.turnId, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      const controls = managedReceiver ? undefined : {
+        terminalUrl: buildTerminalUrl(ds),
+        stopValue: {
+          action: 'close',
+          root_id: sessionAnchorId(ds),
+          session_id: ds.session.sessionId,
+          cli_id: effectiveCliId,
+          botmux_control: 'reply_stop',
+        },
+      };
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -3913,10 +3996,12 @@ function deliverFinalOutput(
             assistantText: safeAssistantText,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
+            recipientMentionMode: 'body',
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
+            controls,
           })
         : buildMarkdownCard(
             safeAssistantText,
@@ -3925,6 +4010,8 @@ function deliverFinalOutput(
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
+            'body',
+            controls,
           );
 
       const proposedOutput = {

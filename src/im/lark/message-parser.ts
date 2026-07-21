@@ -613,9 +613,9 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
 }
 
 /**
- * botmux-generated card footer signature. Every card `botmux send` /
- * buildMarkdownCard emits ends with a small grey note linking back to the repo
- * (`[botmux](https://github.com/deepcoldy/botmux)`, optionally `· 发送给：@owner`).
+ * botmux-generated card footer signature. Generic `botmux send` cards link to
+ * the repo; daemon commentary/final cards link the same `botmux` label to the
+ * current session terminal. Both are human-facing chrome, not prompt content.
  * That footer is human-facing chrome — when another bot receives the card it
  * must NOT leak into the receiving bot's prompt (it surfaces as a stray
  * `<font color='grey'>botmux</font>` block and duplicates mention info). Both
@@ -629,7 +629,17 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
 const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
 
 function isBotmuxFooterLine(line: string): boolean {
-  return line.includes(BOTMUX_FOOTER_MARKER);
+  return line.includes(BOTMUX_FOOTER_MARKER)
+    || /^(?:\[botmux\]\(|botmux\()https?:\/\/[^)]+\)(?:\s*·.*)?$/i.test(line.trim());
+}
+
+function isBotmuxReplyControlButton(node: any): boolean {
+  if (!node || node.tag !== 'button') return false;
+  if (node.value?.botmux_control === 'reply_stop') return true;
+  return Array.isArray(node.behaviors)
+    && node.behaviors.some((behavior: any) =>
+      behavior?.type === 'callback'
+      && behavior?.value?.botmux_control === 'reply_stop');
 }
 
 /**
@@ -702,6 +712,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
+              if (isBotmuxReplyControlButton(node)) continue;
               // Same jump-URL policy as Format B: simple cards reach history
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
@@ -996,6 +1007,7 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // open_url; keep it so the reader can actually follow the link (e.g. Argos
   // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
   if (tag === 'button') {
+    if (isBotmuxReplyControlButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);

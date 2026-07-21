@@ -22,6 +22,26 @@ export interface ReplyTargetEntry {
  *  currentReplyTarget path — same behavior as before the map existed. */
 const REPLY_TARGETS_MAX = 32;
 
+export function rememberTurnCaller(
+  ds: DaemonSession,
+  turnId: string,
+  openId: string | undefined,
+  nowIso = new Date().toISOString(),
+  isBot = false,
+): void {
+  if (!openId) return;
+  const callers = { ...(ds.session.turnCallers ?? {}) };
+  callers[turnId] = { openId, updatedAt: nowIso, ...(isBot ? { isBot: true } : {}) };
+  const keys = Object.keys(callers);
+  if (keys.length > REPLY_TARGETS_MAX) {
+    keys
+      .sort((a, b) => (callers[a].updatedAt < callers[b].updatedAt ? -1 : 1))
+      .slice(0, keys.length - REPLY_TARGETS_MAX)
+      .forEach(key => { delete callers[key]; });
+  }
+  ds.session.turnCallers = callers;
+}
+
 /** The reply target for a SPECIFIC turn: exact per-turn entry first, then the
  *  single-slot currentReplyTarget (which only remembers the latest turn — with
  *  queued/concurrent turns an earlier turn would otherwise lose its anchor). */

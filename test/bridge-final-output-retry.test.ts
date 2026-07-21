@@ -605,7 +605,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_orch_bot></at>');
   });
 
-  it('keeps daemon final-output footer addressing for a human owner', async () => {
+  it('puts a real body mention on daemon final output for a human owner', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -625,7 +625,35 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain('<at id=ou_human></at>');
+    const elements = JSON.parse(cardJson).body.elements;
+    expect(elements[0].content).toBe('<at id=ou_human></at>');
+    expect(elements[elements.length - 1].content).not.toContain('<at id=ou_human></at>');
+  });
+
+  it('mentions the exact turn caller instead of the topic owner', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.lastCallerOpenId = 'ou_later_caller';
+    ds.session.turnCallers = {
+      'turn-1': { openId: 'ou_exact_caller', updatedAt: new Date().toISOString() },
+    };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
+    expect(elements[0].content).toBe('<at id=ou_exact_caller></at>');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_owner');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_later_caller');
   });
 
   it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
@@ -1472,6 +1500,69 @@ describe('Worker turn_terminal routing', () => {
     expect(deliveryOrder).toEqual([]);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(deliveryOrder).toEqual(['progress', 'final']);
+    vi.useRealTimers();
+  });
+
+  it('drops permanently rejected commentary and still forwards the final answer', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('坏进度')) {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400, data: { code: 230099, msg: 'invalid card' } },
+        });
+      }
+      if (body.includes('最终仍需送达')) deliveryOrder.push('final');
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '坏进度', uuid: 'permanent-progress-failure', turnId: 'turn-permanent-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '最终仍需送达', lastUuid: 'final-after-permanent-progress', turnId: 'turn-permanent-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliveryOrder).toEqual(['final']);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('keeps retrying Lark rate limits even when the SDK wraps them in HTTP 400', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    let attempts = 0;
+    const sessionReply = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400, data: { code: 99991400, msg: 'request trigger frequency limit' } },
+        });
+      }
+      return 'om_reply';
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '限流后重试', uuid: 'rate-limited-progress', turnId: 'turn-rate-limit',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(attempts).toBe(2);
     vi.useRealTimers();
   });
 

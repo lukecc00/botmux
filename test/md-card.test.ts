@@ -675,6 +675,38 @@ describe('buildMarkdownCard', () => {
     expect(last.content).toContain('<at id=ou_abc></at>');
   });
 
+  it('can place a recipient mention in the body for attention-sensitive final replies', () => {
+    const json = buildMarkdownCard('hi', 'ou_abc', undefined, undefined, undefined, 'filesystem', 'body');
+    const card = JSON.parse(json);
+    expect(card.body.elements[0].content).toBe('<at id=ou_abc></at>');
+    const last = card.body.elements[card.body.elements.length - 1];
+    expect(last.content).not.toContain('<at id=ou_abc></at>');
+  });
+
+  it('can link the botmux footer to the session terminal and expose a stop action', () => {
+    const terminalUrl = 'https://terminal.example/s/session-1?viewToken=read-only';
+    const stopValue = {
+      action: 'close',
+      root_id: 'om_root',
+      session_id: 'session-1',
+      cli_id: 'codex',
+      botmux_control: 'reply_stop',
+    };
+    const json = buildMarkdownCard(
+      'hi', undefined, undefined, 'zh', undefined, 'filesystem', 'footer',
+      { terminalUrl, stopValue },
+    );
+    const card = JSON.parse(json);
+    const action = card.body.elements.find((element: any) => element.tag === 'action');
+    expect(action.actions).toHaveLength(1);
+    expect(action.actions[0]).toMatchObject({
+      type: 'danger',
+      behaviors: [{ type: 'callback', value: stopValue }],
+    });
+    expect(action.actions[0].text.content).toContain('停止');
+    expect(card.body.elements.at(-1).content).toContain(`[botmux](${terminalUrl})`);
+  });
+
   it('omits recipient line when openId is undefined', () => {
     const json = buildMarkdownCard('hi');
     const card = JSON.parse(json);
