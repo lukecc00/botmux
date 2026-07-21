@@ -516,7 +516,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
-  it('does not address daemon final-output footers to a known bot owner', async () => {
+  it('does not address daemon final output or render a brand footer for a known bot owner', async () => {
     writeFileSync(
       join('/tmp/test-sessions', 'bot-openids-app_test.json'),
       JSON.stringify({ Claude: 'ou_foreign_bot' }),
@@ -541,7 +541,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain('[botmux](');
+    expect(cardJson).not.toContain('[botmux](');
+    expect(cardJson).toContain('web终端');
+    expect(cardJson).toContain('停止');
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
   });
 
@@ -627,7 +629,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const cardJson = sessionReply.mock.calls[0][1] as string;
     const elements = JSON.parse(cardJson).body.elements;
     expect(elements[0].content).toBe('<at id=ou_human></at>');
-    expect(elements[elements.length - 1].content).not.toContain('<at id=ou_human></at>');
+    expect(elements[elements.length - 1].tag).toBe('column_set');
+    expect(cardJson.match(/<at id=ou_human><\/at>/g)).toHaveLength(1);
   });
 
   it('mentions the exact turn caller instead of the topic owner', async () => {

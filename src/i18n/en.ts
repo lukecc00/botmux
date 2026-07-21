@@ -2,6 +2,8 @@
 export const messages: Record<string, string> = {
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',
+  'card.btn.reply_terminal': 'Web Terminal',
+  'card.btn.reply_manage': 'Manage',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',
   'card.btn.open_local_cli': '💻 Open {cliName}',
   'card.btn.open_local_codex': 'Open Codex',
@@ -11,7 +13,7 @@ export const messages: Record<string, string> = {
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
   'card.btn.close_session': '❌ Close Session',
-  'card.btn.stop_conversation': '⏹️ Stop',
+  'card.btn.stop_conversation': 'Stop',
   'card.btn.resume_session': '▶️ Resume Session',
   'card.btn.show_output': '📖 Show Output',
   'card.btn.hide_output': '📕 Hide Output',
@@ -56,6 +58,10 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
+  'card.manage_access.title': 'Management Access',
+  'card.manage_access.note': 'Visible only to you. These links grant management or terminal control; do not forward them.',
+  'card.manage_access.dashboard': 'Management Dashboard',
+  'card.manage_access.terminal': 'Writable Web Terminal',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -712,6 +718,8 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_failed': '⚠️ Could not open the local CLI: {reason}',
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
+  'card.action.manage_access_sent': 'Management access has been sent to you privately.',
+  'card.action.manage_access_no_permission': '🔒 You do not have operate permission, so you cannot get management access.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',

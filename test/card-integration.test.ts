@@ -27,6 +27,7 @@ import {
   makeCloseEvent,
   makeResumeEvent,
   makeGetWriteLinkEvent,
+  makeManageAccessEvent,
   makeRetryLastTaskEvent,
 } from './fixtures/card-action-events.js';
 
@@ -85,6 +86,8 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     ) =>
       JSON.stringify({ type: 'session', url: _url, showManageButtons: !!showManageButtons, adoptMode: !!adoptMode }),
   ),
+  buildManagementAccessCard: vi.fn((dashboardUrl: string, terminalUrl: string) =>
+    JSON.stringify({ type: 'management', dashboardUrl, terminalUrl })),
   buildSessionClosedCard: vi.fn(
     (sid: string, rid: string, title: string, cliId?: string, workingDir?: string) =>
       JSON.stringify({ type: 'closed', sid, rid, title, cliId, workingDir }),
@@ -150,6 +153,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   }),
   // Resume action delegates to session-manager — tests stub per-scenario.
   resumeSession: vi.fn(),
+}));
+
+vi.mock('../src/core/manage-access.js', () => ({
+  buildManagementDashboardUrl: vi.fn(() => 'https://m-test.botmux.example/#/bot-defaults'),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -927,6 +934,26 @@ describe('Card integration: full event flow', () => {
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('尚未就绪'),
       );
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Scenario 6: manage_access delivers dashboard + writable terminal privately', () => {
+    it('sends both privileged links only in a clicker-visible ephemeral card', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ workerPort: 9090, workerToken: 'write_tok', chatType: 'group' });
+      const sessions = new Map<string, DaemonSession>([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const res = await handleCardAction(makeManageAccessEvent(ROOT_ID, 'ou_user'), makeDeps(sessions), APP_ID);
+      await flush();
+
+      expect(res?.toast?.type).toBe('success');
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const privateCard = parseCard(vi.mocked(clientMod.sendEphemeralCard).mock.calls[0][3] as string);
+      expect(privateCard).toEqual({
+        type: 'management',
+        dashboardUrl: 'https://m-test.botmux.example/#/bot-defaults',
+        terminalUrl: expect.stringContaining('token=write_tok'),
+      });
+      expect(fakeLark.dms).toHaveLength(0);
     });
   });
 

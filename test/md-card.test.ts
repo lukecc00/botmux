@@ -683,7 +683,7 @@ describe('buildMarkdownCard', () => {
     expect(last.content).not.toContain('<at id=ou_abc></at>');
   });
 
-  it('can link the botmux footer to the session terminal and expose a stop action', () => {
+  it('puts the web terminal and stop controls side by side without a botmux terminal footer', () => {
     const terminalUrl = 'https://terminal.example/s/session-1?viewToken=read-only';
     const stopValue = {
       action: 'close',
@@ -692,20 +692,60 @@ describe('buildMarkdownCard', () => {
       cli_id: 'codex',
       botmux_control: 'reply_stop',
     };
+    const manageValue = {
+      action: 'manage_access',
+      root_id: 'om_root',
+      session_id: 'session-1',
+      cli_id: 'codex',
+      botmux_control: 'reply_manage',
+    };
     const json = buildMarkdownCard(
       'hi', undefined, undefined, 'zh', undefined, 'filesystem', 'footer',
-      { terminalUrl, stopValue },
+      { terminalUrl, stopValue, manageValue },
     );
     const card = JSON.parse(json);
     expect(card.body.elements.some((element: any) => element.tag === 'action')).toBe(false);
     const columns = card.body.elements.find((element: any) => element.tag === 'column_set');
-    expect(columns.columns).toHaveLength(1);
+    const columnsIndex = card.body.elements.indexOf(columns);
+    expect(card.body.elements[columnsIndex - 1].tag).toBe('hr');
+    expect(columns).toMatchObject({ flex_mode: 'flow', horizontal_spacing: 'small' });
+    expect(columns.columns).toHaveLength(3);
+    expect(columns.columns[0]).toMatchObject({ width: 'auto', vertical_align: 'center' });
     expect(columns.columns[0].elements[0]).toMatchObject({
-      type: 'danger',
+      type: 'primary_text',
+      size: 'tiny',
+      width: 'default',
+      text: { content: 'web终端' },
+      behaviors: [{ type: 'open_url', default_url: terminalUrl }],
+    });
+    expect(columns.columns[1]).toMatchObject({ width: 'auto', vertical_align: 'center' });
+    expect(columns.columns[1].elements[0]).toMatchObject({
+      type: 'danger_text',
+      size: 'tiny',
+      width: 'default',
       behaviors: [{ type: 'callback', value: stopValue }],
     });
-    expect(columns.columns[0].elements[0].text.content).toContain('停止');
-    expect(card.body.elements.at(-1).content).toContain(`[botmux](${terminalUrl})`);
+    expect(columns.columns[1].elements[0].text.content).toContain('停止');
+    expect(columns.columns[2].elements[0]).toMatchObject({
+      type: 'text',
+      size: 'tiny',
+      text: { content: '管理' },
+      behaviors: [{ type: 'callback', value: manageValue }],
+    });
+    expect(json).not.toContain('bot-defaults');
+    expect(json).not.toContain('token=');
+    expect(json).not.toContain('[botmux]');
+    expect(card.body.elements.at(-1).tag).toBe('column_set');
+  });
+
+  it('suppresses a custom brand footer on session reply cards', () => {
+    const json = buildMarkdownCard(
+      'hi', undefined, '[custom brand](https://brand.example)', 'zh', undefined,
+      'filesystem', 'footer',
+      { terminalUrl: 'https://terminal.example/s/11111111-1111-1111-1111-111111111111?viewToken=read-only' },
+    );
+    expect(json).not.toContain('custom brand');
+    expect(JSON.parse(json).body.elements.at(-1).tag).toBe('column_set');
   });
 
   it('omits recipient line when openId is undefined', () => {

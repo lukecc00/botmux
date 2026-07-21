@@ -36,6 +36,7 @@ export type RecipientMentionMode = 'footer' | 'body';
 export interface MarkdownCardSessionControls {
   terminalUrl?: string;
   stopValue?: Record<string, string>;
+  manageValue?: Record<string, string>;
 }
 
 interface LocalHomeCandidate {
@@ -248,29 +249,73 @@ export function brandFooterSegment(brand: string | undefined): string | null {
 }
 
 function footerBrandSegment(brand: string | undefined, controls?: MarkdownCardSessionControls): string | null {
-  if (controls?.terminalUrl && brand === undefined) {
-    return `[botmux](${controls.terminalUrl})`;
-  }
+  if (controls?.terminalUrl || controls?.stopValue || controls?.manageValue) return null;
   return brandFooterSegment(brand);
 }
 
 function sessionControlElements(controls: MarkdownCardSessionControls | undefined, locale?: Locale): any[] {
-  if (!controls?.stopValue) return [];
-  return [{
-    tag: 'column_set',
-    flex_mode: 'none',
-    columns: [{
+  if (!controls?.terminalUrl && !controls?.stopValue) return [];
+  const columns: any[] = [];
+  if (controls.terminalUrl) {
+    columns.push({
       tag: 'column',
-      width: 'weighted',
-      weight: 1,
+      width: 'auto',
+      vertical_align: 'center',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.reply_terminal', undefined, locale) },
+        type: 'primary_text',
+        size: 'tiny',
+        width: 'default',
+        behaviors: [{
+          type: 'open_url',
+          default_url: controls.terminalUrl,
+          pc_url: controls.terminalUrl,
+          android_url: controls.terminalUrl,
+          ios_url: controls.terminalUrl,
+        }],
+      }],
+    });
+  }
+  if (controls.stopValue) {
+    columns.push({
+      tag: 'column',
+      width: 'auto',
+      vertical_align: 'center',
       elements: [{
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.stop_conversation', undefined, locale) },
-        type: 'danger',
+        type: 'danger_text',
+        size: 'tiny',
+        width: 'default',
         behaviors: [{ type: 'callback', value: controls.stopValue }],
       }],
-    }],
-  }];
+    });
+  }
+  if (controls.manageValue) {
+    columns.push({
+      tag: 'column',
+      width: 'auto',
+      vertical_align: 'center',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.reply_manage', undefined, locale) },
+        type: 'text',
+        size: 'tiny',
+        width: 'default',
+        behaviors: [{ type: 'callback', value: controls.manageValue }],
+      }],
+    });
+  }
+  return [
+    { tag: 'hr' },
+    {
+      tag: 'column_set',
+      flex_mode: 'flow',
+      horizontal_spacing: 'small',
+      columns,
+    },
+  ];
 }
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */

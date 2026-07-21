@@ -18,6 +18,7 @@ import {
   buildRelayPickerCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildManagementAccessCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -77,6 +78,23 @@ function expectSidebarUrl(actual: string, targetUrl: string): void {
   expect(u.searchParams.get('reload')).toBe('false');
   expect(u.searchParams.get('url')).toBe(targetUrl);
 }
+
+describe('buildManagementAccessCard', () => {
+  it('renders dashboard and writable-terminal links in an explicit private-access card', () => {
+    const card = parse(buildManagementAccessCard(
+      'https://m-test.botmux.example/#/bot-defaults',
+      'https://m-test.botmux.example/s/session?token=secret',
+      'zh',
+    ));
+    const raw = JSON.stringify(card);
+    expect(card.schema).toBe('2.0');
+    expect(raw).toContain('仅你可见');
+    expect(raw).toContain('https://m-test.botmux.example/#/bot-defaults');
+    expect(raw).toContain('token=secret');
+    expect(raw).toContain('管理面板');
+    expect(raw).toContain('可操作 Web 终端');
+  });
+});
 
 /** Default mode: the terminal button links straight to the terminal URL on
  *  every platform field (no Feishu sidebar wrapper). */

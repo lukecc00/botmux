@@ -888,6 +888,21 @@ describe('repo select card — worktree open', () => {
     expect(vi.mocked(deliverWriteLinkCard)).not.toHaveBeenCalled(); // 门控就拦下，未投递
   });
 
+  it('manage_access requires canOperate and never generates private links for an outsider', async () => {
+    const ds = makeDs({ worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const res = await handleCardAction({
+      operator: { open_id: 'ou_stranger' },
+      action: { value: { action: 'manage_access', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(res?.toast?.content).toContain('没有操作权限');
+    expect(vi.mocked(deliverWriteLinkCard)).not.toHaveBeenCalled();
+  });
+
   it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);

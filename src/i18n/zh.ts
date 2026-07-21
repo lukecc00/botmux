@@ -5,6 +5,8 @@
 export const messages: Record<string, string> = {
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
+  'card.btn.reply_terminal': 'web终端',
+  'card.btn.reply_manage': '管理',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',
   'card.btn.open_local_cli': '💻 打开 {cliName}',
   'card.btn.open_local_codex': '打开 Codex',
@@ -14,7 +16,7 @@ export const messages: Record<string, string> = {
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
-  'card.btn.stop_conversation': '⏹️ 停止',
+  'card.btn.stop_conversation': '停止',
   'card.btn.resume_session': '▶️ 恢复会话',
   'card.btn.show_output': '📖 显示输出',
   'card.btn.hide_output': '📕 隐藏输出',
@@ -59,6 +61,10 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
+  'card.manage_access.title': '管理入口',
+  'card.manage_access.note': '仅你可见。以下入口包含管理或终端操作权限，请勿转发。',
+  'card.manage_access.dashboard': '管理面板',
+  'card.manage_access.terminal': '可操作 Web 终端',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -715,6 +721,8 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_failed': '⚠️ 无法打开本机 CLI：{reason}',
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
+  'card.action.manage_access_sent': '管理入口已私密发送，请查收',
+  'card.action.manage_access_no_permission': '🔒 没有操作权限，无法获取管理入口',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',

@@ -208,6 +208,50 @@ export function getCliDisplayName(cliId: CliId): string {
   return cliDisplayNames[cliId] ?? cliId;
 }
 
+export function buildManagementAccessCard(
+  dashboardUrl: string,
+  writableTerminalUrl: string,
+  locale?: Locale,
+): string {
+  const linkButton = (label: string, url: string, type: 'primary_text' | 'text') => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: label },
+    type,
+    size: 'small',
+    width: 'default',
+    behaviors: [{
+      type: 'open_url',
+      default_url: url,
+      pc_url: url,
+      android_url: url,
+      ios_url: url,
+    }],
+  });
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.manage_access.title', undefined, locale) },
+    },
+    body: {
+      direction: 'vertical',
+      elements: [
+        { tag: 'markdown', content: t('card.manage_access.note', undefined, locale) },
+        {
+          tag: 'column_set',
+          flex_mode: 'flow',
+          horizontal_spacing: 'small',
+          columns: [
+            { tag: 'column', width: 'auto', elements: [linkButton(t('card.manage_access.dashboard', undefined, locale), dashboardUrl, 'primary_text')] },
+            { tag: 'column', width: 'auto', elements: [linkButton(t('card.manage_access.terminal', undefined, locale), writableTerminalUrl, 'text')] },
+          ],
+        },
+      ],
+    },
+  });
+}
+
 /** Escape Lark markdown special characters in user-controlled strings.
  *  `<`/`>` are escaped too so an attacker-controlled name (e.g. a foreign
  *  bot's app name surfaced in the grant card) cannot inject a literal

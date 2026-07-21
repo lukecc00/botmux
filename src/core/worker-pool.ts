@@ -2460,6 +2460,13 @@ function setupWorkerHandlers(
           cli_id: effectiveCliId,
           botmux_control: 'reply_stop',
         },
+        manageValue: {
+          action: 'manage_access',
+          root_id: sessionAnchorId(ds),
+          session_id: ds.session.sessionId,
+          cli_id: effectiveCliId,
+          botmux_control: 'reply_manage',
+        },
       };
       const cardJson = buildMarkdownCard(
         record.content,
@@ -4105,6 +4112,13 @@ function deliverFinalOutput(
           session_id: ds.session.sessionId,
           cli_id: effectiveCliId,
           botmux_control: 'reply_stop',
+        },
+        manageValue: {
+          action: 'manage_access',
+          root_id: sessionAnchorId(ds),
+          session_id: ds.session.sessionId,
+          cli_id: effectiveCliId,
+          botmux_control: 'reply_manage',
         },
       };
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'

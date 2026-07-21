@@ -38,6 +38,13 @@ export function makeGetWriteLinkEvent(rootId: string, operatorOpenId = 'ou_user'
   };
 }
 
+export function makeManageAccessEvent(rootId: string, operatorOpenId = 'ou_user') {
+  return {
+    action: { value: { action: 'manage_access', root_id: rootId } },
+    operator: { open_id: operatorOpenId },
+  };
+}
+
 export function makeRetryLastTaskEvent(rootId: string, operatorOpenId = 'ou_user') {
   return {
     action: { value: { action: 'retry_last_task', root_id: rootId } },

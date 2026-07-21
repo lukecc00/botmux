@@ -635,11 +635,22 @@ function isBotmuxFooterLine(line: string): boolean {
 
 function isBotmuxReplyControlButton(node: any): boolean {
   if (!node || node.tag !== 'button') return false;
-  if (node.value?.botmux_control === 'reply_stop') return true;
+  if (node.value?.botmux_control === 'reply_stop' || node.value?.botmux_control === 'reply_manage') return true;
   return Array.isArray(node.behaviors)
     && node.behaviors.some((behavior: any) =>
       behavior?.type === 'callback'
-      && behavior?.value?.botmux_control === 'reply_stop');
+      && (behavior?.value?.botmux_control === 'reply_stop'
+        || behavior?.value?.botmux_control === 'reply_manage'));
+}
+
+function isBotmuxReplyTerminalButton(node: any): boolean {
+  if (!node || node.tag !== 'button') return false;
+  const label = typeof node.text === 'string' ? node.text : node.text?.content;
+  if (label !== 'web终端' && label !== 'Web Terminal') return false;
+  const url = buttonOpenUrl(node);
+  return typeof url === 'string'
+    && /\/s\/[0-9a-f-]{16,}(?:[/?#]|$)/i.test(url)
+    && /[?&]viewToken=/.test(url);
 }
 
 /**
@@ -712,7 +723,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
-              if (isBotmuxReplyControlButton(node)) continue;
+              if (isBotmuxReplyControlButton(node) || isBotmuxReplyTerminalButton(node)) continue;
               // Same jump-URL policy as Format B: simple cards reach history
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
@@ -1007,7 +1018,7 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // open_url; keep it so the reader can actually follow the link (e.g. Argos
   // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
   if (tag === 'button') {
-    if (isBotmuxReplyControlButton(el)) return;
+    if (isBotmuxReplyControlButton(el) || isBotmuxReplyTerminalButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);

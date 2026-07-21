@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard, buildManagementAccessCard } from './card-builder.js';
 import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
@@ -73,6 +73,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { buildManagementDashboardUrl } from '../../core/manage-access.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -1257,7 +1258,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'manage_access', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1292,11 +1293,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
+        if (value.action === 'get_write_link' || value.action === 'manage_access' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
             : value.action === 'open_local_cli'
               ? 'card.action.local_cli_no_permission'
+              : value.action === 'manage_access'
+                ? 'card.action.manage_access_no_permission'
               : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
@@ -1318,11 +1321,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
+        if (value.action === 'get_write_link' || value.action === 'manage_access' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
             : value.action === 'open_local_cli'
               ? 'card.action.local_cli_no_permission'
+              : value.action === 'manage_access'
+                ? 'card.action.manage_access_no_permission'
               : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
@@ -1812,6 +1817,28 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         });
         await deliverEphemeralOrReply(ds, operatorOpenId, notReadyCard, 'interactive', () => sessionReply(rootId, notReadyCard, 'interactive'));
       }
+    }
+
+    if (actionType === 'manage_access' && ds && operatorOpenId) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (!ds.riffAccessUrl && (!ds.workerPort || !ds.workerToken)) {
+        const notReadyCard = JSON.stringify({
+          schema: '2.0',
+          body: { elements: [{ tag: 'markdown', content: t('card.action.terminal_not_ready', undefined, locDs) }] },
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, notReadyCard, 'interactive', () => sessionReply(rootId, notReadyCard, 'interactive'));
+        return;
+      }
+      const cardJson = buildManagementAccessCard(
+        buildManagementDashboardUrl(),
+        buildTerminalUrl(ds, { write: true }),
+        locDs,
+      );
+      // Same private transport as get_write_link: visible-to-clicker ephemeral
+      // when supported, otherwise a private DM. The public reply card contains
+      // neither URL nor write capability.
+      void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+      return { toast: { type: 'success', content: t('card.action.manage_access_sent', undefined, locDs) } };
     }
 
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias

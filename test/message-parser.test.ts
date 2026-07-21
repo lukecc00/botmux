@@ -303,29 +303,43 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('botmux');
   });
 
-  it('drops a session-terminal botmux footer and its internal stop control', () => {
-    const terminalUrl = 'https://terminal.example/s/session-1?viewToken=read-only';
+  it('drops the session reply web-terminal and stop controls', () => {
+    const terminalUrl = 'https://terminal.example/s/11111111-1111-1111-1111-111111111111?viewToken=read-only';
     const card = {
       body: { elements: [
         { tag: 'markdown', content: '正文内容' },
-        { tag: 'action', actions: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '⏹️ 停止' },
-          type: 'danger',
-          behaviors: [{
-            type: 'callback',
-            value: { action: 'close', botmux_control: 'reply_stop' },
-          }],
-        }] },
-        { tag: 'hr' },
-        { tag: 'markdown', text_size: 'notation_small_v2',
-          content: `<font color='grey'>[botmux](${terminalUrl})</font>` },
+        { tag: 'column_set', columns: [
+          { tag: 'column', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'web终端' },
+            behaviors: [{ type: 'open_url', default_url: terminalUrl }],
+          }] },
+          { tag: 'column', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '管理' },
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'manage_access', botmux_control: 'reply_manage' },
+            }],
+          }] },
+          { tag: 'column', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '⏹️ 停止' },
+            type: 'danger',
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'close', botmux_control: 'reply_stop' },
+            }],
+          }] },
+        ] },
       ] },
     };
     const result = parseApiMessage(makeMsg('interactive', card));
     expect(result.content).toContain('正文内容');
-    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('web终端');
+    expect(result.content).not.toContain('viewToken');
     expect(result.content).not.toContain('停止');
+    expect(result.content).not.toContain('管理');
   });
 
   it('drops the simplified session-terminal botmux footer', () => {
