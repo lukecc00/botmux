@@ -697,13 +697,14 @@ describe('buildMarkdownCard', () => {
       { terminalUrl, stopValue },
     );
     const card = JSON.parse(json);
-    const action = card.body.elements.find((element: any) => element.tag === 'action');
-    expect(action.actions).toHaveLength(1);
-    expect(action.actions[0]).toMatchObject({
+    expect(card.body.elements.some((element: any) => element.tag === 'action')).toBe(false);
+    const columns = card.body.elements.find((element: any) => element.tag === 'column_set');
+    expect(columns.columns).toHaveLength(1);
+    expect(columns.columns[0].elements[0]).toMatchObject({
       type: 'danger',
       behaviors: [{ type: 'callback', value: stopValue }],
     });
-    expect(action.actions[0].text.content).toContain('停止');
+    expect(columns.columns[0].elements[0].text.content).toContain('停止');
     expect(card.body.elements.at(-1).content).toContain(`[botmux](${terminalUrl})`);
   });
 

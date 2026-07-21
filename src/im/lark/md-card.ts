@@ -255,16 +255,22 @@ function footerBrandSegment(brand: string | undefined, controls?: MarkdownCardSe
 }
 
 function sessionControlElements(controls: MarkdownCardSessionControls | undefined, locale?: Locale): any[] {
-  const actions: any[] = [];
-  if (controls?.stopValue) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.stop_conversation', undefined, locale) },
-      type: 'danger',
-      behaviors: [{ type: 'callback', value: controls.stopValue }],
-    });
-  }
-  return actions.length > 0 ? [{ tag: 'action', actions }] : [];
+  if (!controls?.stopValue) return [];
+  return [{
+    tag: 'column_set',
+    flex_mode: 'none',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.stop_conversation', undefined, locale) },
+        type: 'danger',
+        behaviors: [{ type: 'callback', value: controls.stopValue }],
+      }],
+    }],
+  }];
 }
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
