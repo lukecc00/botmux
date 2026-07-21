@@ -42,6 +42,7 @@ interface ActiveTurn {
   itemText: Map<string, string>;
   /** Stable botmux/Lark turn id copied from clientUserMessageId. */
   stableTurnId?: string;
+  dispatchAttempt?: number;
   terminalFailure?: { kind: 'stream_disconnected' | 'failed'; message: string };
   done: Promise<void>;
   resolveDone: () => void;
@@ -50,9 +51,12 @@ interface ActiveTurn {
 interface QueuedInput {
   content: string;
   codexAppInput?: CodexAppTurnInput;
+  turnId?: string;
+  dispatchAttempt?: number;
 }
 
 const output = new RunnerControlWriter();
+const recentMarkers: Array<{ kind: string; payload: any }> = [];
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
@@ -80,7 +84,22 @@ function parseArgs(argv: string[]): Args {
 }
 
 function emitMarker(kind: string, payload: unknown): void {
+  recentMarkers.push({ kind, payload });
+  if (recentMarkers.length > 512) recentMarkers.splice(0, recentMarkers.length - 512);
   output.marker(kind, payload);
+}
+
+function replayMarkers(turns: Array<{ turnId: string; dispatchAttempt?: number }>): void {
+  const allowed = (payload: any): boolean => turns.some(turn =>
+    payload?.turnId === turn.turnId
+    && payload?.dispatchAttempt === turn.dispatchAttempt,
+  );
+  for (const marker of recentMarkers) {
+    if (marker.kind === 'thread' || allowed(marker.payload)) {
+      output.marker(marker.kind, marker.payload);
+    }
+  }
+  output.marker('replay_ack', { count: turns.length });
 }
 
 function writeLine(text = ''): void {
@@ -299,7 +318,7 @@ function detectedCodexVersion(): CodexVersion | undefined {
   return codexVersion;
 }
 
-function makeTurn(stableTurnId?: string): ActiveTurn {
+function makeTurn(stableTurnId?: string, dispatchAttempt?: number): ActiveTurn {
   let resolveDone!: () => void;
   const done = new Promise<void>(resolve => { resolveDone = resolve; });
   return {
@@ -309,6 +328,7 @@ function makeTurn(stableTurnId?: string): ActiveTurn {
     allAgentText: '',
     itemText: new Map(),
     ...(stableTurnId ? { stableTurnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     done,
     resolveDone,
   };
@@ -392,6 +412,9 @@ function handleNotification(msg: JsonObject): void {
           emitMarker('progress', {
             ...(activeTurn.stableTurnId ? { turnId: activeTurn.stableTurnId } : {}),
             ...(activeTurn.nativeTurnId ? { nativeTurnId: activeTurn.nativeTurnId } : {}),
+            ...(activeTurn.dispatchAttempt !== undefined
+              ? { dispatchAttempt: activeTurn.dispatchAttempt }
+              : {}),
             itemId: String(item.id ?? ''),
             content,
           });
@@ -485,7 +508,10 @@ async function ensureThread(): Promise<string> {
 
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
-  const turn = makeTurn(message.codexAppInput?.clientUserMessageId);
+  const turn = makeTurn(
+    message.turnId ?? message.codexAppInput?.clientUserMessageId,
+    message.dispatchAttempt,
+  );
   activeTurn = turn;
   const version = message.codexAppInput ? detectedCodexVersion() : undefined;
   let built = buildCodexAppTurnStartParams({
@@ -533,10 +559,11 @@ async function runTurn(message: QueuedInput): Promise<void> {
   await turn.done;
 
   if (turn.terminalFailure) {
-    const stableTurnId = message.codexAppInput?.clientUserMessageId;
+    const stableTurnId = turn.stableTurnId;
     emitMarker('terminal', {
       ...(stableTurnId ? { turnId: stableTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       status: 'failed',
       errorCode: turn.terminalFailure.kind === 'stream_disconnected'
         ? 'codex_stream_disconnected'
@@ -557,10 +584,11 @@ async function runTurn(message: QueuedInput): Promise<void> {
     // that native id as `turnId` breaks daemon wait maps, VC suppression and
     // reply routing. When no structured sidecar exists, omit turnId so the
     // worker deliberately falls back to its current botmux turn attribution.
-    const stableTurnId = message.codexAppInput?.clientUserMessageId;
+    const stableTurnId = turn.stableTurnId;
     emitMarker('final', {
       ...(stableTurnId ? { turnId: stableTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       content: finalText,
       startedAtMs: turn.startedAtMs,
       completedAtMs,
@@ -581,12 +609,13 @@ async function drainQueue(): Promise<void> {
       } catch (err: any) {
         const message = `Codex App runner error: ${err?.message ?? err}`;
         const completedAtMs = Date.now();
-        const stableTurnId = next.codexAppInput?.clientUserMessageId;
+        const stableTurnId = next.turnId ?? next.codexAppInput?.clientUserMessageId;
         const nativeTurnId = activeTurn?.nativeTurnId;
         writeLine(message);
         emitMarker('terminal', {
           ...(stableTurnId ? { turnId: stableTurnId } : {}),
           ...(nativeTurnId ? { nativeTurnId } : {}),
+          ...(next.dispatchAttempt !== undefined ? { dispatchAttempt: next.dispatchAttempt } : {}),
           status: 'failed',
           errorCode: isCodexAppStreamDisconnectError(err)
             ? 'codex_stream_disconnected'
@@ -611,6 +640,14 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'replay' && Array.isArray(decoded.turns)) {
+        replayMarkers(decoded.turns.filter((turn: any) =>
+          turn && typeof turn.turnId === 'string'
+          && (turn.dispatchAttempt === undefined || Number.isInteger(turn.dispatchAttempt)),
+        ));
+        prompt();
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput
@@ -618,7 +655,14 @@ function enqueueLine(line: string): void {
         if (decoded.codexAppInput !== undefined && !codexAppInput) {
           writeLine('[codex-app] ignored invalid structured input sidecar');
         }
-        queue.push({ content: decoded.content, codexAppInput });
+        queue.push({
+          content: decoded.content,
+          codexAppInput,
+          ...(typeof decoded.turnId === 'string' ? { turnId: decoded.turnId } : {}),
+          ...(Number.isInteger(decoded.dispatchAttempt)
+            ? { dispatchAttempt: decoded.dispatchAttempt }
+            : {}),
+        });
         void drainQueue();
       }
     } catch (err: any) {

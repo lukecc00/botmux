@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { writeRunnerInput } from './runner-input.js';
+import { writeRunnerInput, writeRunnerReplayRequest } from './runner-input.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -62,18 +62,22 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return null;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context) {
       // Chunked + throttled stdin injection — a single send-keys of the whole
       // (potentially ~20KB) control line overruns the pane pty input buffer and
       // gets dropped. See runner-input.ts.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content);
+      return writeRunnerInput(pty, '::botmux-codex-app:', content, undefined, context);
     },
 
-    async writeStructuredInput(pty, content, codexAppInput) {
+    async writeStructuredInput(pty, content, codexAppInput, context) {
       // The legacy prompt remains in the control payload as a compatibility
       // fallback. The runner uses the sidecar only on supported app-server
       // versions and never reverse-parses the XML-ish legacy envelope.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
+      return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput, context);
+    },
+
+    replayPendingTurns(pty, turns) {
+      return writeRunnerReplayRequest(pty, '::botmux-codex-app:', turns);
     },
 
     completionPattern: undefined,

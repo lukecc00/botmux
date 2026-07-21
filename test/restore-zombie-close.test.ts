@@ -473,6 +473,53 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('parks a legacy wrong-topic target so recovery can rebind it to the source topic', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex';
+    const source = makeActivePersistentSession('om_original_topic');
+    const target = sessionStore.createSession(
+      source.chatId,
+      'om_legacy_new_topic',
+      'legacy fresh target',
+      source.chatType,
+    );
+    target.larkAppId = source.larkAppId;
+    target.scope = 'thread';
+    target.cliId = 'codex';
+    source.codexFreshHandoff = {
+      requestId: 'handoff-legacy-wrong-topic',
+      reason: 'context_window_exceeded',
+      requestedAt: new Date().toISOString(),
+      interruptedTurnId: 'turn-full',
+      interruptedUserGoal: 'continue in original topic',
+      summaryTurnId: 'summary-legacy',
+      phase: 'migrating',
+      newTopicAnchor: target.rootMessageId,
+      newSessionId: target.sessionId,
+    };
+    sessionStore.updateSession(source);
+    sessionStore.updateSession(target);
+
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const recoverCodexHandoff = vi.fn(async (restoredSource: DaemonSession) => {
+      expect(restoredSource.session.sessionId).toBe(source.sessionId);
+      expect(restoredSource.pendingCodexFreshHandoff?.newTopicAnchor)
+        .toBe('om_legacy_new_topic');
+      expect([...map.values()].some(ds => ds.session.sessionId === target.sessionId)).toBe(false);
+    });
+
+    await restoreActiveSessions(map, { recoverCodexHandoff });
+
+    expect(recoverCodexHandoff).toHaveBeenCalledOnce();
+    expect(map.get(sessionKey('om_original_topic', 'app_test'))?.session.sessionId)
+      .toBe(source.sessionId);
+    expect(map.has(sessionKey('om_legacy_new_topic', 'app_test'))).toBe(false);
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('restores only the latest clean Codex App sidecar after a disk reload and re-attaches it', async () => {
     probe.result = 'exists';
     bot.cliId = 'codex-app';

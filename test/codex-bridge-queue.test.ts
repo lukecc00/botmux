@@ -110,6 +110,23 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainProgressOutputs()).toEqual([]);
   });
 
+  it('recovers an in-flight turn after worker restart and replays progress/final', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-restart', 'long running task', 100);
+    q.ingest([
+      userEv('long running task', 'restart-user', 101),
+      progressEv('daemon 重启后继续进度', 'restart-progress', 120),
+      asstEv('daemon 重启后最终结果', 'restart-final', 140),
+    ]);
+
+    expect(q.drainProgressOutputs()).toEqual([expect.objectContaining({
+      uuid: 'restart-progress', turnId: 'turn-restart',
+    })]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'turn-restart', finalText: 'daemon 重启后最终结果',
+    })]);
+  });
+
   it('marked turn whose user fingerprint matches becomes started; assistant_final closes it; drainEmittable yields finalText', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'hello model please', 100);

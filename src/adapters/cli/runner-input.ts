@@ -41,10 +41,14 @@ export const RUNNER_INPUT_CHUNK_BYTES = 1024;
  *  pane pty between writes. */
 export const RUNNER_INPUT_THROTTLE_MS = 20;
 
-export function encodeRunnerInput(content: string, codexAppInput?: CodexAppTurnInput): string {
+export function encodeRunnerInput(
+  content: string,
+  codexAppInput?: CodexAppTurnInput,
+  context?: { turnId?: string; dispatchAttempt?: number },
+): string {
   const payload = codexAppInput
-    ? { type: 'message', content, codexAppInput }
-    : { type: 'message', content };
+    ? { type: 'message', content, codexAppInput, ...context }
+    : { type: 'message', content, ...context };
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
 }
 
@@ -84,8 +88,9 @@ export async function writeRunnerInput(
   markerPrefix: string,
   content: string,
   codexAppInput?: CodexAppTurnInput,
+  context?: { turnId?: string; dispatchAttempt?: number },
 ): Promise<{ submitted: boolean }> {
-  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput)}`;
+  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput, context)}`;
 
   // Non-tmux fallback (raw PTY): a single write is fine — there's no send-keys
   // process to time out, and the PTY write isn't bounded the same way.
@@ -137,4 +142,23 @@ export async function writeRunnerInput(
   // unsubmitted line in the buffer).
   if (!sendEnterWithRetry()) return { submitted: false };
   return { submitted: true };
+}
+
+export async function writeRunnerReplayRequest(
+  pty: PtyHandle,
+  markerPrefix: string,
+  turns: Array<{ turnId: string; dispatchAttempt?: number }>,
+): Promise<{ submitted: boolean }> {
+  const encoded = Buffer.from(JSON.stringify({ type: 'replay', turns }), 'utf8').toString('base64');
+  const line = `${markerPrefix}${encoded}`;
+  if (!pty.sendText || !pty.sendSpecialKeys) {
+    try { pty.write(line + '\r'); return { submitted: true }; }
+    catch { return { submitted: false }; }
+  }
+  if (pty.sendSpecialKeys('Enter') === false) return { submitted: false };
+  for (const chunk of chunkAscii(line, RUNNER_INPUT_CHUNK_BYTES)) {
+    if (pty.sendText(chunk) === false) return { submitted: false };
+    await delay(RUNNER_INPUT_THROTTLE_MS);
+  }
+  return { submitted: pty.sendSpecialKeys('Enter') !== false };
 }

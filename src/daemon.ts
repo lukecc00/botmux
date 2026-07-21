@@ -3305,6 +3305,16 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   persistStreamCardState(ds);
 }
 
+function codexHandoffSourceNoticeUuid(requestId: string, anchor: string): string {
+  const digest = createHash('sha256')
+    .update(requestId)
+    .update('\0')
+    .update(anchor)
+    .digest('hex')
+    .slice(0, 40);
+  return `bmxh_${digest}`;
+}
+
 /** Consume a Codex-generated Handoff Summary in the current Lark topic while
  * replacing only the underlying Codex session. This deliberately does not
  * copy cliSessionId and calls forkWorker with resume=false. */
@@ -3330,6 +3340,21 @@ async function migrateCodexHandoffToFreshSession(
       [source.session.cliSessionId, source.session.sessionId],
     );
     const selectedSummary = handoff.selectedSummary;
+    // The Lark topic is part of the source conversation's identity, not
+    // resumable handoff state. Older botmux builds persisted the id of a newly
+    // created top-level message here; trusting that value after an upgrade
+    // would keep all recovered commentary/final cards in the wrong topic.
+    // Always canonicalise unfinished migrations back to the source anchor.
+    const persistedAnchor = handoff.newTopicAnchor;
+    const anchor = sessionAnchorId(source);
+    const sourceTopicNoticeSentAt = handoff.sourceTopicNoticeSentAt;
+    if (persistedAnchor && persistedAnchor !== anchor) {
+      logger.warn(
+        `[${tag(source)}] Rebinding legacy Codex handoff from topic `
+        + `${persistedAnchor.substring(0, 12)} to source topic ${anchor.substring(0, 12)}`,
+      );
+    }
+    handoff.newTopicAnchor = anchor;
     source.session.codexFreshHandoff = {
       requestId: handoff.requestId,
       reason: handoff.reason,
@@ -3341,6 +3366,7 @@ async function migrateCodexHandoffToFreshSession(
       selectedSummary,
       newTopicAnchor: handoff.newTopicAnchor,
       newSessionId: handoff.newSessionId,
+      sourceTopicNoticeSentAt,
     };
     sessionStore.updateSession(source.session);
     const locale = localeForBot(source.larkAppId);
@@ -3348,25 +3374,39 @@ async function migrateCodexHandoffToFreshSession(
     // Codex native thread, not a new Lark topic: creating a top-level message
     // here used to move every later commentary/final card out of the topic the
     // user was reading. `newTopicAnchor` retains its historical persisted name
-    // for schema compatibility; new migrations store the source topic anchor.
-    const anchor = handoff.newTopicAnchor ?? sessionAnchorId(source);
-    if (!handoff.newTopicAnchor) {
+    // for schema compatibility.
+    if (!sourceTopicNoticeSentAt) {
       await sessionReply(
         anchor,
         buildFreshCodexHandoffTopic(selectedSummary, locale, handoff.reason),
         'text',
         source.larkAppId,
         undefined,
-        { uuid: handoff.requestId },
+        { uuid: codexHandoffSourceNoticeUuid(handoff.requestId, anchor) },
       );
+      handoff.sourceTopicNoticeSentAt = new Date().toISOString();
       handoff.newTopicAnchor = anchor;
       source.session.codexFreshHandoff.newTopicAnchor = anchor;
+      source.session.codexFreshHandoff.sourceTopicNoticeSentAt = handoff.sourceTopicNoticeSentAt;
       sessionStore.updateSession(source.session);
     }
     const bot = getBot(source.larkAppId);
     const promptText = buildFreshCodexHandoffPrompt(selectedSummary);
     const freshCliId = freshCodexHandoffCliId(source.session.cliId, handoff.reason);
     let session = handoff.newSessionId ? sessionStore.getSession(handoff.newSessionId) : undefined;
+    // A daemon may restart between an old build creating the target row under
+    // a new top-level message and closing the source. That exact referenced
+    // row is safe to repair in place before it starts: preserve its botmux id,
+    // but bind its delivery route to the source topic.
+    if (session
+      && persistedAnchor
+      && persistedAnchor !== anchor
+      && session.rootMessageId === persistedAnchor) {
+      session.rootMessageId = anchor;
+      session.chatId = source.chatId;
+      session.scope = 'thread';
+      sessionStore.updateSession(session);
+    }
     if (!session) {
       session = sessionStore.listSessions().find(candidate =>
         candidate.status === 'active'
@@ -3505,6 +3545,7 @@ async function migrateCodexHandoffToFreshSession(
       selectedSummary: handoff.selectedSummary,
       newTopicAnchor: handoff.newTopicAnchor,
       newSessionId: handoff.newSessionId,
+      sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
     };
     source.pendingCodexFreshHandoff = undefined;
     sessionStore.updateSession(source.session);
@@ -3529,6 +3570,7 @@ async function migrateCodexHandoffToFreshSession(
         selectedSummary: handoff.selectedSummary,
         newTopicAnchor: handoff.newTopicAnchor,
         newSessionId: handoff.newSessionId,
+        sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
       };
       source.pendingCodexFreshHandoff = undefined;
       try { sessionStore.updateSession(source.session); } catch { /* best effort */ }
@@ -3558,6 +3600,7 @@ async function migrateCodexHandoffToFreshSession(
         selectedSummary: handoff.selectedSummary,
         newTopicAnchor: handoff.newTopicAnchor,
         newSessionId: handoff.newSessionId,
+        sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
       };
       sessionStore.updateSession(source.session);
     } catch (persistErr) {
@@ -3605,6 +3648,7 @@ function persistCodexHandoff(source: DaemonSession): void {
       selectedSummary: handoff.selectedSummary,
       newTopicAnchor: handoff.newTopicAnchor,
       newSessionId: handoff.newSessionId,
+      sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
     };
     sessionStore.updateSession(source.session);
   } catch (err) {

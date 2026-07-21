@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   writeRunnerInput,
+  writeRunnerReplayRequest,
   chunkAscii,
   encodeRunnerInput,
   RUNNER_INPUT_CHUNK_BYTES,
@@ -191,6 +192,29 @@ describe('writeRunnerInput — tmux mode', () => {
     // The pre-flush Enter never lands, so we must not write the control line
     // onto a possibly-dirty buffer.
     expect(textChunks).toHaveLength(0);
+  });
+});
+
+describe('writeRunnerReplayRequest', () => {
+  it('encodes exact pending turn identities and submits one control line', async () => {
+    const { pty, textChunks, enterCount } = fakeTmuxPty();
+    const result = await writeRunnerReplayRequest(
+      pty,
+      '::botmux-codex-app:',
+      [{ turnId: 'turn-a' }, { turnId: 'turn-b', dispatchAttempt: 3 }],
+    );
+    expect(result).toEqual({ submitted: true });
+    const line = textChunks.join('');
+    expect(line.startsWith('::botmux-codex-app:')).toBe(true);
+    const decoded = JSON.parse(Buffer.from(
+      line.slice('::botmux-codex-app:'.length),
+      'base64',
+    ).toString('utf8'));
+    expect(decoded).toEqual({
+      type: 'replay',
+      turns: [{ turnId: 'turn-a' }, { turnId: 'turn-b', dispatchAttempt: 3 }],
+    });
+    expect(enterCount()).toBe(2);
   });
 });
 

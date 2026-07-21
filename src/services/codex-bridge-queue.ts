@@ -140,6 +140,29 @@ export class CodexBridgeQueue {
     this.replayBufferedUnmatched(markTimeMs);
   }
 
+  /** Restore a turn that was already written to a persistent CLI before the
+   * daemon/worker restarted. Its transcript user record may be older than the
+   * new worker, so mark it started up-front and replay only events at/after the
+   * original write timestamp. */
+  restoreStarted(
+    turnId: string,
+    message: string,
+    startedAt: number,
+    dispatchAttempt?: number,
+    userGoal?: string,
+  ): void {
+    const turn: CodexPendingTurn = {
+      turnId,
+      userGoal,
+      dispatchAttempt,
+      started: true,
+      contentFingerprint: makeFingerprint(message),
+      markTimeMs: startedAt,
+    };
+    this.queue.push(turn);
+    this.collecting = turn;
+  }
+
   /** Drop all pending turns. Used when the worker decides it can't reliably
    *  attribute future events (e.g. a teardown). */
   clearPending(): CodexPendingTurn[] {

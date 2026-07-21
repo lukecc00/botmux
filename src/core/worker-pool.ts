@@ -100,6 +100,14 @@ import {
   type ProgressDeliveryRecord,
 } from '../services/progress-delivery-store.js';
 import { notifySessionStopped } from './session-stop-notice.js';
+import {
+  bridgeDeliveryAcknowledged,
+  bridgeFinalProviderUuid,
+  completePendingBridgeTurn,
+  markPendingBridgeTurnWritten,
+  rememberBridgeDelivery,
+  stagePendingBridgeTurn,
+} from '../services/bridge-recovery-state.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1161,6 +1169,7 @@ function flushCardPatch(ds: DaemonSession): void {
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
+const bridgeWorkerRecoveryCounts = new Map<string, { count: number; lastAt: number }>();
 
 // ─── Skills installation ────────────────────────────────────────────────────
 
@@ -1502,6 +1511,7 @@ export async function closeSession(
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  bridgeWorkerRecoveryCounts.delete(sessionId);
   if (ds) {
     // Fence the live delivery pipeline before killing the worker or deleting
     // the outbox.
@@ -1910,6 +1920,16 @@ export function sendWorkerInput(
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
+  if (turnId && ['codex', 'codex-app'].includes(ds.session.cliId ?? getBot(ds.larkAppId).config.cliId)) {
+    if (stagePendingBridgeTurn(ds.session, {
+      turnId,
+      content: normalized.content,
+      userGoal: normalized.userGoal,
+      dispatchAttempt: opts.dispatchAttempt,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      startedAt: Date.now(),
+    })) sessionStore.updateSession(ds.session);
+  }
   ds.worker.send({
     type: 'message',
     content: normalized.content,
@@ -1977,6 +1997,10 @@ export function forkWorker(
   // before they learned to pass its id explicitly.
   const initAttributionTurnId = initTurnId
     ?? (prompt.length > 0 ? ds.currentReplyTarget?.turnId : undefined);
+  const bridgeInitTurnId = prompt.length > 0
+    && ['codex', 'codex-app'].includes(ds.session.cliId ?? botCfg.cliId)
+    ? (initAttributionTurnId ?? `bridge-${randomBytes(8).toString('hex')}`)
+    : initAttributionTurnId;
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -2215,15 +2239,32 @@ export function forkWorker(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: initAttributionTurnId,
+    turnId: bridgeInitTurnId,
     dispatchAttempt: initDispatchAttempt,
+    // A dead Node worker may be lazily re-forked by the NEXT user message.
+    // Carry older in-flight Codex turns even when this init also contains a
+    // new prompt: spawnCli recovers/ingests them before init queues the prompt.
+    recoverBridgeTurns: (agentCfg.cliId === 'codex' || agentCfg.cliId === 'codex-app')
+      ? ds.session.pendingBridgeTurns
+      : undefined,
     vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
       ds.session,
-      initAttributionTurnId,
+      bridgeInitTurnId,
     ),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
   };
+  if (prompt.length > 0 && bridgeInitTurnId
+    && (agentCfg.cliId === 'codex' || agentCfg.cliId === 'codex-app')) {
+    if (stagePendingBridgeTurn(ds.session, {
+      turnId: bridgeInitTurnId,
+      content: prompt,
+      userGoal: promptPayload.userGoal,
+      dispatchAttempt: initDispatchAttempt,
+      ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      startedAt: Date.now(),
+    })) sessionStore.updateSession(ds.session);
+  }
   worker.send(initMsg);
   ds.initConfig = initMsg;
 
@@ -2422,6 +2463,9 @@ function setupWorkerHandlers(
             uuid: progressProviderUuid(record.sessionId, record.transcriptUuid),
           });
           ds.progressOutputUuids!.add(record.transcriptUuid);
+          if (rememberBridgeDelivery(ds.session, 'progress', record.transcriptUuid)) {
+            sessionStore.updateSession(ds.session);
+          }
           while (ds.progressOutputUuids!.size > 512) {
             const oldest = ds.progressOutputUuids!.values().next().value;
             if (oldest === undefined) break;
@@ -2990,6 +3034,10 @@ function setupWorkerHandlers(
         if (!msg.content.trim()) break;
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (ds.docCommentTurns?.has(msg.turnId)) break;
+        if (bridgeDeliveryAcknowledged(ds.session, 'progress', msg.uuid)) {
+          logger.debug(`[${t}] recovered progress_output already acknowledged (${msg.uuid})`);
+          break;
+        }
         const record = stageProgressDelivery(config.session.dataDir, {
           sessionId: msg.sessionId,
           turnId: msg.turnId,
@@ -3000,6 +3048,19 @@ function setupWorkerHandlers(
         enqueueProgressDelivery(record);
         break;
       }
+
+      case 'bridge_turn_written': {
+        if (ds.workerGeneration !== workerGeneration) break;
+        if (msg.sessionId !== ds.session.sessionId) break;
+        if (markPendingBridgeTurnWritten(
+          ds.session,
+          msg.turnId,
+          msg.dispatchAttempt,
+          msg.writtenAt,
+        )) sessionStore.updateSession(ds.session);
+        break;
+      }
+
 
       case 'screenshot_uploaded': {
         // Drop uploads that arrived during a new-turn handoff — the image_key may
@@ -3404,6 +3465,12 @@ function setupWorkerHandlers(
             logger.warn(`[${t}] Failed to reset Codex stream recovery budget: ${err.message}`);
           }
         }
+        if (!msg.bridgeFinalEmitted
+          && completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+          try { sessionStore.updateSession(ds.session); } catch (err: any) {
+            logger.warn(`[${t}] Failed to clear completed bridge recovery turn: ${err.message}`);
+          }
+        }
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
         } catch (err: any) {
@@ -3504,6 +3571,13 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
         const dedupeKey = finalOutputDedupeKey(ds, msg);
+        if (bridgeDeliveryAcknowledged(ds.session, 'final', msg.lastUuid || msg.turnId)) {
+          if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+            sessionStore.updateSession(ds.session);
+          }
+          logger.debug(`[${t}] recovered final_output already acknowledged (${dedupeKey.substring(0, 48)})`);
+          break;
+        }
         if (ds.lastBridgeEmittedUuid === dedupeKey) {
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
@@ -3562,11 +3636,24 @@ function setupWorkerHandlers(
 
   worker.on('exit', (code, signal) => {
     logger.info(`[${t}] Worker process exited (code: ${code})`);
+    const currentWorkerExit = ds.worker === worker;
+    const recoverPendingCodex = currentWorkerExit
+      && !worker.killed
+      && ds.session.status !== 'closed'
+      && !ds.pendingCodexFreshHandoff
+      && !ds.session.codexFreshHandoff
+      && ((ds.session.cliId ?? botCfg.cliId) === 'codex'
+        || (ds.session.cliId ?? botCfg.cliId) === 'codex-app')
+      && (ds.session.pendingBridgeTurns?.length ?? 0) > 0;
     // Last-resort startup guard: syntax/import crashes and abrupt exits can
     // happen before the worker sends either ready or a structured error.  Do
     // not leave the originating Lark message unanswered. Intentional close /
     // replacement kills are excluded to avoid noisy false alarms.
-    if (!startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
+    if (!recoverPendingCodex
+      && !startupState.ready
+      && !startupState.failureNotified
+      && !worker.killed
+      && ds.session.status !== 'closed') {
       const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
@@ -3579,7 +3666,8 @@ function setupWorkerHandlers(
     // death; intentional close/replacement and managed silent receivers remain
     // excluded. CLI crashes handled inside the live worker keep their richer
     // retry/crash-loop flow and do not reach this branch.
-    if (startupState.ready
+    if (!recoverPendingCodex
+      && startupState.ready
       && ds.worker === worker
       && !worker.killed
       && ds.session.status !== 'closed'
@@ -3606,7 +3694,7 @@ function setupWorkerHandlers(
     // may schedule a retry; it must not observe/send to this dead IPC channel.
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
-    if (ds.worker === worker) {
+    if (currentWorkerExit) {
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
@@ -3624,10 +3712,33 @@ function setupWorkerHandlers(
     } catch (err: any) {
       logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
     }
+    if (recoverPendingCodex) {
+      const key = ds.session.sessionId;
+      const now = Date.now();
+      const rc = bridgeWorkerRecoveryCounts.get(key) ?? { count: 0, lastAt: 0 };
+      if (now - rc.lastAt > 60_000) rc.count = 0;
+      rc.count += 1;
+      rc.lastAt = now;
+      bridgeWorkerRecoveryCounts.set(key, rc);
+      if (rc.count <= 3) {
+        logger.warn(
+          `[${t}] Worker exited with ${ds.session.pendingBridgeTurns!.length} pending Codex turn(s); `
+          + `auto-reforking bridge worker (attempt ${rc.count}/3)`,
+        );
+        setTimeout(() => {
+          if (ds.worker || ds.session.status === 'closed') return;
+          forkWorker(ds, '', { resume: true });
+        }, 250).unref?.();
+      } else {
+        logger.error(`[${t}] Pending Codex worker recovery stopped after ${rc.count} exits in 1 minute`);
+        void notifySessionStopped(ds, cb.sessionReply, 'unexpected');
+        ds.exitEventEmitted = false;
+      }
+    }
     // Notify dashboard, but only once per session lifecycle. The
     // dashboard-driven `closeSession()` path also publishes; whichever
     // fires first wins, the other's emit is suppressed.
-    if (!ds.exitEventEmitted) {
+    if (!recoverPendingCodex && !ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
       dashboardEventBus.publish({
         type: 'session.exited',
@@ -3760,6 +3871,9 @@ function deliverFinalOutput(
   if (waitPromise) {
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+      sessionStore.updateSession(ds.session);
+    }
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -3770,6 +3884,9 @@ function deliverFinalOutput(
     asyncResult.content = msg.content;
     asyncResult.completedAt = Date.now();
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+      sessionStore.updateSession(ds.session);
+    }
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -3831,6 +3948,9 @@ function deliverFinalOutput(
           try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+          sessionStore.updateSession(ds.session);
+        }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
         return;
       }
@@ -3986,6 +4106,9 @@ function deliverFinalOutput(
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+          sessionStore.updateSession(ds.session);
+        }
         logger.info(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
@@ -4011,13 +4134,17 @@ function deliverFinalOutput(
               // including the first attempt and crash reconciliation replay.
               suppressHook: true,
             }
-          : undefined,
+          : { uuid: bridgeFinalProviderUuid(ds.session.sessionId, msg.lastUuid || msg.turnId) },
       );
       recordPrimaryOutput(messageId);
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      if (rememberBridgeDelivery(ds.session, 'final', msg.lastUuid || msg.turnId)) {
+        completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt);
+        sessionStore.updateSession(ds.session);
+      }
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {

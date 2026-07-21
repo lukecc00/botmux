@@ -221,6 +221,7 @@ let sandboxTeardownDone = false;                     // guards the exit-time bes
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
+let appRunnerReplayAccepted = 0;
 /** Guard: user_notify for "resume → fresh fallback" is sent once per worker
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
@@ -2692,7 +2693,7 @@ function mtrBridgeIngest(): void {
   }
 }
 
-function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
+function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live' | 'recover-active'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -2703,6 +2704,21 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge fresh-empty: ${rolloutPath}`);
+  } else if (mode === 'recover-active' && existsSync(rolloutPath)) {
+    const recovered = (lastInitConfig?.recoverBridgeTurns ?? [])
+      .filter(turn => turn.writtenAt !== undefined);
+    const result = structuredBridgeIngestPath(rolloutPath, 0);
+    // The transcript can stamp its user record a few milliseconds before the
+    // daemon-side write-ahead persistence completes. Match the queue's normal
+    // fingerprint tolerance so that record is never absorbed as old history.
+    const liveSince = Math.min(...recovered.map(turn => turn.writtenAt!)) - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(result.events, liveSince);
+    codexBridgeQueue.absorb(history);
+    ingestStructuredBridgeEvents(live);
+    codexBridgeOffset = result.newOffset;
+    codexBridgePendingTail = result.pendingTail;
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge recovered active turn(s): ${rolloutPath} (turns=${recovered.length}, history=${history.length}, live=${live.length}, offset=${codexBridgeOffset})`);
   } else if (mode === 'split-live' && existsSync(rolloutPath)) {
     // Adopt mode: drain everything, then split by adoptStartMs. History
     // (pre-adopt) is `absorb()`-ed so it can't replay; live (post-adopt)
@@ -3082,6 +3098,7 @@ function emitReadyCodexTurns(): void {
   }
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  const finalEmittedTurnIds = new Set<string>();
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -3189,6 +3206,7 @@ function emitReadyCodexTurns(): void {
         kind: 'local-turn',
         userText: fields.userText,
       });
+      finalEmittedTurnIds.add(turn.turnId);
       continue;
     }
     send({
@@ -3199,6 +3217,7 @@ function emitReadyCodexTurns(): void {
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
+    finalEmittedTurnIds.add(turn.turnId);
   }
   for (const turn of ready) {
     if (turn.dispatchAttempt === undefined
@@ -3210,6 +3229,7 @@ function emitReadyCodexTurns(): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
+      finalEmittedTurnIds.has(turn.turnId),
     );
   }
 }
@@ -4147,22 +4167,40 @@ function decodeCodexAppPayload(payload: string): any | undefined {
   }
 }
 
-function handleCodexAppMarker(body: string): void {
+function handleCodexAppMarker(body: string, replay = false): void {
   const sep = body.indexOf(':');
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
   if (!payload || typeof payload !== 'object') return;
+  const pendingTurn = replay && typeof payload.turnId === 'string'
+    ? lastInitConfig?.recoverBridgeTurns?.find(turn =>
+        turn.turnId === payload.turnId
+        && turn.dispatchAttempt === payload.dispatchAttempt,
+      )
+    : undefined;
+  if (replay && kind !== 'thread' && !pendingTurn) return;
+  const authorityTurnId = replay ? pendingTurn?.turnId : currentBotmuxTurnId;
+  const authorityDispatchAttempt = replay
+    ? pendingTurn?.dispatchAttempt
+    : currentBotmuxDispatchAttempt;
 
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
     return;
   }
 
+  if (kind === 'replay_ack') {
+    appRunnerReplayAccepted++;
+    log(`Codex App runner replay acknowledged (count=${String(payload.count ?? '?')})`);
+    return;
+  }
+
+
   if (kind === 'progress' && typeof payload.content === 'string' && payload.content.trim()) {
     const identity = resolveCodexAppProgressTurnIdentity(
       payload,
-      currentBotmuxTurnId,
+      authorityTurnId,
       `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
     );
     if (!identity.ok) {
@@ -4174,10 +4212,10 @@ function handleCodexAppMarker(body: string): void {
       return;
     }
     if (payload.dispatchAttempt !== undefined
-      && payload.dispatchAttempt !== currentBotmuxDispatchAttempt) {
+      && payload.dispatchAttempt !== authorityDispatchAttempt) {
       log(
         `${cliName()} rejected progress marker with mismatched dispatch attempt `
-        + `(marker=${String(payload.dispatchAttempt)}, current=${currentBotmuxDispatchAttempt ?? '-'})`,
+        + `(marker=${String(payload.dispatchAttempt)}, current=${authorityDispatchAttempt ?? '-'})`,
       );
       return;
     }
@@ -4191,8 +4229,8 @@ function handleCodexAppMarker(body: string): void {
       content: payload.content,
       uuid: `app:${nativeTurnId}:${itemId}`,
       turnId: identity.turnId,
-      ...(currentBotmuxDispatchAttempt !== undefined
-        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      ...(authorityDispatchAttempt !== undefined
+        ? { dispatchAttempt: authorityDispatchAttempt }
         : {}),
     });
     return;
@@ -4201,7 +4239,7 @@ function handleCodexAppMarker(body: string): void {
   if (kind === 'terminal' && payload.status === 'failed') {
     const identity = resolveCodexAppFinalTurnIdentity(
       payload,
-      currentBotmuxTurnId,
+      authorityTurnId,
       `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
     );
     if (!identity.ok) {
@@ -4213,9 +4251,9 @@ function handleCodexAppMarker(body: string): void {
       return;
     }
     if (payload.dispatchAttempt !== undefined
-      && payload.dispatchAttempt !== currentBotmuxDispatchAttempt) return;
+      && payload.dispatchAttempt !== authorityDispatchAttempt) return;
     if (payload.errorCode === 'codex_stream_disconnected'
-      && currentBotmuxDispatchAttempt === undefined
+      && authorityDispatchAttempt === undefined
       && lastInitConfig?.adoptMode !== true) {
       beginCodexStreamDisconnectHandoff(
         identity.turnId,
@@ -4226,8 +4264,8 @@ function handleCodexAppMarker(body: string): void {
     send({
       type: 'user_notify',
       turnId: identity.turnId,
-      ...(currentBotmuxDispatchAttempt !== undefined
-        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      ...(authorityDispatchAttempt !== undefined
+        ? { dispatchAttempt: authorityDispatchAttempt }
         : {}),
       message: `❌ ${String(payload.message ?? 'Codex App turn failed')}`,
     });
@@ -4235,7 +4273,7 @@ function handleCodexAppMarker(body: string): void {
       identity.turnId,
       'failed',
       String(payload.errorCode ?? 'codex_app_turn_failed'),
-      currentBotmuxDispatchAttempt,
+      authorityDispatchAttempt,
     );
     return;
   }
@@ -4248,7 +4286,7 @@ function handleCodexAppMarker(body: string): void {
     // intentionally omit it and fall back to the worker's frozen botmux turn.
     const identity = resolveCodexAppFinalTurnIdentity(
       payload,
-      currentBotmuxTurnId,
+      authorityTurnId,
       `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
     );
     if (!identity.ok) {
@@ -4264,16 +4302,16 @@ function handleCodexAppMarker(body: string): void {
       log(`${cliName()} native turn ${nativeTurnId.substring(0, 12)} mapped to botmux turn ${turnId.substring(0, 12)}`);
     }
     if (payload.dispatchAttempt !== undefined
-      && payload.dispatchAttempt !== currentBotmuxDispatchAttempt) {
+      && payload.dispatchAttempt !== authorityDispatchAttempt) {
       log(
         `${cliName()} rejected final marker with mismatched dispatch attempt `
-        + `(marker=${String(payload.dispatchAttempt)}, current=${currentBotmuxDispatchAttempt ?? '-'})`,
+        + `(marker=${String(payload.dispatchAttempt)}, current=${authorityDispatchAttempt ?? '-'})`,
       );
       return;
     }
     // Attempt authority is worker-owned. A runner marker may redundantly assert
     // equality for compatibility, but can never select another attempt.
-    const dispatchAttempt = currentBotmuxDispatchAttempt;
+    const dispatchAttempt = authorityDispatchAttempt;
     if (startedAtMs !== undefined) {
       const sentByModel = shouldSuppressBridgeEmit(
         { markTimeMs: startedAtMs, isLocal: false, finalText: payload.content },
@@ -4294,7 +4332,7 @@ function handleCodexAppMarker(body: string): void {
       turnId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
-    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt);
+    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt, true);
   }
 }
 
@@ -4614,6 +4652,18 @@ function scheduleSubmitFailureNotify(
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+        }
+        if ((lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'codex-app')
+          && turnIdentity?.turnId) {
+          send({
+            type: 'bridge_turn_written',
+            sessionId,
+            turnId: turnIdentity.turnId,
+            ...(turnIdentity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: turnIdentity.dispatchAttempt }
+              : {}),
+            writtenAt: Date.now(),
+          });
         }
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         return;
@@ -4956,8 +5006,8 @@ async function flushPending(): Promise<void> {
       let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
       try {
         result = item.codexAppInput && cliAdapter.writeStructuredInput
-          ? await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput)
-          : await cliAdapter.writeInput(backend, msg);
+          ? await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput, item)
+          : await cliAdapter.writeInput(backend, msg, item);
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
         log(`writeInput threw: ${err?.message ?? err}`);
@@ -4992,6 +5042,18 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
+      const submitted = result === undefined || result.submitted === true;
+      if (submitted
+        && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'codex-app')
+        && item.turnId) {
+        send({
+          type: 'bridge_turn_written',
+          sessionId,
+          turnId: item.turnId,
+          ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+          writtenAt: Date.now(),
+        });
       }
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
@@ -5909,6 +5971,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
 
+
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
@@ -6757,10 +6820,32 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
+    const recovered = cfg.recoverBridgeTurns ?? [];
+    const writtenRecovered = recovered.filter(turn => turn.writtenAt !== undefined);
+    const unwrittenRecovered = recovered.filter(turn => turn.writtenAt === undefined);
+    if (unwrittenRecovered.length > 0) {
+      pendingMessages.unshift(...unwrittenRecovered.map(turn => ({
+        content: turn.content,
+        userGoal: turn.userGoal,
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+      })));
+      log(`Codex bridge requeued ${unwrittenRecovered.length} unwritten recovered turn(s)`);
+    }
+    for (const turn of recovered) {
+      if (turn.writtenAt === undefined) continue;
+      codexBridgeQueue.mark(
+        turn.turnId,
+        turn.content,
+        turn.writtenAt,
+        turn.dispatchAttempt,
+        turn.userGoal,
+      );
+    }
     if (effectiveCliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
-        codexBridgeAttach(rolloutPath, 'baseline-existing');
+        codexBridgeAttach(rolloutPath, writtenRecovered.length > 0 ? 'recover-active' : 'baseline-existing');
       } else {
         codexBridgePendingSessionId = effectiveCliSessionId;
         codexBridgeStartTimer();
@@ -6903,8 +6988,45 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
   }
 
-  backend.onData(onPtyData);
   const observedBackend = backend;
+  backend.onData(onPtyData);
+  if (cfg.cliId === 'codex-app' && (cfg.recoverBridgeTurns?.length ?? 0) > 0) {
+    const recovered = cfg.recoverBridgeTurns!;
+    if (willReattachPersistent && cliAdapter.replayPendingTurns) {
+      const acceptedBefore = appRunnerReplayAccepted;
+      void cliAdapter.replayPendingTurns(backend, recovered.map(turn => ({
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      }))).then(result => {
+        log(`Codex App runner replay requested for ${recovered.length} pending turn(s), submitted=${result.submitted}`);
+        setTimeout(() => {
+          if (backend !== observedBackend || appRunnerReplayAccepted > acceptedBefore) return;
+          log('Codex App replay produced no supported marker — cold-restarting runner and requeueing pending turns');
+          pendingMessages.unshift(...recovered.map(turn => ({
+            content: turn.content,
+            userGoal: turn.userGoal,
+            turnId: turn.turnId,
+            dispatchAttempt: turn.dispatchAttempt,
+            codexAppInput: turn.codexAppInput,
+          })));
+          void restartCliProcess('app runner replay unsupported', {
+            immediate: true,
+            preservePending: true,
+            forceFresh: true,
+          });
+        }, 2_000).unref?.();
+      }).catch(err => log(`Codex App runner replay request failed: ${err?.message ?? err}`));
+    } else {
+      pendingMessages.unshift(...recovered.map(turn => ({
+        content: turn.content,
+        userGoal: turn.userGoal,
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+        codexAppInput: turn.codexAppInput,
+      })));
+      log(`Codex App requeued ${recovered.length} pending turn(s) after cold runner start`);
+    }
+  }
   backend.onAccessUrl?.((url) => {
     send({ type: 'riff_access_url', accessUrl: url });
   });
@@ -8298,6 +8420,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
+  bridgeFinalEmitted = false,
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -8317,6 +8440,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(bridgeFinalEmitted ? { bridgeFinalEmitted: true } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
