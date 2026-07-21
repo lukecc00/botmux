@@ -256,6 +256,23 @@ export interface Session {
   usageLimit?: CliUsageLimitState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Structured-bridge turns written to a persistent CLI but not yet fully
+   * acknowledged by Lark. Survives daemon/worker restarts so transcript output
+   * produced while the bridge is down can be replayed and attributed. */
+  pendingBridgeTurns?: Array<{
+    turnId: string;
+    content: string;
+    userGoal?: string;
+    dispatchAttempt?: number;
+    codexAppInput?: CodexAppTurnInput;
+    startedAt: number;
+    /** Set only after Codex history.jsonl confirms the input reached the CLI. */
+    writtenAt?: number;
+  }>;
+  /** Bounded provider-ack ledger for transcript UUIDs/turn keys. A recovered
+   * bridge may intentionally reread the active turn; this prevents old
+   * commentary/finals from being posted twice after the provider confirms. */
+  deliveredBridgeUuids?: string[];
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
@@ -541,7 +558,29 @@ export type CodexFreshHandoffReason =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; prompt: string; promptUserGoal?: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | {
+      type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p';
+      rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string;
+      wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean;
+      startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean;
+      sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean;
+      readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string;
+      backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string;
+      riffRepoDirs?: string[]; prompt: string; promptUserGoal?: string;
+      promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string;
+      originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string;
+      larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string;
+      locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number;
+      recoverBridgeTurns?: NonNullable<Session['pendingBridgeTurns']>;
+      vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+      pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string;
+      skillReadonlyRoots?: string[]; adoptMode?: boolean;
+      adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string;
+      adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string;
+      adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number;
+      adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number;
+      adoptCwd?: string; adoptRestoredFromMetadata?: boolean;
+    }
   | { type: 'message'; content: string; userGoal?: string; codexAppInput?: CodexAppTurnInput; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -603,6 +642,7 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'bridge_turn_written'; sessionId: string; turnId: string; dispatchAttempt?: number; writtenAt: number }
   /** Codex ended an ordinary turn because its model context window is full.
    * The daemon owns the same-Lark-topic handoff: /compact the old native
    * thread, collect a bounded summary, then start a fresh native thread. */
@@ -678,6 +718,9 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** True when a final_output IPC was queued immediately before this
+       * terminal. The daemon retains restart recovery state until Lark ACKs. */
+      bridgeFinalEmitted?: boolean;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string }

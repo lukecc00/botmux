@@ -155,6 +155,7 @@ export interface CliAdapter {
   writeInput(
     pty: PtyHandle,
     content: string,
+    context?: { turnId?: string; dispatchAttempt?: number },
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
@@ -173,12 +174,20 @@ export interface CliAdapter {
     pty: PtyHandle,
     content: string,
     codexAppInput: CodexAppTurnInput,
+    context?: { turnId?: string; dispatchAttempt?: number },
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
+
+  /** Persistent runner reattach hook: ask the still-live runner to replay
+   * structured markers for exact pending turns before new prompts continue. */
+  replayPendingTurns?(
+    pty: PtyHandle,
+    turns: Array<{ turnId: string; dispatchAttempt?: number }>,
+  ): Promise<{ submitted: boolean }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files

@@ -13,8 +13,10 @@ describe('worker app-runner control-channel wiring', () => {
 
   it('rejects marker identity mismatches and keeps dispatch authority worker-owned', () => {
     expect(workerSource).toContain('if (!identity.ok)');
-    expect(workerSource).toContain('payload.dispatchAttempt !== currentBotmuxDispatchAttempt');
-    expect(workerSource).toContain('const dispatchAttempt = currentBotmuxDispatchAttempt;');
+    expect(workerSource).toContain('const authorityDispatchAttempt = replay');
+    expect(workerSource).toContain(': currentBotmuxDispatchAttempt;');
+    expect(workerSource).toContain('payload.dispatchAttempt !== authorityDispatchAttempt');
+    expect(workerSource).toContain('const dispatchAttempt = authorityDispatchAttempt;');
     expect(workerSource).not.toContain('const dispatchAttempt = payload.dispatchAttempt');
   });
 
@@ -22,5 +24,12 @@ describe('worker app-runner control-channel wiring', () => {
     expect(workerSource).toContain("kind === 'terminal' && payload.status === 'failed'");
     expect(workerSource).toContain("payload.errorCode === 'codex_stream_disconnected'");
     expect(workerSource).toContain('beginCodexStreamDisconnectHandoff(');
+  });
+
+  it('requests pending-marker replay from a warm Codex App runner', () => {
+    expect(workerSource).toContain('cliAdapter.replayPendingTurns');
+    expect(workerSource).toContain('Codex App runner replay requested');
+    expect(workerSource).toContain("handleCodexAppMarker(body: string, replay = false)");
+    expect(workerSource).toContain("if (replay && kind !== 'thread' && !pendingTurn) return;");
   });
 });

@@ -3645,11 +3645,11 @@ function persistCodexHandoff(source: DaemonSession): void {
       interruptedUserGoal: handoff.interruptedUserGoal,
       summaryTurnId: handoff.summaryTurnId,
       phase: handoff.phase,
-    selectedSummary: handoff.selectedSummary,
-    newTopicAnchor: handoff.newTopicAnchor,
-    newSessionId: handoff.newSessionId,
-    sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
-  };
+      selectedSummary: handoff.selectedSummary,
+      newTopicAnchor: handoff.newTopicAnchor,
+      newSessionId: handoff.newSessionId,
+      sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
+    };
     sessionStore.updateSession(source.session);
   } catch (err) {
     logger.error(`[${tag(source)}] Failed to persist Codex handoff intent; in-memory watchdog remains active: ${err instanceof Error ? err.message : String(err)}`);

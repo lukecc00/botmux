@@ -975,6 +975,8 @@ describe('worker startup failure delivery', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.session.cliId = 'claude-code' as any;
+    ds.session.agentFrozen = true;
     forkWorker(ds, 'hello', false);
     const worker = forkMock.mock.results.at(-1)!.value;
 
@@ -996,6 +998,8 @@ describe('worker startup failure delivery', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.session.cliId = 'claude-code' as any;
+    ds.session.agentFrozen = true;
     ds.session.lastCallerOpenId = 'ou_latest';
     forkWorker(ds, 'hello', false);
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -1019,6 +1023,46 @@ describe('worker startup failure delivery', () => {
     );
   });
 
+  it('auto-reforks a crashed worker when a Codex turn is still pending', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-auto-refork-pending';
+    ds.session.cliId = 'codex' as any;
+    ds.session.pendingBridgeTurns = [{
+      turnId: 'turn-pending',
+      content: 'continue the task',
+      startedAt: Date.now(),
+      writtenAt: Date.now(),
+    }];
+    forkWorker(ds, '', true);
+    const crashed = forkMock.mock.results.at(-1)!.value;
+    const callsBeforeCrash = forkMock.mock.calls.length;
+    crashed.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+
+    crashed.emit('exit', 9, 'SIGKILL');
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    const replacement = forkMock.mock.results
+      .slice(callsBeforeCrash)
+      .map(result => result.value)
+      .find(worker => worker?.send?.mock?.calls?.some(([message]: [any]) =>
+        message?.type === 'init'
+        && message?.prompt === ''
+        && message?.resume === true
+        && message?.recoverBridgeTurns?.some((turn: any) => turn.turnId === 'turn-pending'),
+      ));
+    expect(replacement).toBeDefined();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('@s the latest caller with a normal stop notice when a ready worker exits cleanly', async () => {
     const sessionReply = vi.fn(async () => 'om_stop_reply');
     initWorkerPool({
@@ -1028,6 +1072,8 @@ describe('worker startup failure delivery', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.session.cliId = 'claude-code' as any;
+    ds.session.agentFrozen = true;
     ds.session.lastCallerOpenId = 'ou_latest';
     forkWorker(ds, 'hello', false);
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -1199,6 +1245,30 @@ describe('forkWorker session agent config freeze', () => {
       model: 'opus',
       resume: true,
     }));
+  });
+
+  it('carries pending Codex bridge turns even when lazy refork also has a new prompt', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+    ds.session.pendingBridgeTurns = [{
+      turnId: 'old-turn',
+      content: 'old prompt',
+      startedAt: 1_000,
+    }];
+
+    forkWorker(ds, 'new prompt', { resume: true, turnId: 'new-turn' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      prompt: 'new prompt',
+      turnId: 'new-turn',
+      recoverBridgeTurns: [expect.objectContaining({ turnId: 'old-turn' })],
+    }));
+    expect(ds.session.pendingBridgeTurns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ turnId: 'old-turn' }),
+      expect.objectContaining({ turnId: 'new-turn', content: 'new prompt' }),
+    ]));
   });
 
   it('back-fills wrapper/model from bot config on the first resume of a legacy (pre-freeze) session', () => {
