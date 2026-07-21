@@ -219,10 +219,11 @@ describe('validateMentionDecision', () => {
     expect(validateMentionDecision({ ...base, noMention: true }).ok).toBe(true);
   });
 
-  it('fails (no decision) with content-based guidance (not human-vs-bot)', () => {
+  it('fails (no decision) with end-or-action guidance (not content importance)', () => {
     const r = validateMentionDecision({ ...base });
     expect(r.ok).toBe(false);
-    expect(r.error).toContain('实质结论');
+    expect(r.error).toContain('过程更新、阶段结论、状态记录');
+    expect(r.error).toContain('整轮对话结束');
     expect(r.error).toContain('--mention-back');
     expect(r.error).toContain('--no-mention');
   });

@@ -749,6 +749,59 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/progress-card', () => {
+  it('returns the canonical low-attention native progress card', async () => {
+    const appId = 'progress-card-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: '/tmp',
+      workingDirs: ['/tmp'],
+    } as any);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: {
+        sessionId: 'progress-session',
+        rootMessageId: 'om_root',
+        webPort: 4321,
+        cliId: 'codex',
+      },
+      scope: 'thread',
+      workerPort: 4321,
+      workerToken: 'write-token',
+      workerViewToken: 'view-token',
+      larkAppId: appId,
+      chatId: 'oc_chat',
+      chatType: 'group',
+      workingDir: '/tmp',
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/progress-session/progress-card';
+      const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          ...trustedHostHeaders('POST', path, handle.port),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ content: '阶段进度，不需要 @ 用户。' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.cardJson).toContain('阶段进度，不需要 @ 用户。');
+      expect(body.cardJson).toContain('web终端');
+      expect(body.cardJson).toContain('reply_stop');
+      expect(body.cardJson).toContain('reply_manage');
+      expect(body.cardJson).not.toContain('发送给');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/write-link-card', () => {
   it('returns 401 without a valid loopback-HMAC signature', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);

@@ -127,6 +127,7 @@ import {
   whiteboardPath,
 } from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
+import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
 import {
@@ -4483,8 +4484,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        /--voice 混用；用户回复后自动撤下。
        --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）
     @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
-    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
-    纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
+    过程更新/阶段结论/状态记录→--no-mention；仅整轮结束或明确需要对方
+    确认/决策/授权/补充信息/处理阻塞时→--mention-back(或--mention点名)。
+    没信息量的"收到"不如不发。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
@@ -5884,7 +5886,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const sessions = loadSessions();
-  const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const currentTurnId = trustedRelayCtx?.turnId
+    ?? liveMarkerCtx?.turnId
+    ?? ancestorCtx?.turnId
+    ?? process.env.BOTMUX_TURN_ID;
   let s = sessions.get(sid);
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -6318,6 +6323,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  // Same-thread ordinary text may also arrive through Codex commentary/final.
+  // Both processes share this provider UUID, closing the race atomically.
+  // Payloads with attachments, attention, voice, custom cards, or explicit
+  // third-party mentions keep their own side effects and are not coalesced.
+  const ordinaryBridgeOutputUuid = shouldRecordBridgeMarker
+    && !customCardRequested
+    && !asVoice
+    && !attention.requested
+    && images.length === 0
+    && files.length === 0
+    && videoAttachments.length === 0
+    && mentionArgs.length === 0
+    && noMention
+    && currentTurnId
+      ? bridgeProgressProviderUuid(sid, currentTurnId, content)
+      : undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -6376,7 +6397,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...((prepared?.providerKey ?? ordinaryBridgeOutputUuid)
+          ? { uuid: prepared?.providerKey ?? ordinaryBridgeOutputUuid }
+          : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
@@ -6440,6 +6463,58 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (managedRenderedPayloadError) {
       console.error(`botmux send refused for a managed VC turn: ${managedRenderedPayloadError}`);
       process.exit(2);
+    }
+
+    // Ordinary progress must look like the transcript-native first card even
+    // if this explicit send wins the provider race. Ask the daemon to render
+    // its canonical card (Web Terminal / stop / manage; no recipient footer).
+    // Failure is best-effort: the stable UUID still prevents two messages.
+    let nativeProgressCardJson: string | undefined;
+    const nativeProgressEligible = noMention
+      && !customCardRequested
+      && !asVoice
+      && !attention.requested
+      && images.length === 0
+      && files.length === 0
+      && videoAttachments.length === 0
+      && mentionArgs.length === 0
+      && !sendTopLevel
+      && !overrideChatId
+      && !sendInto
+      && !!currentTurnId;
+    if (nativeProgressEligible) {
+      try {
+        const daemon = findDaemon(appId);
+        if (daemon) {
+          const originCapability = readManagedOriginCapability(
+            resolveDataDir(),
+            sid,
+            process.env.BOTMUX_SEND_RELAY,
+          )?.capability;
+          const request = {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              content,
+              originCapability,
+              originTurnId: currentTurnId,
+              originDispatchAttempt: trustedRelayCtx?.dispatchAttempt
+                ?? liveMarkerCtx?.dispatchAttempt
+                ?? ancestorCtx?.dispatchAttempt,
+            }),
+          } satisfies RequestInit;
+          let secret: string | undefined;
+          try { secret = loadDaemonIpcSecret(); } catch { /* isolated CLI */ }
+          const path = `/api/sessions/${encodeURIComponent(sid)}/progress-card`;
+          const response = secret
+            ? await fetchDaemonIpc(daemon.ipcPort, path, request, secret)
+            : await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, request);
+          if (response.ok) {
+            const payload = await response.json() as { cardJson?: unknown };
+            if (typeof payload.cardJson === 'string') nativeProgressCardJson = payload.cardJson;
+          }
+        }
+      } catch { /* fall back to the ordinary card; UUID dedupe remains active */ }
     }
 
     // Upload images only after the final rendered payload has passed the
@@ -6599,6 +6674,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         });
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (nativeProgressCardJson) {
+      messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive');
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages

@@ -47,7 +47,7 @@ export function getDaemonBootId(): string {
   return DAEMON_BOOT_ID;
 }
 
-function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
+export function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // The daemon is outside file/read isolation. Never use its host namespace
   // to disambiguate isolated or remote output; lexical repair performs no
   // filesystem I/O. initConfig.backendType is the backend frozen for the live
@@ -108,6 +108,7 @@ import {
   rememberBridgeDelivery,
   stagePendingBridgeTurn,
 } from '../services/bridge-recovery-state.js';
+import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -461,6 +462,40 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+/** Canonical card shape for transcript-native progress and an explicit
+ * same-text `botmux send --no-mention`. Keeping this builder daemon-owned
+ * guarantees the first-card style regardless of which channel reaches Lark
+ * first: no recipient footer, plus Web Terminal / stop / manage controls. */
+export function buildNativeProgressCard(ds: DaemonSession, content: string): string {
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+  return buildMarkdownCard(
+    content,
+    undefined,
+    renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+    localeForBot(ds.larkAppId),
+    ds.workingDir,
+    daemonCardLocalHomeLinkMode(ds),
+    'footer',
+    {
+      terminalUrl: buildTerminalUrl(ds),
+      stopValue: {
+        action: 'close',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_stop',
+      },
+      manageValue: {
+        action: 'manage_access',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_manage',
+      },
+    },
+  );
 }
 
 function sessionAgentConfig(
@@ -2450,34 +2485,7 @@ function setupWorkerHandlers(
     ds.progressOutputInFlight.add(record.transcriptUuid);
 
     const run = async (): Promise<void> => {
-      const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
-      const controls = {
-        terminalUrl: buildTerminalUrl(ds),
-        stopValue: {
-          action: 'close',
-          root_id: sessionAnchorId(ds),
-          session_id: ds.session.sessionId,
-          cli_id: effectiveCliId,
-          botmux_control: 'reply_stop',
-        },
-        manageValue: {
-          action: 'manage_access',
-          root_id: sessionAnchorId(ds),
-          session_id: ds.session.sessionId,
-          cli_id: effectiveCliId,
-          botmux_control: 'reply_manage',
-        },
-      };
-      const cardJson = buildMarkdownCard(
-        record.content,
-        undefined, // progress is deliberately low-attention: no owner @ footer
-        renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
-        localeForBot(ds.larkAppId),
-        ds.workingDir,
-        daemonCardLocalHomeLinkMode(ds),
-        'footer',
-        controls,
-      );
+      const cardJson = buildNativeProgressCard(ds, record.content);
       for (let attempt = 0; ; attempt++) {
         const backoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
           Math.min(attempt, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
@@ -2496,7 +2504,8 @@ function setupWorkerHandlers(
         }
         try {
           await scopedReply(cardJson, 'interactive', record.turnId, {
-            uuid: progressProviderUuid(record.sessionId, record.transcriptUuid),
+            uuid: bridgeProgressProviderUuid(record.sessionId, record.turnId, record.content)
+              ?? progressProviderUuid(record.sessionId, record.transcriptUuid),
           });
           ds.progressOutputUuids!.add(record.transcriptUuid);
           if (rememberBridgeDelivery(ds.session, 'progress', record.transcriptUuid)) {

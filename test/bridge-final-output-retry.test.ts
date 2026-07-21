@@ -1407,6 +1407,11 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('修复和边界测试都已完成');
     expect(sessionReply.mock.calls[0][1]).not.toContain('Ran pnpm build');
     expect(sessionReply.mock.calls[0][1]).not.toContain('internal reasoning');
+    expect(sessionReply.mock.calls[0][1]).toContain('web终端');
+    expect(sessionReply.mock.calls[0][1]).toContain('reply_stop');
+    expect(sessionReply.mock.calls[0][1]).toContain('reply_manage');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('发送给');
+    expect(sessionReply.mock.calls[0][5]?.uuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
     vi.useRealTimers();
   });
 

@@ -608,7 +608,7 @@ export const messages: Record<string, string> = {
   'ai.identity.mention_must': '要跟某个 bot 沟通或协作（让它收到你的消息），**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
   'ai.identity.mention_partners': '- 首轮上下文里的 `<available_bots>` 块会提示当前可协作的 bot（数量少时含 open_id，多时只列名字）；对方 open_id 也可以随时 `botmux bots list` 查',
   'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
-  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。按内容价值选：有实质结论、要对方继续看/确认/决策 → --mention-back（或 --mention 点名）；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰',
+  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。过程更新、阶段结论、状态记录一律 --no-mention，即使内容重要也不要每轮 @ 人；只有整轮对话结束，或明确需要对方确认、决策、授权、补充信息、处理阻塞时才 --mention-back（或 --mention 点名）。没信息量的"收到"不如不发',
   'ai.identity.mention_when_to': '- 该 --mention 的场景：需要跟对方沟通或协作、用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
   'ai.identity.mention_when_not': '- 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
 
@@ -620,8 +620,8 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
-  'ai.shell.codex_structured_delivery': 'Codex 专用交付规则：你明确写给用户的每段 commentary/进度和 final，都会分别自动成为一张话题内飞书 Markdown 卡片。长任务中，每完成一个可验证阶段、开始一次预计较久的构建/测试/等待、或得到会改变下一步的新结论，都要立即写一段自包含的 commentary；不要等到 final，也不要把多个里程碑合并。特别是“阶段结论 → 工具调用 → 下一阶段说明 → 长命令/等待”场景，工具前后的两段说明必须分别写成 commentary；工具调用、命令输出、Updated Plan 和 final 都不能替代或吞并这些说明。普通进度和最终答案不要再调用 `botmux send` 重复发送；只在附件、@mention、跨群发送等结构化通道无法表达时使用 `botmux send`。',
-  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
+  'ai.shell.codex_structured_delivery': 'Codex 专用交付规则：你明确写给用户的每段 commentary/进度和 final，都会分别自动成为一张话题内飞书 Markdown 卡片。长任务中，每完成一个可验证阶段、开始一次预计较久的构建/测试/等待、或得到会改变下一步的新结论，都要立即写一段自包含的 commentary；不要等到 final，也不要把多个里程碑合并。特别是“阶段结论 → 工具调用 → 下一阶段说明 → 长命令/等待”场景，工具前后的两段说明必须分别写成 commentary；工具调用、命令输出、Updated Plan 和 final 都不能替代或吞并这些说明。每段普通进度先写成 commentary，再用 `botmux send --no-mention` 发送完全相同的正文；botmux 会按会话、轮次和正文幂等合并，只保留带 Web 终端控制的原生进度卡。最终答案只写在 final，不要再显式发送同文；结束卡会负责通知用户。附件、跨群发送或点名其他人/bot 等特殊投递仍按需使用 `botmux send`。',
+  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。过程更新、阶段结论、状态记录一律 `--no-mention`，即使内容很重要也不要每轮 @ 人；只有整轮对话结束，或明确需要对方确认、决策、授权、补充信息、处理阻塞时才 `--mention-back`。点名其他人/bot 仍用 `--mention`。没信息量的“收到”不如不发。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应',
@@ -630,7 +630,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到',
-  'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者都会自动同步到飞书卡片，并在当前话题内逐段回复。每段 commentary 和 final 都会分别成为一张独立卡片。长任务每完成一个可验证阶段、开始较久的构建/测试/等待、或新结论改变下一步时，立即写一段自包含的 commentary；不要等到 final、不要合并多个里程碑。尤其在 commentary → tool → commentary → tool/等待的序列中，工具前后两段都必须分别输出，后续工具或 final 不能替代前段。不要用 `botmux send` 重复发送普通进度/结果；仅附件、@mention 或跨群发送除外',
+  'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者都会自动同步到飞书卡片，并在当前话题内逐段回复。每段 commentary 和 final 都会分别成为一张独立卡片。长任务每完成一个可验证阶段、开始较久的构建/测试/等待、或新结论改变下一步时，立即写一段自包含的 commentary；不要等到 final、不要合并多个里程碑。尤其在 commentary → tool → commentary → tool/等待的序列中，工具前后两段都必须分别输出，后续工具或 final 不能替代前段。每段普通进度在 commentary 后调用 `botmux send --no-mention` 发送相同正文，botmux 会合并重复投递并保留原生进度卡样式；最终答案只写 final，不再显式发送同文。只有结束或明确需要用户处理时才 @ 用户，不要每轮 @',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
