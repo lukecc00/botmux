@@ -68,6 +68,7 @@ import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
+import { isSessionRuntimeIdleOrLimited } from '../../core/session-runtime-status.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
@@ -228,7 +229,7 @@ function voiceSummaryInstruction(locale?: Locale): string {
 
 function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
   if (!ds.worker || ds.worker.killed) return true;
-  return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
+  return isSessionRuntimeIdleOrLimited(ds);
 }
 
 function isLegacySelfHealAction(actionType?: string): boolean {

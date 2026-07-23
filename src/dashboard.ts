@@ -874,6 +874,42 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return raw ? JSON.parse(raw) : {};
 }
 
+/** Remove one or more registry Skills from a JSON request body. */
+async function removeDashboardSkills(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let parsed: unknown;
+  try {
+    parsed = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  const rawNames = Array.isArray(body.names) ? body.names : [];
+  if (rawNames.some(name => typeof name !== 'string')) return jsonRes(res, 400, { ok: false, error: 'invalid_skill_names' });
+  const names = [...new Set((rawNames as string[]).map(name => name.trim()).filter(Boolean))];
+  if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'skills_required' });
+  if (names.length > 500) return jsonRes(res, 400, { ok: false, error: 'too_many_skills' });
+  const registrySkills = readSkillRegistry().skills;
+  const missing = names.filter(name => !registrySkills[name]);
+  if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
+
+  const referencesBySkill = await dashboardSkillReferencesMany(names);
+  const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+  const affectedSkills = references
+    .filter(item => item.refs.bots.length > 0)
+    .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+  if (body.force !== true && affectedSkills.length > 0) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'skills_in_use',
+      affectedSkills,
+    });
+  }
+
+  const result = removeInstalledSkills(names);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason, missing: result.missing });
+  return jsonRes(res, 200, { ok: true, removed: result.removed, affectedSkills });
+}
+
 /** Fast in-process guard against double-clicks within this dashboard process.
  *  Cross-process serialization against the maintenance auto-update (a different
  *  process) is handled separately by the shared file lock in the run route. */
@@ -2559,39 +2595,11 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, dashboardSkillsPayload());
     }
 
-    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
-      let parsed: unknown;
-      try {
-        parsed = await readJsonBody(req);
-      } catch {
-        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      }
-      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-      const rawNames = Array.isArray(body.names) ? body.names : [];
-      if (rawNames.some(name => typeof name !== 'string')) return jsonRes(res, 400, { ok: false, error: 'invalid_skill_names' });
-      const names = [...new Set((rawNames as string[]).map(name => name.trim()).filter(Boolean))];
-      if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'skills_required' });
-      if (names.length > 500) return jsonRes(res, 400, { ok: false, error: 'too_many_skills' });
-      const registrySkills = readSkillRegistry().skills;
-      const missing = names.filter(name => !registrySkills[name]);
-      if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
-
-      const referencesBySkill = await dashboardSkillReferencesMany(names);
-      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
-      const affectedSkills = references
-        .filter(item => item.refs.bots.length > 0)
-        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
-      if (body.force !== true && affectedSkills.length > 0) {
-        return jsonRes(res, 409, {
-          ok: false,
-          error: 'skills_in_use',
-          affectedSkills,
-        });
-      }
-
-      const result = removeInstalledSkills(names);
-      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason, missing: result.missing });
-      return jsonRes(res, 200, { ok: true, removed: result.removed, affectedSkills });
+    // POST avoids the proxy compatibility trap around request bodies on
+    // DELETE. Keep DELETE wired for older dashboard bundles.
+    if ((req.method === 'POST' && url.pathname === '/api/skills/remove')
+      || (req.method === 'DELETE' && url.pathname === '/api/skills')) {
+      return removeDashboardSkills(req, res);
     }
 
     if (req.method === 'PUT' && url.pathname === '/api/skills/global') {

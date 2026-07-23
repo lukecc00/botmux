@@ -5,6 +5,7 @@ import {
   bridgeFinalProviderUuid,
   completePendingBridgeTurn,
   markPendingBridgeTurnWritten,
+  markPendingBridgeTurnTerminal,
   rememberBridgeDelivery,
   stagePendingBridgeTurn,
 } from '../src/services/bridge-recovery-state.js';
@@ -29,6 +30,9 @@ describe('bridge recovery state', () => {
     expect(markPendingBridgeTurnWritten(s, 'turn-a', undefined, 120)).toBe(true);
     expect(s.pendingBridgeTurns?.[0]?.writtenAt).toBe(120);
     expect(markPendingBridgeTurnWritten(s, 'turn-a', undefined, 120)).toBe(false);
+    expect(markPendingBridgeTurnTerminal(s, 'turn-a', undefined, 140)).toBe(true);
+    expect(s.pendingBridgeTurns?.[0]?.terminalAt).toBe(140);
+    expect(markPendingBridgeTurnTerminal(s, 'turn-a', undefined, 150)).toBe(false);
     expect(completePendingBridgeTurn(s, 'turn-a')).toBe(true);
     expect(s.pendingBridgeTurns).toBeUndefined();
   });

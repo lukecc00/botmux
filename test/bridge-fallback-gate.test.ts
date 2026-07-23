@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -89,6 +89,58 @@ describe('shouldSuppressBridgeEmit', () => {
       markers,
       false,
     )).toBe(false);
+  });
+
+  it('non-adopt: a long mirrored commentary marker never suppresses the later final', () => {
+    const commentary = '从代码看还有第二层开关：groupMentionMode 决定已有话题内的后续回复是否免 @。因此完整配置需要同时设置新话题自动开工和话题内免 @，我会继续确认面板名称与命令格式。';
+    const finalText = '问题不是飞书后台没开，而是 botmux 运行配置还没开到正确字段。请开启新话题自动开工，并把群聊 @ 策略设为仅话题内不需要 @。设置后一定要新建全新话题测试；已有话题不能验证新话题自动开工。';
+    const marker = { sentAtMs: 150, ...buildBridgeSendMarkerContent(commentary) };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText, progressTexts: [commentary] },
+      200,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: a real final send still suppresses when commentary was mirrored too', () => {
+    const commentary = '正在核对配置字段与后台名称。';
+    const finalText = '请开启 autoStartOnNewTopic，并把 regularGroupMentionMode 设为 topic。';
+    const markers = [
+      { sentAtMs: 140, ...buildBridgeSendMarkerContent(commentary) },
+      { sentAtMs: 150, ...buildBridgeSendMarkerContent(finalText) },
+    ];
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText, progressTexts: [commentary] },
+      200,
+      markers,
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: legacy length-only commentary marker does not suppress during rolling upgrade', () => {
+    const commentary = '正在核对配置字段与后台名称。';
+    const finalText = '请开启 autoStartOnNewTopic，并把 regularGroupMentionMode 设为 topic。';
+    const marker = markerForContent(150, commentary);
+    delete marker.contentHash;
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText, progressTexts: [commentary] },
+      200,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: unmatched legacy marker remains conservative', () => {
+    const commentary = '正在核对配置字段与后台名称。';
+    const marker = markerForContent(150, '最终答案已经通过 botmux send 发出。');
+    delete marker.contentHash;
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: '简短最终答案', progressTexts: [commentary] },
+      200,
+      [marker],
+      false,
+    )).toBe(true);
   });
 
   it('non-adopt: short transcript follow-up remains suppressed when a structured marker exists', () => {

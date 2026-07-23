@@ -87,6 +87,38 @@ describe('attention signals', () => {
     expect(composeRowFromActive(queued).status).toBe('idle');
   });
 
+  it('keeps a switched Codex conversation working until its bridge turn terminates', () => {
+    const ds = makeDs({ worker: {} as any, lastScreenStatus: 'idle' });
+    ds.session.cliId = 'codex';
+    ds.session.pendingBridgeTurns = [{
+      turnId: 'turn-before-compaction',
+      content: 'finish the task after switching conversations',
+      startedAt: 1_000,
+      writtenAt: 1_010,
+    }];
+
+    expect(composeRowFromActive(ds).status).toBe('working');
+
+    // The terminal is authoritative for model work. Keep the record itself
+    // until final delivery ACK so restart replay/dedup still works.
+    ds.session.pendingBridgeTurns[0]!.terminalAt = 1_200;
+    expect(composeRowFromActive(ds).status).toBe('idle');
+  });
+
+  it('shows daemon-owned Codex handoff work as running even between workers', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.codexFreshHandoff = {
+      requestId: 'handoff-1',
+      reason: 'context_window_exceeded',
+      requestedAt: new Date(1_000).toISOString(),
+      summaryTurnId: 'summary-1',
+      phase: 'migrating',
+    };
+
+    expect(composeRowFromActive(ds).status).toBe('working');
+  });
+
   it('composeRowFromActive carries the agent raise-hand signal with its reason', () => {
     const raised = composeRowFromActive(makeDs({
       agentAttention: { kind: 'authz', reason: '需要 prod 部署授权', at: 1234 },

@@ -13,6 +13,7 @@ import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import { sessionRuntimeStatus } from './session-runtime-status.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -134,14 +135,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
-    // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
-    // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
-    // For every other session, process residency is authoritative: suspension
-    // clears ds.worker but intentionally preserves the logical active session.
-    // Never let a stale pre-suspend status make it look resident after hydrate.
-    status: ds.session.queued
-      ? 'idle'
-      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
+    status: sessionRuntimeStatus(ds),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,

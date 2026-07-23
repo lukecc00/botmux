@@ -21,6 +21,7 @@ import type { RelayPickerEntry } from '../im/lark/card-builder.js';
 import { getChatNameAndMode } from '../im/lark/client.js';
 import { isRelayableRealSession } from '../core/worker-pool.js';
 import { sessionAnchorId } from '../core/types.js';
+import { isSessionRuntimeIdleOrLimited } from '../core/session-runtime-status.js';
 
 export async function collectRelayPickerEntries(
   activeSessions: Map<string, DaemonSession>,
@@ -78,8 +79,7 @@ export async function collectRelayPickerEntries(
     // have already POSTed + deleted an M1). This is a snapshot at
     // render/click time, not live — re-clicking the entry re-renders and
     // recomputes it.
-    const running = !!c.worker && !c.worker.killed
-      && c.lastScreenStatus !== 'idle' && c.lastScreenStatus !== 'limited';
+    const running = !!c.worker && !c.worker.killed && !isSessionRuntimeIdleOrLimited(c);
     if (c.chatType === 'p2p') {
       return {
         sessionId: c.session.sessionId,

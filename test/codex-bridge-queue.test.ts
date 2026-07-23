@@ -40,7 +40,15 @@ function emitDecisions(
     out.push({
       turnId: turn.turnId,
       suppressed: shouldSuppressBridgeEmit(
-        { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode,
+        {
+          markTimeMs: turn.markTimeMs,
+          isLocal: turn.isLocal,
+          finalText: turn.finalText,
+          progressTexts: turn.progressTexts,
+        },
+        nextBoundaryMs,
+        markers,
+        adoptMode,
       ),
     });
   }
@@ -92,7 +100,9 @@ describe('CodexBridgeQueue', () => {
     ]);
     expect(q.drainProgressOutputs()).toEqual([]);
     expect(q.drainEmittable()[0]).toMatchObject({
-      turnId: 'turn-layout-build', finalText: '最终完成',
+      turnId: 'turn-layout-build',
+      finalText: '最终完成',
+      progressTexts: ['已核对原生 XML 和 Holder。', '已完成首轮修复并开始构建。'],
     });
   });
 
@@ -801,6 +811,22 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
       markerForContent(10_000, 'I found the existing scripts'),
     ];
     expect(emitDecisions(q, markers)).toEqual([{ turnId: 't1', suppressed: false }]);
+  });
+
+  it('does not let a long manually mirrored commentary suppress a shorter final answer', () => {
+    const q = new CodexBridgeQueue();
+    const commentary = '从代码看还有第二层开关：groupMentionMode 决定已有话题内的后续回复是否免 @。因此完整配置需要同时设置新话题自动开工和话题内免 @，我会继续确认面板名称与命令格式。';
+    const finalText = '请开启 autoStartOnNewTopic，并把 regularGroupMentionMode 设为 topic。设置后新建全新话题测试。';
+    q.mark('t-commentary-final', '排查无需艾特配置', 1_000);
+    q.ingest([
+      userEv('排查无需艾特配置', 'u-commentary-final', 5_000),
+      progressEv(commentary, 'p-commentary-final', 8_000),
+      asstEv(finalText, 'a-commentary-final', 15_000),
+    ]);
+    q.drainProgressOutputs();
+
+    expect(emitDecisions(q, [markerForContent(10_000, commentary)]))
+      .toEqual([{ turnId: 't-commentary-final', suppressed: false }]);
   });
 
   it('turn1 send no longer escapes its window when turn2 was type-ahead-marked early', () => {

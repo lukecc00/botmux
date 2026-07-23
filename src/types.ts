@@ -268,6 +268,9 @@ export interface Session {
     startedAt: number;
     /** Set only after Codex history.jsonl confirms the input reached the CLI. */
     writtenAt?: number;
+    /** Authoritative model terminal observed. The record can remain until its
+     * final Lark delivery is acknowledged/replayed. */
+    terminalAt?: number;
   }>;
   /** Bounded provider-ack ledger for transcript UUIDs/turn keys. A recovered
    * bridge may intentionally reread the active turn; this prevents old

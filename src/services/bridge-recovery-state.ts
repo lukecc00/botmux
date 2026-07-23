@@ -53,6 +53,21 @@ export function markPendingBridgeTurnWritten(
   return true;
 }
 
+export function markPendingBridgeTurnTerminal(
+  session: Session,
+  turnId: string,
+  dispatchAttempt: number | undefined,
+  terminalAt: number = Date.now(),
+): boolean {
+  const turn = session.pendingBridgeTurns?.find(candidate =>
+    candidate.turnId === turnId
+    && candidate.dispatchAttempt === dispatchAttempt,
+  );
+  if (!turn || turn.terminalAt !== undefined) return false;
+  turn.terminalAt = terminalAt;
+  return true;
+}
+
 export function bridgeDeliveryAcknowledged(
   session: Session,
   kind: 'progress' | 'final',

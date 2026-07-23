@@ -7,6 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import type { DaemonSession } from './types.js';
+import { sessionRuntimeStatus } from './session-runtime-status.js';
 
 export function markSessionActivity(ds: DaemonSession, at: number = Date.now()): void {
   ds.lastMessageAt = at;
@@ -34,6 +35,18 @@ export function publishLastInputFromBotPatch(ds: DaemonSession): void {
     body: {
       sessionId: ds.session.sessionId,
       patch: { lastInputFromBot: ds.session.quoteTargetSenderIsBot === true },
+    },
+  });
+}
+
+/** Publish status after durable work state changes without requiring a TUI
+ * redraw (handoff armed, transcript terminal settled, final ACK completed). */
+export function publishSessionRuntimeStatus(ds: DaemonSession): void {
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: ds.session.sessionId,
+      patch: { status: sessionRuntimeStatus(ds) },
     },
   });
 }

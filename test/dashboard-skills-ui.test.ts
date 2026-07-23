@@ -6,6 +6,17 @@ import { BotPolicyCard, InstalledSkillsLibrary, RemoveSkillsDialog, SkillsInstal
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
+const skillsPageSource = readFileSync(new URL('../src/dashboard/web/skills-page.tsx', import.meta.url), 'utf8');
+const dashboardSource = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+
+describe('dashboard Skills removal transport', () => {
+  it('uses a POST action endpoint so proxies cannot drop the removal payload', () => {
+    expect(skillsPageSource).toMatch(/jsonRequest\('\/api\/skills\/remove',\s*\{\s*method:\s*'POST'/s);
+    expect(dashboardSource).toContain("req.method === 'POST' && url.pathname === '/api/skills/remove'");
+    expect(dashboardSource).toContain("req.method === 'DELETE' && url.pathname === '/api/skills'");
+  });
+});
+
 describe('dashboard skills React hook safety', () => {
   it('keeps hook order stable when the same bot card flips between error and normal states', () => {
     const onSave = vi.fn();

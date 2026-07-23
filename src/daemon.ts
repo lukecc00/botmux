@@ -149,6 +149,7 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { hasActiveSessionWork, sessionRuntimeStatus } from './core/session-runtime-status.js';
 import {
   buildFallbackCodexHandoffSummary,
   buildFreshCodexHandoffPrompt,
@@ -269,6 +270,7 @@ import {
   announcePendingRepoSession,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
+  publishSessionRuntimeStatus,
   clearAgentAttention,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -3651,6 +3653,7 @@ function persistCodexHandoff(source: DaemonSession): void {
       sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
     };
     sessionStore.updateSession(source.session);
+    publishSessionRuntimeStatus(source);
   } catch (err) {
     logger.error(`[${tag(source)}] Failed to persist Codex handoff intent; in-memory watchdog remains active: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -17403,7 +17406,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try {
       let busy = 0;
       for (const [, ds] of activeSessions) {
-        if (ds.worker && !ds.worker.killed && ds.lastScreenStatus === 'working') busy++;
+        if (hasActiveSessionWork(ds)
+          || (ds.worker && !ds.worker.killed && sessionRuntimeStatus(ds) === 'working')) busy++;
       }
       writeHeartbeat(cfg.larkAppId, busy);
     } catch { /* best-effort */ }

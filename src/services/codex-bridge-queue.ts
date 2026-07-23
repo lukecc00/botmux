@@ -56,6 +56,9 @@ export interface CodexPendingTurn {
   markTimeMs?: number;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  /** User-facing commentary seen before the final. Used only to identify
+   * manually mirrored progress sends in the fallback suppression gate. */
+  progressTexts?: string[];
   /** Explicit transcript terminal semantics. Undefined keeps the historical
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
@@ -315,6 +318,7 @@ export class CodexBridgeQueue {
     } else if (ev.kind === 'assistant_progress') {
       if (this.collecting) {
         if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+        (this.collecting.progressTexts ??= []).push(ev.text);
         this.progressOutputs.push({
           uuid: ev.uuid,
           content: ev.text,

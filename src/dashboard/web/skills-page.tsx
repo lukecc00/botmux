@@ -1208,8 +1208,8 @@ function SkillsPage() {
     setRemovalError(null);
     setInstalledStatus({ text: tr('skills.removingCount', { count: names.length }), ok: true });
     try {
-      const body = await jsonRequest('/api/skills', {
-        method: 'DELETE',
+      const body = await jsonRequest('/api/skills/remove', {
+        method: 'POST',
         body: JSON.stringify({ names, force }),
       });
       if (!mountedRef.current) return;

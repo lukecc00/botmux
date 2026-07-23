@@ -65,7 +65,11 @@ export function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMod
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
-import { publishAttentionPatch } from './session-activity.js';
+import { publishAttentionPatch, publishSessionRuntimeStatus } from './session-activity.js';
+import {
+  isSessionRuntimeIdleOrLimited,
+  liveSessionRuntimeStatus,
+} from './session-runtime-status.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -105,6 +109,7 @@ import {
   bridgeFinalProviderUuid,
   completePendingBridgeTurn,
   markPendingBridgeTurnWritten,
+  markPendingBridgeTurnTerminal,
   rememberBridgeDelivery,
   stagePendingBridgeTurn,
 } from '../services/bridge-recovery-state.js';
@@ -807,7 +812,7 @@ export async function postFreshStreamingCard(
   const effectiveCliId = sessionCliId(ds, botCfg);
   const readUrl = buildTerminalUrl(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-  const status = ds.lastScreenStatus ?? 'idle';
+  const status = liveSessionRuntimeStatus(ds, ds.lastScreenStatus ?? 'idle');
 
   // Park the current card (no-op when there's none) so the fresh one replaces
   // rather than duplicates it.
@@ -897,7 +902,7 @@ export async function postPrivateSnapshotCard(
   const effectiveCliId = sessionCliId(ds, botCfg);
   const readUrl = buildTerminalUrl(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-  const status = ds.lastScreenStatus ?? 'idle';
+  const status = liveSessionRuntimeStatus(ds, ds.lastScreenStatus ?? 'idle');
   const cardJson = buildPrivateSnapshotCard(
     readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
     ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
@@ -1795,8 +1800,7 @@ export async function transferSession(
   // leader had already abort+report 'busy', producing reports that
   // disagreed with reality. Cleaner contract: refuse on first miss, let
   // the user retry when the turn settles.
-  const st = ds.lastScreenStatus;
-  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
+  if (ds.worker && !ds.worker.killed && !isSessionRuntimeIdleOrLimited(ds)) {
     return { ok: false, error: 'worker_busy' };
   }
 
@@ -1979,7 +1983,10 @@ export function sendWorkerInput(
       dispatchAttempt: opts.dispatchAttempt,
       ...(codexAppInput ? { codexAppInput } : {}),
       startedAt: Date.now(),
-    })) sessionStore.updateSession(ds.session);
+    })) {
+      sessionStore.updateSession(ds.session);
+      publishSessionRuntimeStatus(ds);
+    }
   }
   ds.worker.send({
     type: 'message',
@@ -2314,7 +2321,10 @@ export function forkWorker(
       dispatchAttempt: initDispatchAttempt,
       ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
       startedAt: Date.now(),
-    })) sessionStore.updateSession(ds.session);
+    })) {
+      sessionStore.updateSession(ds.session);
+      publishSessionRuntimeStatus(ds);
+    }
   }
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -2924,42 +2934,44 @@ function setupWorkerHandlers(
         // the real port, and riffAccessUrl rides the pending-patch flow.
         if (!ds.workerPort) break;
         const prevStatus = ds.lastScreenStatus;
+        const prevRuntimeStatus = liveSessionRuntimeStatus(ds, prevStatus);
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        const runtimeStatus = liveSessionRuntimeStatus(ds);
 
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
-        if (prevStatus !== ds.lastScreenStatus) {
+        if (prevRuntimeStatus !== runtimeStatus) {
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
               sessionId: ds.session.sessionId,
               patch: {
-                status: ds.lastScreenStatus,
+                status: runtimeStatus,
                 lastMessageAt: ds.lastMessageAt,
                 tokenUsage: composeRowFromActive(ds).tokenUsage,
               },
             },
           });
-          emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+          emitSessionStateTransitionHook(ds, prevRuntimeStatus, runtimeStatus, {
             source: 'screen_update',
             content: msg.content,
           });
           // Usage ledger + turn reactions: idle/limited edges are turn
           // boundaries. Append the token delta, and flip this turn's pending ✋
           // reactions to ✅ (best-effort, never blocks the status pipeline).
-          if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
+          if (runtimeStatus === 'idle' || runtimeStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
           // reclaimed immediately instead of waiting for the 60s backstop.
-          if (ds.lastScreenStatus === 'idle' && cb.enforceLiveSessionCap) {
+          if (runtimeStatus === 'idle' && cb.enforceLiveSessionCap) {
             // Defer until this screen_update has finished using process state.
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
@@ -3000,7 +3012,7 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
-            ds.lastScreenStatus,
+            runtimeStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -3052,7 +3064,7 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             msg.content,
-            ds.lastScreenStatus,
+            runtimeStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -3122,9 +3134,11 @@ function setupWorkerHandlers(
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
         const prevStatus = ds.lastScreenStatus;
+        const prevRuntimeStatus = liveSessionRuntimeStatus(ds, prevStatus);
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
-        emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+        const runtimeStatus = liveSessionRuntimeStatus(ds);
+        emitSessionStateTransitionHook(ds, prevRuntimeStatus, runtimeStatus, {
           source: 'screenshot_uploaded',
           imageKey: msg.imageKey,
           content: ds.lastScreenContent ?? '',
@@ -3141,7 +3155,7 @@ function setupWorkerHandlers(
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
-          ds.lastScreenStatus,
+          runtimeStatus,
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
@@ -3519,10 +3533,34 @@ function setupWorkerHandlers(
             logger.warn(`[${t}] Failed to reset Codex stream recovery budget: ${err.message}`);
           }
         }
+        const prevRuntimeStatus = liveSessionRuntimeStatus(ds);
+        const terminalMarked = markPendingBridgeTurnTerminal(
+          ds.session,
+          msg.turnId,
+          msg.dispatchAttempt,
+        );
         if (!msg.bridgeFinalEmitted
           && completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
           try { sessionStore.updateSession(ds.session); } catch (err: any) {
             logger.warn(`[${t}] Failed to clear completed bridge recovery turn: ${err.message}`);
+          }
+        } else if (terminalMarked) {
+          try { sessionStore.updateSession(ds.session); } catch (err: any) {
+            logger.warn(`[${t}] Failed to persist bridge terminal state: ${err.message}`);
+          }
+        }
+        const runtimeStatus = liveSessionRuntimeStatus(ds);
+        publishSessionRuntimeStatus(ds);
+        if (prevRuntimeStatus !== runtimeStatus) {
+          emitSessionStateTransitionHook(ds, prevRuntimeStatus, runtimeStatus, {
+            source: 'turn_terminal',
+          });
+          if (runtimeStatus === 'idle' || runtimeStatus === 'limited') {
+            recordUsageForDaemonSession(ds);
+            void finishTurnReactions(ds);
+          }
+          if (runtimeStatus === 'idle' && cb.enforceLiveSessionCap) {
+            queueMicrotask(cb.enforceLiveSessionCap);
           }
         }
         try {
@@ -3628,6 +3666,7 @@ function setupWorkerHandlers(
         if (bridgeDeliveryAcknowledged(ds.session, 'final', msg.lastUuid || msg.turnId)) {
           if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
             sessionStore.updateSession(ds.session);
+            publishSessionRuntimeStatus(ds);
           }
           logger.debug(`[${t}] recovered final_output already acknowledged (${dedupeKey.substring(0, 48)})`);
           break;
@@ -3951,6 +3990,11 @@ function deliverFinalOutput(
   earlierProgress: Promise<void> | undefined = ds.progressDeliveryTail,
 ): void {
   const managedReceiver = !!ds.session.vcMeetingReceiver;
+  const completeBridgeTurn = (): boolean => {
+    const changed = completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt);
+    if (changed) publishSessionRuntimeStatus(ds);
+    return changed;
+  };
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
   // output, resolve the Promise immediately, and DO NOT send it to Lark.
@@ -3960,7 +4004,7 @@ function deliverFinalOutput(
   if (waitPromise) {
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-    if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+    if (completeBridgeTurn()) {
       sessionStore.updateSession(ds.session);
     }
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
@@ -3973,7 +4017,7 @@ function deliverFinalOutput(
     asyncResult.content = msg.content;
     asyncResult.completedAt = Date.now();
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-    if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+    if (completeBridgeTurn()) {
       sessionStore.updateSession(ds.session);
     }
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
@@ -4037,7 +4081,7 @@ function deliverFinalOutput(
           try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+        if (completeBridgeTurn()) {
           sessionStore.updateSession(ds.session);
         }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
@@ -4216,7 +4260,7 @@ function deliverFinalOutput(
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        if (completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt)) {
+        if (completeBridgeTurn()) {
           sessionStore.updateSession(ds.session);
         }
         logger.info(
@@ -4252,7 +4296,7 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       if (rememberBridgeDelivery(ds.session, 'final', msg.lastUuid || msg.turnId)) {
-        completePendingBridgeTurn(ds.session, msg.turnId, msg.dispatchAttempt);
+        completeBridgeTurn();
         sessionStore.updateSession(ds.session);
       }
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);

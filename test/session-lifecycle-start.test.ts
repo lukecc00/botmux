@@ -466,7 +466,7 @@ describe('session.start lifecycle integration', () => {
     vi.unstubAllEnvs();
   });
 
-  it('re-checks the resident-session cap after spawn and again on an idle edge', async () => {
+  it('re-checks the resident-session cap only after a Codex turn terminal, not a prompt-looking idle edge', async () => {
     const enforceLiveSessionCap = vi.fn();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
@@ -483,6 +483,17 @@ describe('session.start lifecycle integration', () => {
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
     worker.emit('message', { type: 'screen_update', content: '', status: 'idle' });
+    await Promise.resolve();
+    expect(enforceLiveSessionCap).toHaveBeenCalledTimes(1);
+
+    const turnId = ds.session.pendingBridgeTurns?.[0]?.turnId;
+    expect(turnId).toBeTruthy();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId,
+      status: 'completed',
+    });
     await Promise.resolve();
     expect(enforceLiveSessionCap).toHaveBeenCalledTimes(2);
   });
