@@ -278,7 +278,7 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
         { tag: 'markdown', content: '正文内容' },
         { tag: 'hr' },
         { tag: 'markdown', text_size: 'notation_small_v2',
-          content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux) · 发送给：<at id=ou_owner></at></font>" },
+          content: "<font color='grey'>[botmux](https://github.com/lukecc00/botmux) · 发送给：<at id=ou_owner></at></font>" },
       ] },
     };
     const result = parseApiMessage(makeMsg('interactive', card));
@@ -292,7 +292,7 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
       elements: [
         [{ tag: 'text', text: '正文内容' }],
         [
-          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'a', text: 'botmux', href: 'https://github.com/lukecc00/botmux' },
           { tag: 'text', text: ' · 发送给：' },
           { tag: 'at', user_name: 'Owner' },
         ],

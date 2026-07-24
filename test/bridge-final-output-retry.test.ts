@@ -3,11 +3,11 @@
  *
  * The worker pops each turn off its queue at emit time and never re-sends
  * the same payload, so the daemon owns retry. We verify:
- *   - transient sessionReply rejections retry up to 3 times with backoff
+ *   - transient sessionReply rejections keep retrying with bounded backoff
  *   - dedup marker is committed only after a successful send
  *   - MessageWithdrawnError aborts retries (no point), commits dedup, and
  *     closes the session
- *   - 3 consecutive failures give up and DO NOT commit the dedup marker
+ *   - repeated failures do not commit the dedup marker and do not exhaust retries
  *     (so any retransmit can still deliver)
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -516,7 +516,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
-  it('does not address daemon final output or render a brand footer for a known bot owner', async () => {
+  it('renders a terminal final card without live session controls for a known bot owner', async () => {
     writeFileSync(
       join('/tmp/test-sessions', 'bot-openids-app_test.json'),
       JSON.stringify({ Claude: 'ou_foreign_bot' }),
@@ -541,9 +541,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).not.toContain('[botmux](');
-    expect(cardJson).toContain('web终端');
-    expect(cardJson).toContain('停止');
+    expect(cardJson).toContain('[botmux](');
+    expect(cardJson).not.toContain('web终端');
+    expect(cardJson).not.toContain('reply_stop');
+    expect(cardJson).not.toContain('reply_manage');
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
   });
 
@@ -629,8 +630,14 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const cardJson = sessionReply.mock.calls[0][1] as string;
     const elements = JSON.parse(cardJson).body.elements;
     expect(elements[0].content).toBe('<at id=ou_human></at>');
-    expect(elements[elements.length - 1].tag).toBe('column_set');
+    expect(elements[elements.length - 1]).toMatchObject({
+      tag: 'markdown',
+      content: expect.stringContaining('[botmux]('),
+    });
     expect(cardJson.match(/<at id=ou_human><\/at>/g)).toHaveLength(1);
+    expect(cardJson).not.toContain('reply_stop');
+    expect(cardJson).not.toContain('reply_manage');
+    expect(cardJson).not.toContain('web终端');
   });
 
   it('mentions the exact turn caller instead of the topic owner', async () => {
@@ -1218,7 +1225,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
-  it('gives up after 3 attempts and does NOT commit dedup', async () => {
+  it('keeps retrying after 3 failures and does NOT commit dedup before success', async () => {
     const sessionReply = vi.fn().mockRejectedValue(new Error('persistent'));
     const closeSession = vi.fn();
     initWorkerPool({
@@ -1235,10 +1242,14 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(5000);
     await vi.advanceTimersByTimeAsync(15000);
+    await vi.advanceTimersByTimeAsync(30000);
 
-    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(sessionReply).toHaveBeenCalledTimes(4);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
     expect(closeSession).not.toHaveBeenCalled();
+    ds.session.status = 'closed' as any;
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(sessionReply).toHaveBeenCalledTimes(4);
   });
 
   it('MessageWithdrawnError aborts retries, commits dedup, and closes session', async () => {
@@ -1508,6 +1519,45 @@ describe('Worker turn_terminal routing', () => {
     expect(deliveryOrder).toEqual([]);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(deliveryOrder).toEqual(['progress', 'final']);
+    vi.useRealTimers();
+  });
+
+  it('forwards the final answer after a bounded wait when commentary remains stuck', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('持续失败的过程卡')) throw new Error('temporary progress outage');
+      if (body.includes('必须送达的最终结论')) deliveryOrder.push('final');
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '持续失败的过程卡', uuid: 'stuck-progress', turnId: 'turn-stuck-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '必须送达的最终结论', lastUuid: 'final-after-stuck-progress', turnId: 'turn-stuck-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(deliveryOrder).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deliveryOrder).toEqual(['final']);
+    const finalCard = sessionReply.mock.calls.find(call => String(call[1]).includes('必须送达的最终结论'))?.[1] as string;
+    expect(finalCard).not.toContain('reply_stop');
+    expect(finalCard).not.toContain('reply_manage');
+    expect(finalCard).not.toContain('web终端');
+    ds.progressDeliveryClosed = true;
+    await vi.advanceTimersByTimeAsync(60_000);
     vi.useRealTimers();
   });
 

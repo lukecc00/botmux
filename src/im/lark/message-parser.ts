@@ -626,7 +626,7 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
  * card whose own body puts this exact repo URL on a line would lose that line
  * too — vanishingly rare versus the value of a simple format-agnostic anchor.
  */
-const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
+const BOTMUX_FOOTER_MARKER = 'github.com/lukecc00/botmux';
 
 function isBotmuxFooterLine(line: string): boolean {
   return line.includes(BOTMUX_FOOTER_MARKER)

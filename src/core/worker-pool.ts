@@ -3850,7 +3850,16 @@ function setupWorkerHandlers(
 
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
-const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+/** A final answer is the only irreplaceable user-visible terminal artifact.
+ * Keep retrying while the session is active; provider UUIDs make the
+ * "accepted, then daemon crashed" window idempotent. The bounded array is a
+ * backoff schedule, not an attempt budget. */
+const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+/** Preserve commentary-before-final ordering during ordinary short provider
+ * hiccups, but never let the durable commentary FIFO hold the terminal answer
+ * hostage indefinitely. Commentary remains in its own outbox and can land
+ * later with the original provider UUID. */
+const FINAL_OUTPUT_PROGRESS_WAIT_MS = 20_000;
 /** Commentary is not reproducible after its transcript event has passed.
  * Retry forever (bounded at 30s) while the session is active; the durable
  * outbox takes over across daemon restarts. */
@@ -3893,6 +3902,25 @@ function isPermanentProgressDeliveryError(error: unknown): boolean {
 
 function isSessionClosed(ds: DaemonSession): boolean {
   return ds.progressDeliveryClosed === true || ds.session.status === 'closed';
+}
+
+async function waitForEarlierProgress(
+  earlierProgress: Promise<void> | undefined,
+  timeoutMs = FINAL_OUTPUT_PROGRESS_WAIT_MS,
+): Promise<'settled' | 'timed_out'> {
+  if (!earlierProgress) return 'settled';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      earlierProgress.then(() => 'settled' as const, () => 'settled' as const),
+      new Promise<'timed_out'>(resolve => {
+        timer = setTimeout(() => resolve('timed_out'), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
@@ -4048,12 +4076,21 @@ function deliverFinalOutput(
       logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
       return;
     }
+    let retryEarlierProgress = earlierProgress;
     try {
       // IPC preserves worker emission order, but progress delivery is async.
       // Wait for every earlier commentary card to be acknowledged before the
       // final answer is posted, otherwise a transient failure can make final
       // appear first and the recovered commentary arrive underneath it.
-      await earlierProgress;
+      const progressWait = await waitForEarlierProgress(earlierProgress);
+      if (progressWait === 'timed_out') {
+        retryEarlierProgress = undefined;
+        logger.warn(
+          `[${t}] Bridge final_output stopped waiting for earlier commentary after `
+          + `${FINAL_OUTPUT_PROGRESS_WAIT_MS}ms; prioritizing terminal delivery `
+          + `(turn ${msg.turnId.substring(0, 8)})`,
+        );
+      }
       if (isSessionClosed(ds)) {
         logger.info(`[${t}] Bridge final_output abandoned after progress wait — session closed`);
         return;
@@ -4157,23 +4194,6 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonFinalRecipientOpenId(ds, msg.turnId, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
-      const controls = managedReceiver ? undefined : {
-        terminalUrl: buildTerminalUrl(ds),
-        stopValue: {
-          action: 'close',
-          root_id: sessionAnchorId(ds),
-          session_id: ds.session.sessionId,
-          cli_id: effectiveCliId,
-          botmux_control: 'reply_stop',
-        },
-        manageValue: {
-          action: 'manage_access',
-          root_id: sessionAnchorId(ds),
-          session_id: ds.session.sessionId,
-          cli_id: effectiveCliId,
-          botmux_control: 'reply_manage',
-        },
-      };
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -4188,7 +4208,6 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            controls,
           })
         : buildMarkdownCard(
             safeAssistantText,
@@ -4198,7 +4217,6 @@ function deliverFinalOutput(
             ds.workingDir,
             localHomeLinkMode,
             'body',
-            controls,
           );
 
       const proposedOutput = {
@@ -4310,16 +4328,18 @@ function deliverFinalOutput(
         return;
       }
       const next = attempt + 1;
-      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
-        logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
-        // Don't commit the dedup marker — leave room for any future
-        // retransmit (e.g. daemon restart that re-fires the IPC).
-        return;
-      }
-      logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, earlierProgress);
+      const nextBackoff = FINAL_OUTPUT_RETRY_BACKOFF_MS[
+        Math.min(next, FINAL_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+      ];
+      logger.warn(
+        `[${t}] Bridge final_output attempt ${next} failed (${err.message}); `
+        + `retrying in ${nextBackoff}ms`,
+      );
+      deliverFinalOutput(ds, msg, t, next, retryEarlierProgress);
     }
-  }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
+  }, FINAL_OUTPUT_RETRY_BACKOFF_MS[
+    Math.min(attempt, FINAL_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+  ] ?? 0);
 }
 
 

@@ -232,7 +232,7 @@ export function normalizeLocalHomeLinks(
 }
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
-export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/lukecc00/botmux)';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
