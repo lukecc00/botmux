@@ -134,7 +134,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
-import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { cleanupIdleSessions, idleCleanupClosePath, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { handleDesktopCompat } from './dashboard/compat.js';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
@@ -2372,7 +2372,7 @@ const server = createServer(async (req, res) => {
         try {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
-            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+            idleCleanupClosePath(s.sessionId),
             { method: 'POST' },
           );
           const text = await upstream.text();

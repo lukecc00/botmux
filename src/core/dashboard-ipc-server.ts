@@ -320,8 +320,12 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   jsonRes(res, 404, { error: 'not_found' });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
-  const r = await closeSession(params.sessionId);
+ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
+  const suppressStopNotice = new URL(req.url ?? '/', 'http://localhost')
+    .searchParams.get('suppressStopNotice') === '1';
+  const r = suppressStopNotice
+    ? await closeSession(params.sessionId, { suppressStopNotice: true })
+    : await closeSession(params.sessionId);
   jsonRes(res, 200, r);
 });
 

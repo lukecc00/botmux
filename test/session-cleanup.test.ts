@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   cleanupIdleSessions,
+  idleCleanupClosePath,
   idleCleanupCutoffMs,
   parseIdleCleanupHours,
   selectIdleCleanupCandidates,
@@ -20,6 +21,10 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 }
 
 describe('dashboard idle session cleanup selection', () => {
+  it('uses the stop-notice-suppressed close route for dashboard bulk cleanup', () => {
+    expect(idleCleanupClosePath('sess a/b')).toBe('/api/sessions/sess%20a%2Fb/close?suppressStopNotice=1');
+  });
+
   it('accepts only the supported cleanup thresholds', () => {
     expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([24, 72, 168]);
     expect(parseIdleCleanupHours(24)).toBe(24);

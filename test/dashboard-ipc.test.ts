@@ -299,6 +299,23 @@ describe('POST /api/sessions/:sessionId/close', () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
   });
+
+  it('passes full stop-notice suppression only when explicitly requested', async () => {
+    const closeSpy = vi.spyOn(workerPool, 'closeSession')
+      .mockResolvedValue({ ok: true, alreadyClosed: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      await fetch(`${base}/api/sessions/s-normal/close`, { method: 'POST' });
+      await fetch(`${base}/api/sessions/s-bulk/close?suppressStopNotice=1`, { method: 'POST' });
+
+      expect(closeSpy).toHaveBeenNthCalledWith(1, 's-normal');
+      expect(closeSpy).toHaveBeenNthCalledWith(2, 's-bulk', { suppressStopNotice: true });
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
 });
 
 describe('POST /api/sessions/:sessionId/lock', () => {

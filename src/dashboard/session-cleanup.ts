@@ -13,6 +13,12 @@ export interface IdleCleanupSessionRow {
 
 const OPTIONS = new Set<number>(IDLE_CLEANUP_HOUR_OPTIONS);
 
+/** Dashboard bulk cleanup is deliberately silent in Lark: sweeping many stale
+ * conversations must not send a stop notice/card into every old thread. */
+export function idleCleanupClosePath(sessionId: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/close?suppressStopNotice=1`;
+}
+
 export function parseIdleCleanupHours(value: unknown): IdleCleanupHours | null {
   const normalized = value === '7d' ? 168 : Number(value);
   if (!Number.isFinite(normalized) || !OPTIONS.has(normalized)) return null;
