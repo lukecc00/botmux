@@ -136,7 +136,8 @@ describe('dashboard master feature integration', () => {
     expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-table\s*\{[\s\S]*?min-width:\s*620px;[\s\S]*?table-layout:\s*fixed;/);
     expect(css).toMatch(/\.bot-defaults-page \.bd-body \.tgm-memory-settings-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/);
     expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-row-actions\s*\{[\s\S]*?flex-wrap:\s*wrap;/);
-    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-entry-counts\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-entry-counts\s*\{[^}]*display:\s*block;[^}]*font-size:\s*11px;[^}]*white-space:\s*normal;[^}]*overflow-wrap:\s*anywhere;/);
+    expect(css).not.toMatch(/\.bot-defaults-page \.tgm-memory-entry-counts\s*\{[^}]*-webkit-line-clamp:/);
     expect(css).toContain('.tgm-memory-detail-dialog::backdrop');
     expect(css).toMatch(/\.tgm-memory-detail-body\s*\{[\s\S]*?overflow:\s*auto;/);
 

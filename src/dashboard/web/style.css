@@ -23026,13 +23026,12 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 
 .bot-defaults-page .tgm-memory-entry-counts {
-  display: -webkit-box;
-  overflow: hidden;
+  display: block;
+  font-size: 11px;
   line-height: 1.45;
+  white-space: normal;
   overflow-wrap: anywhere;
-  word-break: break-word;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  word-break: normal;
 }
 
 .bot-defaults-page .tgm-memory-row-actions {
