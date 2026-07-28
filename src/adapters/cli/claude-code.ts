@@ -656,6 +656,29 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return args;
     },
 
+    buildIsolatedStructuredRun({ schema, systemPrompt, model }) {
+      return {
+        args: [
+          '--print',
+          '--output-format', 'json',
+          '--json-schema', JSON.stringify(schema),
+          '--tools', '',
+          '--bare',
+          '--safe-mode',
+          '--setting-sources', '',
+          '--disable-slash-commands',
+          '--strict-mcp-config',
+          '--mcp-config', '{"mcpServers":{}}',
+          '--no-session-persistence',
+          '--permission-mode', 'dontAsk',
+          '--no-chrome',
+          '--system-prompt', systemPrompt,
+          ...(model?.trim() ? ['--model', model.trim()] : []),
+        ],
+        outputMode: 'stdout-json-envelope',
+      };
+    },
+
     injectsSessionContext: true,
 
     async writeInput(pty, content) {

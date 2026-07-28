@@ -114,6 +114,7 @@ import {
   stagePendingBridgeTurn,
 } from '../services/bridge-recovery-state.js';
 import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
+import { scheduleTopicGroupMemoryUpdate } from '../services/topic-group-memory-update.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -4317,6 +4318,9 @@ function deliverFinalOutput(
         completeBridgeTurn();
         sessionStore.updateSession(ds.session);
       }
+      // Delivery is acknowledged before memory persistence begins. The update
+      // remains fire-and-forget and cannot delay the user-visible final.
+      scheduleTopicGroupMemoryUpdate(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {

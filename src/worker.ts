@@ -2490,15 +2490,24 @@ function structuredBridgeIngestPath(path: string, offset: number) {
  * output, reasoning, and the terminal viewport never enter this path. */
 function ingestStructuredBridgeEvents(events: CodexBridgeEvent[]): void {
   const attributedEvents = structuredBridgeIsCodex()
-    ? events.map(event => event.kind === 'assistant_final'
-      && event.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE
-      ? {
-          ...event,
-          terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
-          terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
-          submittedInputAtTerminal: currentCodexSubmittedInput,
+    ? events.map(event => {
+        if (event.kind === 'assistant_final'
+          && event.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE) {
+          return {
+            ...event,
+            terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
+            terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
+            submittedInputAtTerminal: currentCodexSubmittedInput,
+          };
         }
-      : event)
+        if (event.kind === 'assistant_progress' && event.progressKind === 'compaction_summary') {
+          return {
+            ...event,
+            text: `${t('worker.codex_compaction_summary')}\n\n${event.text}`,
+          };
+        }
+        return event;
+      })
     : events;
   codexBridgeQueue.ingest(attributedEvents);
   for (const progress of codexBridgeQueue.drainProgressOutputs()) {

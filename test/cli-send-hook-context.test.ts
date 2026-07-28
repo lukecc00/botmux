@@ -21,6 +21,17 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
 
+  it('uses the daemon live-turn UUID for an ordinary explicit progress send', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain('let ordinaryBridgeOutputUuid');
+    expect(cmdSend).toContain('providerUuid?: unknown;');
+    expect(cmdSend).toContain('ordinaryBridgeOutputUuid = payload.providerUuid;');
+    expect(cmdSend.indexOf('ordinaryBridgeOutputUuid = payload.providerUuid;'))
+      .toBeLessThan(cmdSend.indexOf("messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive')"));
+  });
+
   it('freezes VC listener replay content and indexes only the successful primary output', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);

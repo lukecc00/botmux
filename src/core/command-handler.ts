@@ -85,6 +85,7 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -1456,6 +1457,7 @@ export async function handleCommand(
             if (hasBufferedInput) {
               const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
               ensureSessionWhiteboard(ds!);
+              const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds!);
               const followUpInput = buildNewTopicCliInput(
                 pendingPrompt,
                 ds!.session.sessionId,
@@ -1472,6 +1474,7 @@ export async function handleCommand(
                   larkAppId,
                   chatId: ds!.chatId,
                   whiteboardId: ds!.session.whiteboardId,
+                  topicGroupMemoryBlock,
                   substituteTrigger: ds!.pendingSubstituteTrigger,
                   codexAppText: ds!.pendingCodexAppText,
                   codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
@@ -1496,6 +1499,7 @@ export async function handleCommand(
           } else if (hasBufferedInput) {
             const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
             ensureSessionWhiteboard(ds!);
+            const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds!);
             const prompt = buildNewTopicCliInput(
               pendingPrompt,
               ds!.session.sessionId,
@@ -1512,6 +1516,7 @@ export async function handleCommand(
                 larkAppId,
                 chatId: ds!.chatId,
                 whiteboardId: ds!.session.whiteboardId,
+                topicGroupMemoryBlock,
                 substituteTrigger: ds!.pendingSubstituteTrigger,
                 codexAppText: ds!.pendingCodexAppText,
                 codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,

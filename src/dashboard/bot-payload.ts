@@ -57,6 +57,16 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    topicGroupMemory: {
+      enabled: j?.topicGroupMemory?.enabled === true,
+      injectMode: j?.topicGroupMemory?.injectMode === 'off' || j?.topicGroupMemory?.injectMode === 'summary-and-facts'
+        ? j.topicGroupMemory.injectMode : 'summary',
+      updateMode: j?.topicGroupMemory?.updateMode === 'off' || j?.topicGroupMemory?.updateMode === 'manual'
+        ? j.topicGroupMemory.updateMode : 'auto',
+      maxPromptChars: Number.isInteger(j?.topicGroupMemory?.maxPromptChars) ? j.topicGroupMemory.maxPromptChars : 8000,
+      maxSummaryChars: Number.isInteger(j?.topicGroupMemory?.maxSummaryChars) ? j.topicGroupMemory.maxSummaryChars : 10000,
+      httpLlm: j?.topicGroupMemory?.httpLlm,
+    },
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),

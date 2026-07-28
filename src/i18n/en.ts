@@ -740,6 +740,7 @@ export const messages: Record<string, string> = {
   'worker.exited_unexpectedly': '⚠️ The {cliName} session ended unexpectedly (worker exit code: {code}, signal: {signal}). This turn may be incomplete. Send a new message to restart and retry.',
   'worker.session_stopped': 'This conversation has stopped. Please take note.',
   'worker.session_stopped_unexpected': 'This conversation stopped unexpectedly and this turn may be incomplete. Please take note.',
+  'worker.codex_compaction_summary': 'Context was automatically compacted; continuing (this is not the final result).',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',

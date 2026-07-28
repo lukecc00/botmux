@@ -214,6 +214,28 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       return ['resume', ...baseArgs, traeSessionId];
     },
 
+    buildIsolatedStructuredRun({ schemaPath, outputPath, model }) {
+      // Supported TRAE/TraeCLI releases are Codex-family CLIs and expose the
+      // same non-interactive structured exec surface. A deployment with an
+      // older/incompatible binary fails this child only; memory update falls
+      // back to the local extractive compactor without touching the main session.
+      return {
+        args: [
+          'exec',
+          '--ephemeral',
+          '--skip-git-repo-check',
+          '--ignore-rules',
+          '--sandbox', 'read-only',
+          '--output-schema', schemaPath,
+          '--output-last-message', outputPath,
+          '--color', 'never',
+          ...(model?.trim() ? ['--model', model.trim()] : []),
+          '-',
+        ],
+        outputMode: 'output-file',
+      };
+    },
+
     buildResumeCommand({ sessionId, cliSessionId }) {
       const sid = cliSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
       if (!sid) return null;

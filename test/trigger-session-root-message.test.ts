@@ -88,6 +88,11 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
   runAutoWorktreeCommit: (...args: any[]) => mockRunAutoWorktreeCommit(...args),
 }));
 
+const mockLoadTopicGroupMemoryBlock = vi.fn(async () => '<topic_group_memory>shared context</topic_group_memory>');
+vi.mock('../src/services/topic-group-memory-runtime.js', () => ({
+  loadTopicGroupMemoryBlockForSession: (...args: any[]) => mockLoadTopicGroupMemoryBlock(...args),
+}));
+
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
 
@@ -158,6 +163,10 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
+    expect(mockLoadTopicGroupMemoryBlock).toHaveBeenCalledWith(ds);
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[11]).toMatchObject({
+      topicGroupMemoryBlock: '<topic_group_memory>shared context</topic_group_memory>',
+    });
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
   });
 
@@ -190,6 +199,9 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'delivered', target: { sessionId: 'sess_existing', chatId: CHAT } });
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockBuildFollowUpCliInput.mock.calls.at(-1)?.[2]).toMatchObject({
+      topicGroupMemoryBlock: '<topic_group_memory>shared context</topic_group_memory>',
+    });
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
   });
 

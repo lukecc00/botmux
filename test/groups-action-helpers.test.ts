@@ -93,14 +93,21 @@ describe('addBotsToGroup', () => {
 describe('disbandGroup', () => {
   it('happy: proxies to named bot, cascade-closes sessions on success', async () => {
     const closedReturn = [{ sessionId: 's1' }, { sessionId: 's2' }];
+    const clearedReturn = [{ larkAppId: 'cli_owner', chatId: 'oc_demo', cleared: true }];
     const deps = makeDeps({
       proxyToDaemon: vi.fn(async () => makeRes(200, { ok: true })),
       closeSessionsMatching: vi.fn(async () => closedReturn),
+      clearTopicGroupMemoriesForChat: vi.fn(async () => clearedReturn),
     });
     const r = await disbandGroup('oc_demo', { larkAppId: 'cli_owner' }, deps);
     expect(r.status).toBe(200);
-    expect(r.body).toEqual({ ok: true, closedSessions: closedReturn });
+    expect(r.body).toEqual({
+      ok: true,
+      closedSessions: closedReturn,
+      clearedTopicGroupMemories: clearedReturn,
+    });
     expect(deps.closeSessionsMatching).toHaveBeenCalledOnce();
+    expect(deps.clearTopicGroupMemoriesForChat).toHaveBeenCalledWith('oc_demo');
   });
 
   it('returns larkAppId_required when body lacks the field', async () => {
@@ -117,8 +124,28 @@ describe('disbandGroup', () => {
     });
     const r = await disbandGroup('oc_demo', { larkAppId: 'cli_x' }, deps);
     expect(r.status).toBe(500);
-    expect(r.body).toEqual({ ok: false, error: 'lark_denied', closedSessions: [] });
+    expect(r.body).toEqual({
+      ok: false,
+      error: 'lark_denied',
+      closedSessions: [],
+      clearedTopicGroupMemories: [],
+    });
     expect(deps.closeSessionsMatching).not.toHaveBeenCalled();
+  });
+
+  it('keeps disband successful but reports a topic-memory cleanup failure', async () => {
+    const deps = makeDeps({
+      proxyToDaemon: vi.fn(async () => makeRes(200, { ok: true })),
+      clearTopicGroupMemoriesForChat: vi.fn(async () => { throw new Error('disk_busy'); }),
+    });
+    const r = await disbandGroup('oc_demo', { larkAppId: 'cli_owner' }, deps);
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({
+      ok: true,
+      closedSessions: [],
+      clearedTopicGroupMemories: [],
+      topicGroupMemoryCleanupError: 'disk_busy',
+    });
   });
 });
 

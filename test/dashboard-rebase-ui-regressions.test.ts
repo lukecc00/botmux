@@ -105,4 +105,47 @@ describe('dashboard master feature integration', () => {
     expect(offenders).toEqual([]);
     expect(botDefaults).toContain('className="bd-field"');
   });
+
+  it('keeps topic-group memory compact in a column with names-only, scrolling, pagination, and actions', () => {
+    const page = dashboardSource('bot-defaults-page.tsx');
+    const css = dashboardSource('style.css');
+    const messages = dashboardSource('i18n.ts');
+
+    expect(page).toContain('const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10');
+    expect(page).toContain('chatDisplayTitle({ chatId })');
+    expect(page).toContain('topicGroupMemoryForDisplay');
+    expect(page).toContain('className="tgm-memory-chat"');
+    expect(page).toContain('className="tgm-memory-table-wrap"');
+    expect(page).toContain('className="tgm-memory-pagination"');
+    expect(page).toContain('className="bd-tile bd-topic-group-memory-tile"');
+    expect(page).toContain('className="tgm-memory-help"');
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryHelpSummary')");
+    expect(page).toContain('className="tgm-memory-status-strip"');
+    expect(page).toContain('data-topic-group-memory-detail-dialog');
+    expect(page).toContain('dialog.showModal()');
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryDetailClose')");
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryDelete')");
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryClearAll')");
+    expect(page).not.toContain('<code>{memory.chatId}</code>');
+    expect(page).not.toContain('<code>{props.selected.stats.chatId}</code>');
+    expect(page).not.toContain("tr('botDefaults.topicGroupMemoryUpdatedAt')");
+    expect(page).not.toContain("tr('botDefaults.topicGroupMemoryRevision')");
+    expect(page).not.toContain('className="tgm-memory-detail"');
+
+    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-table-wrap\s*\{[\s\S]*?overflow-x:\s*auto;/);
+    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-table\s*\{[\s\S]*?min-width:\s*620px;[\s\S]*?table-layout:\s*fixed;/);
+    expect(css).toMatch(/\.bot-defaults-page \.bd-body \.tgm-memory-settings-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/);
+    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-row-actions\s*\{[\s\S]*?flex-wrap:\s*wrap;/);
+    expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-entry-counts\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(css).toContain('.tgm-memory-detail-dialog::backdrop');
+    expect(css).toMatch(/\.tgm-memory-detail-body\s*\{[\s\S]*?overflow:\s*auto;/);
+
+    expect(messages).toContain("'botDefaults.topicGroupMemoryChatId': '话题群'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryHelpSummary': '适用范围说明'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryDelete': '删除'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryClearAll': '清空全部记忆'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryDetailClose': '收起'");
+    expect(messages).not.toContain("'botDefaults.topicGroupMemoryUpdatedAt': '最后更新'");
+    expect(messages).not.toContain("'botDefaults.topicGroupMemoryRevision': '版本'");
+  });
 });

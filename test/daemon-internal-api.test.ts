@@ -471,6 +471,8 @@ describe('dispatch: groups write', () => {
     deps.groupsActionDeps.proxyToDaemon = proxySpy;
     const closedSpy = vi.fn(async () => [{ sessionId: 's1' }]);
     deps.groupsActionDeps.closeSessionsMatching = closedSpy as any;
+    const clearMemorySpy = vi.fn(async () => [{ larkAppId: 'cli_owner', chatId: 'oc_x', cleared: true }]);
+    deps.groupsActionDeps.clearTopicGroupMemoriesForChat = clearMemorySpy;
     const api = createDaemonInternalApi(deps);
     const r = await api.dispatchForTest(
       'POST',
@@ -479,7 +481,9 @@ describe('dispatch: groups write', () => {
     );
     expect(r.status).toBe(200);
     expect((r.body as any).closedSessions).toEqual([{ sessionId: 's1' }]);
+    expect((r.body as any).clearedTopicGroupMemories).toEqual([{ larkAppId: 'cli_owner', chatId: 'oc_x', cleared: true }]);
     expect(closedSpy).toHaveBeenCalledOnce();
+    expect(clearMemorySpy).toHaveBeenCalledWith('oc_x');
   });
 
   it('POST /groups/:id/add-bots forwards bodyRaw verbatim', async () => {

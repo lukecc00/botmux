@@ -168,6 +168,23 @@ describe('clean Codex App document-comment input', () => {
     expect(joinedContext(additional, 'botmux_message_context')).not.toContain(promptInput.question);
     expect(joinedContext(additional, 'botmux_message_context')).toContain(promptInput.priorReplies[0].text);
   });
+
+  it('carries topic-group memory into live and refork document-comment turns', () => {
+    const memory = '<topic_group_memory>shared PRD and PPE links</topic_group_memory>';
+    for (const mode of ['live', 'refork'] as const) {
+      const { cliInput } = buildDocCommentTurnInput({
+        ds: frozenCodexSession(),
+        promptInput,
+        botCliId: 'codex-app',
+        mode,
+        topicGroupMemoryBlock: memory,
+      });
+      expect(joinedContext(
+        cliInput.codexAppInput?.additionalContext,
+        'botmux_topic_group_memory',
+      )).toBe(memory);
+    }
+  });
 });
 
 describe('buildDocWatchWarmupPrompt', () => {

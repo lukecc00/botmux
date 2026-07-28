@@ -62,6 +62,7 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { notifySessionStopped } from '../../core/session-stop-notice.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { loadTopicGroupMemoryBlockForSession } from '../../services/topic-group-memory-runtime.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -397,6 +398,9 @@ export async function commitRepoSelection(
       (ds.pendingAttachments?.length ?? 0) > 0 ||
       (ds.pendingFollowUps?.length ?? 0) > 0;
     if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
+    const topicGroupMemoryBlock = (!pendingRawInput || hasBufferedInput)
+      ? await loadTopicGroupMemoryBlockForSession(ds)
+      : '';
     const wrappedInput = (!pendingRawInput || hasBufferedInput)
       ? buildNewTopicCliInput(
           pendingPrompt,
@@ -414,6 +418,7 @@ export async function commitRepoSelection(
             larkAppId: ds.larkAppId,
             chatId: ds.chatId,
             whiteboardId: ds.session.whiteboardId,
+            topicGroupMemoryBlock,
             substituteTrigger: ds.pendingSubstituteTrigger,
             codexAppText: ds.pendingCodexAppText,
             codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
@@ -2108,6 +2113,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           (ds.pendingAttachments?.length ?? 0) > 0 ||
           (ds.pendingFollowUps?.length ?? 0) > 0;
         if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
+        const topicGroupMemoryBlock = (!pendingRawInput || hasBufferedInput)
+          ? await loadTopicGroupMemoryBlockForSession(ds)
+          : '';
         const wrappedInput = (!pendingRawInput || hasBufferedInput)
           ? buildNewTopicCliInput(
               pendingPrompt,
@@ -2125,6 +2133,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
                 larkAppId: ds.larkAppId,
                 chatId: ds.chatId,
                 whiteboardId: ds.session.whiteboardId,
+                topicGroupMemoryBlock,
                 substituteTrigger: ds.pendingSubstituteTrigger,
                 codexAppText: ds.pendingCodexAppText,
                 codexAppApplicationContext: ds.pendingCodexAppApplicationContext,

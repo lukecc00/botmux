@@ -59,6 +59,15 @@ export interface McpGatewayInstallSpec {
   readonly format: 'codex-toml' | 'claude-json';
 }
 
+export type IsolatedStructuredRunOutputMode = 'output-file' | 'stdout-json-envelope';
+
+export interface IsolatedStructuredRunSpec {
+  /** CLI arguments for a brand-new non-resumed conversation. */
+  args: string[];
+  /** Where the host reads the schema-constrained final value. */
+  outputMode: IsolatedStructuredRunOutputMode;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -105,6 +114,22 @@ export interface CliAdapter {
      *  itself is enforced worker-side, not via CLI args. */
     readIsolation?: boolean;
   }): string[];
+
+  /** Optional batch surface for a fresh, isolated structured-model task.
+   *
+   * This is intentionally separate from buildArgs(): callers must never pass a
+   * main-session resume id or drive the live TUI. Implementations use the CLI's
+   * native one-shot mode (for example `codex exec --ephemeral` or
+   * `claude --print --no-session-persistence`) and constrain the final response
+   * with the supplied JSON schema. Absence means the CLI is unsupported for
+   * background distillation and the caller must use its non-LLM fallback. */
+  buildIsolatedStructuredRun?(opts: {
+    schema: Readonly<Record<string, unknown>>;
+    schemaPath: string;
+    outputPath: string;
+    systemPrompt: string;
+    model?: string;
+  }): IsolatedStructuredRunSpec;
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
    *  The worker skips queuing the prompt for stdin write. */

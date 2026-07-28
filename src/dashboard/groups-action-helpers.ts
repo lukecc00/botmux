@@ -30,6 +30,8 @@ export interface GroupsActionDeps {
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
   /** Close sessions matching a predicate. Returns an opaque list (we just pass it through). */
   closeSessionsMatching: (predicate: (s: SessionLikeForClose) => boolean) => Promise<unknown[]>;
+  /** Delete persisted topic-group memory for a dissolved chat across bot partitions. */
+  clearTopicGroupMemoriesForChat?: (chatId: string) => Promise<unknown[]>;
   /** Override for tests; defaults to global fetch in production. */
   fetch?: typeof fetch;
 }
@@ -110,10 +112,27 @@ export async function disbandGroup(
   const { json } = await parseUpstream(upstream);
 
   let closedSessions: unknown[] = [];
+  let clearedTopicGroupMemories: unknown[] = [];
+  let topicGroupMemoryCleanupError: string | undefined;
   if (json?.ok) {
     closedSessions = await deps.closeSessionsMatching(s => s.chatId === chatId);
+    if (deps.clearTopicGroupMemoriesForChat) {
+      try {
+        clearedTopicGroupMemories = await deps.clearTopicGroupMemoriesForChat(chatId);
+      } catch (error) {
+        topicGroupMemoryCleanupError = error instanceof Error ? error.message : String(error);
+      }
+    }
   }
-  return { status: upstream.status, body: { ...(json ?? {}), closedSessions } };
+  return {
+    status: upstream.status,
+    body: {
+      ...(json ?? {}),
+      closedSessions,
+      clearedTopicGroupMemories,
+      ...(topicGroupMemoryCleanupError ? { topicGroupMemoryCleanupError } : {}),
+    },
+  };
 }
 
 /**

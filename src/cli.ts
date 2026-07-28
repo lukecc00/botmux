@@ -4451,6 +4451,34 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
+  botmux memory help
+                       显示话题群共享记忆专项帮助
+  botmux memory status [--json]
+                       查看当前 key 的 revision、更新时间、文件大小、摘要长度和各类条目数
+  botmux memory list [--lark-app-id <app>]
+                       列出当前 bot（或指定 app）的所有话题群 memory；无上下文时列出全部 bot
+  botmux memory read [--json]
+                       读取当前 memory 的完整 JSON
+  botmux memory path  打印当前 memory 文件路径
+  botmux memory append [--kind summary|fact|decision|question|contribution|resource] <text>
+                       手动追加/更新；正文可来自位置参数、stdin 或 --content-file
+       resource 参数：--resource-kind prd|experiment|ppe|config|document|design|api|repository|dashboard|other
+                       --url <https-url> [--title <标题>] [--description <说明>]
+  botmux memory compact
+                       summary 按段、文本按规范化内容、资源按 URL、贡献按 turnId 去重，
+                       保留最新项后重新执行长度/条数硬裁剪；无变化时不增加 revision
+  botmux memory clear --yes
+                       删除当前群 memory 文件（不可撤销；不会关闭、删除或合并任何 session）
+       memory 上下文：--session-id、--lark-app-id/--app-id、--chat-id、--root-message-id；
+                       会话内可自动推断。key=larkAppId+chatId，仅真正话题群 thread 自动共享。
+       默认存储上限：summary 10000 字符（可配 500–10000）；facts 100；decisions 100；
+                       openQuestions 50；resources 100；recentContributions 50；
+                       单条正文/描述 1000 字符，资源标题 300，URL 2048；无独立文件字节上限。
+       Prompt 注入： 默认最多 8000 字符（可配 500–8000）；资源优先，其次摘要，
+                       summary-and-facts 模式再加入事实/决策/问题；达到预算即停止后续条目。
+       自动写回：    final 成功投递后优先调用本地 HTTP LLM，再尝试当前会话 AI CLI 的独立临时对话；
+                       仍失败时回退本地抽取式语义压缩器，不会轮询其他 CLI；
+                       每次写入自动裁剪，compact 为不调用 LLM 的确定性维护操作。
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -4890,6 +4918,248 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   }
 
   console.error(`Unknown whiteboard command: ${action}`);
+  process.exit(1);
+}
+
+
+function currentMemoryContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; rootMessageId?: string; sessionId?: string } {
+  const sessionIdArg = argValue(args, '--session-id');
+  const sessions = loadSessions();
+  const sid = sessionIdArg || findAncestorSessionId() || undefined;
+  const session = sid ? sessions.get(sid) : undefined;
+  return {
+    session,
+    sessionId: session?.sessionId ?? sid,
+    larkAppId: argValue(args, '--lark-app-id', '--app-id') ?? session?.larkAppId ?? process.env.LARK_APP_ID,
+    chatId: argValue(args, '--chat-id') ?? session?.chatId,
+    rootMessageId: argValue(args, '--root-message-id', '--root-msg-id') ?? session?.rootMessageId,
+  };
+}
+
+function requireMemoryKey(args: string[]): { larkAppId: string; chatId: string; rootMessageId?: string; sessionId?: string } {
+  const ctx = currentMemoryContext(args);
+  if (!ctx.larkAppId || !ctx.chatId) {
+    console.error('Missing memory key. Run inside a botmux session or pass --lark-app-id <app> --chat-id <chat>.');
+    process.exit(2);
+  }
+  return { larkAppId: ctx.larkAppId, chatId: ctx.chatId, rootMessageId: ctx.rootMessageId, sessionId: ctx.sessionId };
+}
+
+const MEMORY_APPEND_BOOLEAN_FLAGS = ['--json', '--yes'];
+
+function memoryContentFromArgs(args: string[]): string {
+  const file = argValue(args, '--content-file', '--file');
+  if (file) return readFileSync(file, 'utf-8');
+  const pos = positionals(args, MEMORY_APPEND_BOOLEAN_FLAGS);
+  return pos.length > 0 ? pos.join(' ') : readStdinUtf8();
+}
+
+function missingAnyFlagValue(args: string[], flags: string[]): string | undefined {
+  return flags.find(flag => flagPresentButValueMissing(args, flag));
+}
+
+function memoryResourceDescriptionFromArgs(args: string[]): string {
+  const explicit = argValue(args, '--description');
+  if (explicit !== undefined) return explicit;
+  const file = argValue(args, '--content-file', '--file');
+  if (file) return readFileSync(file, 'utf-8');
+  // All resource flags are value-taking except the shared CLI booleans above;
+  // `positionals()` therefore skips --url/--title/--resource-kind values and
+  // only returns real trailing description text.
+  const pos = positionals(args, MEMORY_APPEND_BOOLEAN_FLAGS);
+  return pos.length > 0 ? pos.join(' ') : readStdinUtf8();
+}
+
+async function cmdMemory(sub: string, rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const action = sub || 'status';
+  if (action === 'help' || action === '--help' || action === '-h') {
+    console.log(`botmux memory <command>
+
+用途：
+  管理真正飞书话题群的共享记忆。key = larkAppId + chatId；同一 bot、同一话题群的
+  独立话题 session 共享该 memory，但 session/worker/完整历史仍按 rootMessageId 隔离。
+  普通群 thread、单聊、其它 bot、其它话题群不会共享。
+
+命令：
+  status [--json]              查看当前 key 的 revision、更新时间、文件大小和各类条目数
+  list [--lark-app-id <app>]   列出指定 bot 的所有话题群 memory；无上下文时可列出全部 bot
+  read [--json]                读取当前 memory 完整 JSON
+  path                         打印当前 memory 文件路径
+  compact                      去重并重新执行硬上限裁剪；内容未变化时不增加 revision
+  append [--kind summary|fact|decision|question|contribution|resource] <text>
+                               手动追加/更新；正文可来自位置参数、stdin 或 --content-file
+    resource 参数：--resource-kind prd|experiment|ppe|config|document|design|api|repository|dashboard|other
+                   --url <https-url> [--title <标题>] [--description <说明>]
+                   URL 仅允许 HTTP(S)，拒绝凭证及 token/signature 等敏感 query
+  clear --yes                  删除当前 memory 文件；不会删除或关闭话题 session
+
+默认存储硬上限（每个 larkAppId + chatId）：
+  summary                      10000 字符（后台可配 500–10000，默认 10000）
+  facts / decisions            各 100 条
+  openQuestions               50 条
+  resources                   100 条
+  recentContributions         50 条
+  单条 fact/decision/question、resource description、contribution summary
+                               1000 字符；资源标题 300 字符；URL 2048 字符
+  说明：当前没有单独的 JSON 文件字节上限；以上结构化上限共同约束文件增长。
+
+Prompt 注入上限：
+  默认最多 8000 字符，后台可配 500–8000。渲染顺序为安全说明 → resources → summary
+  → facts/decisions/openQuestions（仅 summary-and-facts 模式）；recentContributions 仅用于追踪去重，不注入 prompt。
+  达到预算后停止加入后续条目；summary 会在剩余预算内安全截断，并始终保持完整 XML。
+
+写入与压缩策略：
+  每次 append/自动蒸馏写入都会先 trim：单条截断，并仅保留各数组最后 N 条。
+  自动模式在 final 成功投递后，优先调用本地 HTTP LLM，再用当前会话 agent CLI 启动独立临时对话；
+  两者都失败时使用本地抽取式语义压缩，且不阻塞 final。不会尝试其他 CLI。
+  自动写入会按规范化文本/URL upsert。
+  compact 是本地抽取式语义维护：重建摘要、合并近义结构化文本、资源按安全 URL、
+  近期贡献按 turnId 去重，保留最新项，再执行同一组硬上限；它不会调用 LLM 重写摘要。
+
+Context flags:
+  --session-id, --lark-app-id/--app-id, --chat-id, --root-message-id
+
+示例：
+  botmux memory status
+  botmux memory list --lark-app-id cli_xxx
+  botmux memory append --kind decision '默认灰度 5%'
+  botmux memory append --kind resource --resource-kind prd --url https://example.com/prd --title '主 PRD'
+  botmux memory compact
+  botmux memory clear --yes`);
+    return;
+  }
+  if (action === 'list' || action === 'ls') {
+    const ctx = currentMemoryContext(rest);
+    const store = await import('./services/topic-group-memory-store.js');
+    const memories = await store.listTopicGroupMemories(ctx.larkAppId);
+    console.log(JSON.stringify({ ok: true, larkAppId: ctx.larkAppId ?? null, count: memories.length, memories }, null, 2));
+    return;
+  }
+  const { larkAppId, chatId, rootMessageId, sessionId } = requireMemoryKey(rest);
+  const store = await import('./services/topic-group-memory-store.js');
+
+  if (action === 'path') {
+    console.log(store.topicGroupMemoryPath(larkAppId, chatId));
+    return;
+  }
+  if (action === 'status') {
+    console.log(JSON.stringify({ ok: true, ...(await store.statTopicGroupMemory(larkAppId, chatId)) }, null, 2));
+    return;
+  }
+  if (action === 'read') {
+    const doc = await store.readTopicGroupMemory(larkAppId, chatId);
+    console.log(JSON.stringify({ ok: true, memory: doc }, null, 2));
+    return;
+  }
+  if (action === 'clear') {
+    if (!argFlag(rest, '--yes')) {
+      console.error('Refusing to clear topic-group memory without --yes. Existing memory files are durable and shared by topics in this group.');
+      process.exit(2);
+    }
+    const cleared = await store.clearTopicGroupMemory(larkAppId, chatId);
+    console.log(JSON.stringify({ ok: true, cleared, larkAppId, chatId }, null, 2));
+    return;
+  }
+  if (action === 'compact') {
+    const result = await store.compactTopicGroupMemory(larkAppId, chatId);
+    console.log(JSON.stringify({ ok: true, ...result }, null, 2));
+    return;
+  }
+  if (action === 'append') {
+    const missingValue = missingAnyFlagValue(rest, [
+      '--kind', '--type', '--content-file', '--file', '--lark-app-id', '--app-id', '--chat-id', '--root-message-id', '--root-msg-id', '--session-id',
+      '--resource-kind', '--url', '--title', '--description',
+    ]);
+    if (missingValue) {
+      console.error(`Missing value for ${missingValue}.`);
+      process.exit(2);
+    }
+    const kind = argValue(rest, '--kind', '--type') ?? 'fact';
+    if (!['summary', 'fact', 'decision', 'question', 'contribution', 'resource'].includes(kind)) {
+      console.error('Invalid --kind. Use summary, fact, decision, question, contribution, or resource.');
+      process.exit(2);
+    }
+    const content = kind === 'resource'
+      ? memoryResourceDescriptionFromArgs(rest).trim()
+      : memoryContentFromArgs(rest).trim();
+    if (!content && kind !== 'resource') {
+      console.error('Refusing to append empty memory. Pass text, pipe stdin, or use --content-file.');
+      process.exit(2);
+    }
+    const { containsTopicGroupMemorySensitiveText } = await import('./services/topic-group-memory-safety.js');
+    if (content && containsTopicGroupMemorySensitiveText(content)) {
+      console.error('Refusing to persist sensitive text in topic-group memory. Remove credentials, private identifiers, email addresses, or phone numbers.');
+      process.exit(2);
+    }
+    let resource: { kind: import('./services/topic-group-memory-store.js').TopicGroupMemoryResourceKind; title: string; url: string; description?: string } | undefined;
+    if (kind === 'resource') {
+      const resourceKind = argValue(rest, '--resource-kind') ?? 'other';
+      if (!store.TOPIC_GROUP_MEMORY_RESOURCE_KINDS.includes(resourceKind as any)) {
+        console.error(`Invalid --resource-kind. Use ${store.TOPIC_GROUP_MEMORY_RESOURCE_KINDS.join(', ')}.`);
+        process.exit(2);
+      }
+      const rawUrl = argValue(rest, '--url') ?? '';
+      const { safeTopicGroupMemoryUrl } = await import('./services/topic-group-memory-safety.js');
+      const url = safeTopicGroupMemoryUrl(rawUrl);
+      if (!url) {
+        console.error('Invalid or sensitive resource URL. Use an HTTP(S) URL without credentials or token/signature query parameters.');
+        process.exit(2);
+      }
+      const title = (argValue(rest, '--title') ?? content).trim().slice(0, 300);
+      if (!title) {
+        console.error('Resource title is required. Pass --title or description text.');
+        process.exit(2);
+      }
+      if (containsTopicGroupMemorySensitiveText(title)) {
+        console.error('Refusing to persist a sensitive resource title in topic-group memory.');
+        process.exit(2);
+      }
+      resource = {
+        kind: resourceKind as import('./services/topic-group-memory-store.js').TopicGroupMemoryResourceKind,
+        title,
+        url,
+        ...(content ? { description: content.slice(0, 1_000) } : {}),
+      };
+    }
+    const now = new Date().toISOString();
+    const doc = await store.mutateTopicGroupMemory(larkAppId, chatId, current => {
+      if (kind === 'summary') {
+        current.summary = current.summary ? `${current.summary}\n${content}` : content;
+      } else if (kind === 'fact') {
+        current.facts.push({ id: `fact_${randomBytes(8).toString('hex')}`, text: content, sourceRootMessageId: rootMessageId, sourceSessionId: sessionId, createdAt: now, updatedAt: now, confidence: 'confirmed' });
+      } else if (kind === 'decision') {
+        current.decisions.push({ id: `decision_${randomBytes(8).toString('hex')}`, text: content, sourceRootMessageId: rootMessageId, sourceSessionId: sessionId, createdAt: now });
+      } else if (kind === 'question') {
+        current.openQuestions.push({ id: `question_${randomBytes(8).toString('hex')}`, text: content, sourceRootMessageId: rootMessageId, sourceSessionId: sessionId, createdAt: now });
+      } else if (kind === 'resource' && resource) {
+        const duplicate = current.resources.find(entry => entry.url === resource!.url);
+        if (duplicate) {
+          duplicate.kind = resource.kind;
+          duplicate.title = resource.title;
+          duplicate.description = resource.description;
+          duplicate.updatedAt = now;
+          duplicate.confidence = 'confirmed';
+        } else {
+          current.resources.push({
+            id: `resource_${randomBytes(8).toString('hex')}`,
+            ...resource,
+            sourceRootMessageId: rootMessageId,
+            sourceSessionId: sessionId,
+            createdAt: now,
+            updatedAt: now,
+            confidence: 'confirmed',
+          });
+        }
+      } else {
+        current.recentContributions.push({ turnId: `manual_${randomBytes(8).toString('hex')}`, sessionId: sessionId ?? 'manual', rootMessageId: rootMessageId ?? 'manual', summary: content, createdAt: now });
+      }
+      return current;
+    });
+    console.log(JSON.stringify({ ok: true, memory: doc }, null, 2));
+    return;
+  }
+  console.error(`Unknown memory command: ${action}`);
   process.exit(1);
 }
 
@@ -6327,7 +6597,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Both processes share this provider UUID, closing the race atomically.
   // Payloads with attachments, attention, voice, custom cards, or explicit
   // third-party mentions keep their own side effects and are not coalesced.
-  const ordinaryBridgeOutputUuid = shouldRecordBridgeMarker
+  let ordinaryBridgeOutputUuid = shouldRecordBridgeMarker
     && !customCardRequested
     && !asVoice
     && !attention.requested
@@ -6468,7 +6738,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // Ordinary progress must look like the transcript-native first card even
     // if this explicit send wins the provider race. Ask the daemon to render
     // its canonical card (Web Terminal / stop / manage; no recipient footer).
-    // Failure is best-effort: the stable UUID still prevents two messages.
+    // The daemon also returns the provider UUID derived from its live worker
+    // turn. That value overrides this subprocess's best-effort local UUID,
+    // whose spawn-time BOTMUX_TURN_ID may be stale in a long-lived CLI.
+    // Failure is best-effort: the local UUID remains as the fallback.
     let nativeProgressCardJson: string | undefined;
     const nativeProgressEligible = noMention
       && !customCardRequested
@@ -6480,25 +6753,25 @@ async function cmdSend(rest: string[]): Promise<void> {
       && mentionArgs.length === 0
       && !sendTopLevel
       && !overrideChatId
-      && !sendInto
-      && !!currentTurnId;
+      && !sendInto;
     if (nativeProgressEligible) {
       try {
         const daemon = findDaemon(appId);
         if (daemon) {
-          const originCapability = readManagedOriginCapability(
+          const originClaim = readManagedOriginCapability(
             resolveDataDir(),
             sid,
             process.env.BOTMUX_SEND_RELAY,
-          )?.capability;
+          );
           const request = {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
               content,
-              originCapability,
-              originTurnId: currentTurnId,
-              originDispatchAttempt: trustedRelayCtx?.dispatchAttempt
+              originCapability: originClaim?.capability,
+              originTurnId: originClaim?.turnId ?? currentTurnId,
+              originDispatchAttempt: originClaim?.dispatchAttempt
+                ?? trustedRelayCtx?.dispatchAttempt
                 ?? liveMarkerCtx?.dispatchAttempt
                 ?? ancestorCtx?.dispatchAttempt,
             }),
@@ -6510,8 +6783,14 @@ async function cmdSend(rest: string[]): Promise<void> {
             ? await fetchDaemonIpc(daemon.ipcPort, path, request, secret)
             : await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, request);
           if (response.ok) {
-            const payload = await response.json() as { cardJson?: unknown };
+            const payload = await response.json() as {
+              cardJson?: unknown;
+              providerUuid?: unknown;
+            };
             if (typeof payload.cardJson === 'string') nativeProgressCardJson = payload.cardJson;
+            if (typeof payload.providerUuid === 'string' && payload.providerUuid) {
+              ordinaryBridgeOutputUuid = payload.providerUuid;
+            }
           }
         }
       } catch { /* fall back to the ordinary card; UUID dedupe remains active */ }
@@ -8865,6 +9144,7 @@ switch (command) {
   case 'cd':      await cmdCd(); break;
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'memory': await cmdMemory(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
     // `botmux ask --options ...`         → sub='',        rest=['--options', ...]  (bare alias)

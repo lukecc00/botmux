@@ -4,21 +4,27 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about three `response_item.payload.type === 'message'`
- * shapes:
+ * fallback cares about two `response_item.payload.type === 'message'` shapes
+ * plus Codex's authoritative turn-completion event:
  *
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=commentary      → a model-authored, user-facing progress update
- *   - role=assistant +
- *     phase=final_answer    → the model's final reply (output_text content)
+ *   - role=assistant + phase=final_answer + "Handoff Summary..."
+ *                            → automatic context-compaction notice (progress)
+ *   - event_msg.task_complete with last_agent_message
+ *                            → the model's final reply
  *
  * Why almost all `event_msg` records are ignored:
- *   - `response_item` is the canonical transcript record; `event_msg` is a
- *     UI-event stream that can carry the same final text via two channels
- *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
- *     Picking `response_item` keeps the reader to a single source of truth
- *     and avoids any chance of double-emit if both paths are present.
+ *   - `response_item` is canonical for user prompts and commentary, but not
+ *     for turn completion. Codex also writes `phase=final_answer` while doing
+ *     an automatic context compaction: that message is a Handoff Summary for
+ *     the continuation model, not the answer that should terminate the Lark
+ *     turn. Only `event_msg.task_complete` proves the outer Codex turn ended.
+ *     Its `last_agent_message` is therefore the sole normal final-output
+ *     source. Handoff Summary records are still surfaced as progress so the
+ *     user can see that context compaction happened, but they never close the
+ *     Lark turn.
  *   - Narrow exceptions are structured error records and `task_complete` with
  *     no `last_agent_message`. Codex writes the latter both for intentionally
  *     answer-less turns and failed turns. Some releases nest
@@ -133,6 +139,10 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+  /** Non-terminal progress subtype. Context-compaction summaries are shown to
+   * the user with locale-specific chrome by the worker, but remain ordinary
+   * progress for queueing/retry semantics. */
+  progressKind?: 'compaction_summary';
   /** Structured terminal upgrade that may arrive before or after the empty
    * task_complete boundary. It upgrades the currently collecting or most
    * recently closed ambiguous turn without creating a second final. */
@@ -363,6 +373,10 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+function isHandoffSummaryText(text: string): boolean {
+  return /^Handoff Summary\b/i.test(text.trim());
+}
+
 function codexErrorInfo(payload: unknown): string | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
   if (typeof (payload as any).codex_error_info === 'string') {
@@ -431,21 +445,25 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       });
       continue;
     }
-    if (obj?.type === 'event_msg'
-      && obj.payload?.type === 'task_complete'
-      && (typeof obj.payload.last_agent_message !== 'string'
-        || obj.payload.last_agent_message.trim().length === 0)) {
+    if (obj?.type === 'event_msg' && obj.payload?.type === 'task_complete') {
+      const lastAgentMessage = typeof obj.payload.last_agent_message === 'string'
+        ? obj.payload.last_agent_message
+        : '';
       const errorInfo = codexErrorInfo(obj.payload);
       const contextWindowExceeded = isContextWindowErrorInfo(errorInfo);
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
-        text: '',
-        terminalStatus: contextWindowExceeded ? 'failed' : 'ambiguous',
+        text: lastAgentMessage,
+        terminalStatus: contextWindowExceeded
+          ? 'failed'
+          : (lastAgentMessage.trim().length > 0 ? 'completed' : 'ambiguous'),
         terminalErrorCode: contextWindowExceeded
           ? 'codex_context_window_exceeded'
-          : 'codex_task_complete_without_final_candidate',
+          : (lastAgentMessage.trim().length > 0
+              ? undefined
+              : 'codex_task_complete_without_final_candidate'),
       });
       continue;
     }
@@ -456,14 +474,24 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && (p.phase === 'commentary' || p.phase === 'final_answer')) {
+    } else if (p.role === 'assistant' && p.phase === 'commentary') {
       const text = joinTextBlocks(p.content, 'output_text');
       if (!text) continue;
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
-        kind: p.phase === 'commentary' ? 'assistant_progress' : 'assistant_final',
+        kind: 'assistant_progress',
         text,
+      });
+    } else if (p.role === 'assistant' && p.phase === 'final_answer') {
+      const text = joinTextBlocks(p.content, 'output_text');
+      if (!text || !isHandoffSummaryText(text)) continue;
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_progress',
+        text,
+        progressKind: 'compaction_summary',
       });
     }
     // Skip role=developer (instructions) and any reasoning / function_call*

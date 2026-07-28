@@ -108,6 +108,7 @@ export function buildDocWatchWarmupTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  topicGroupMemoryBlock?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocWatchWarmupPrompt(promptInput);
@@ -125,6 +126,7 @@ export function buildDocWatchWarmupTurnInput(args: {
         larkAppId: ds.larkAppId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
+        topicGroupMemoryBlock: args.topicGroupMemoryBlock,
         codexAppText,
         codexAppApplicationContext: promptContent,
       }),
@@ -137,6 +139,7 @@ export function buildDocWatchWarmupTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      topicGroupMemoryBlock: args.topicGroupMemoryBlock,
       codexAppText,
       codexAppApplicationContext: promptContent,
     }),
@@ -256,6 +259,7 @@ export function buildDocCommentTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  topicGroupMemoryBlock?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocCommentPrompt(promptInput);
@@ -289,6 +293,7 @@ export function buildDocCommentTurnInput(args: {
         larkAppId: ds.larkAppId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
+        topicGroupMemoryBlock: args.topicGroupMemoryBlock,
         ...cleanContext,
       }),
     };
@@ -300,6 +305,7 @@ export function buildDocCommentTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      topicGroupMemoryBlock: args.topicGroupMemoryBlock,
       ...cleanContext,
     }),
   };

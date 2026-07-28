@@ -16,6 +16,8 @@ import {
   type BotSubstituteTarget,
   type CliOptionsState,
   type SubstituteTargetResolution,
+  type TopicGroupMemoryDocument,
+  type TopicGroupMemoryStats,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -28,11 +30,11 @@ import {
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { botAvatarHtml, chatDisplayTitle, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string>;
+type CardPrefPatch = Record<string, boolean | string | number | Record<string, unknown>>;
 
 type JsonResponse = {
   ok: boolean;
@@ -262,6 +264,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
+    topicGroupMemory: body.topicGroupMemory,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
     docSubscribeDefaultMode: body.docSubscribeDefaultMode,
@@ -519,6 +522,9 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
             <SubstituteModeSection bot={bot} patchBot={patchBot} />
             <CrossBotSection bot={bot} putCardPref={putCardPref} />
             <SessionCapSection bot={bot} patchBot={patchBot} />
+          </section>
+          <section className="bd-tile bd-topic-group-memory-tile">
+            <TopicGroupMemorySection bot={bot} putCardPref={putCardPref} />
           </section>
           <section className="bd-tile">
             <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
@@ -2450,6 +2456,518 @@ function mentionMode(bot: BotDefaultsRow): string {
   return bot.regularGroupMentionMode === 'topic' || bot.regularGroupMentionMode === 'never' || bot.regularGroupMentionMode === 'ambient'
     ? bot.regularGroupMentionMode
     : 'always';
+}
+
+type TopicGroupMemorySelection = {
+  stats: TopicGroupMemoryStats;
+  memory: TopicGroupMemoryDocument | null;
+};
+
+const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10;
+
+function topicGroupMemoryChatName(chatId: string, fallback: string): string {
+  return chatDisplayTitle({ chatId })?.trim() || fallback;
+}
+
+function topicGroupMemoryForDisplay(memory: TopicGroupMemoryDocument | null): Record<string, unknown> | null {
+  if (!memory) return null;
+  const { larkAppId: _larkAppId, chatId: _chatId, ...visible } = memory;
+  return visible;
+}
+
+function TopicGroupMemoryDetailDialog(props: {
+  selected: TopicGroupMemorySelection | null;
+  onClose(): void;
+}) {
+  const tr = useT();
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const chatName = props.selected
+    ? topicGroupMemoryChatName(props.selected.stats.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))
+    : null;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (props.selected && !dialog.open) {
+      try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
+    } else if (!props.selected && dialog.open) {
+      dialog.close();
+    }
+  }, [props.selected]);
+
+  useEffect(() => () => {
+    const dialog = dialogRef.current;
+    if (dialog?.open) dialog.close();
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="tgm-memory-detail-dialog"
+      data-topic-group-memory-detail-dialog
+      aria-label={chatName ? tr('botDefaults.topicGroupMemoryDetail', { name: chatName }) : undefined}
+      onCancel={event => {
+        event.preventDefault();
+        props.onClose();
+      }}
+      onClose={props.onClose}
+      onClick={event => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      {props.selected && chatName ? (
+        <article className="tgm-memory-detail-card">
+          <header className="tgm-memory-detail-head">
+            <div className="tgm-memory-detail-title">
+              <h3>{tr('botDefaults.topicGroupMemoryDetail', { name: chatName })}</h3>
+            </div>
+            <button type="button" onClick={props.onClose}>
+              {tr('botDefaults.topicGroupMemoryDetailClose')}
+            </button>
+          </header>
+          <div className="tgm-memory-detail-body">
+            <pre>{JSON.stringify(topicGroupMemoryForDisplay(props.selected.memory), null, 2)}</pre>
+          </div>
+        </article>
+      ) : null}
+    </dialog>
+  );
+}
+
+function TopicGroupMemorySection(props: {
+  bot: BotDefaultsRow;
+  putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
+}) {
+  const tr = useT();
+  const current = props.bot.topicGroupMemory ?? {};
+  const [enabled, setEnabled] = useState(current.enabled === true);
+  const [injectMode, setInjectMode] = useState<'off' | 'summary' | 'summary-and-facts'>(
+    current.injectMode === 'off' || current.injectMode === 'summary-and-facts' ? current.injectMode : 'summary',
+  );
+  const [updateMode, setUpdateMode] = useState<'off' | 'manual' | 'auto'>(
+    current.updateMode === 'off' || current.updateMode === 'manual' ? current.updateMode : 'auto',
+  );
+  const [maxPromptChars, setMaxPromptChars] = useState(String(current.maxPromptChars ?? 8000));
+  const [maxSummaryChars, setMaxSummaryChars] = useState(String(current.maxSummaryChars ?? 10000));
+  const [httpEnabled, setHttpEnabled] = useState(current.httpLlm?.enabled !== false);
+  const [httpAutoDiscover, setHttpAutoDiscover] = useState(current.httpLlm?.autoDiscoverCodex !== false);
+  const [httpBaseUrl, setHttpBaseUrl] = useState(current.httpLlm?.baseUrl ?? '');
+  const [httpModel, setHttpModel] = useState(current.httpLlm?.model ?? '');
+  const [httpApi, setHttpApi] = useState<'auto' | 'responses' | 'chat-completions'>(
+    current.httpLlm?.api === 'responses' || current.httpLlm?.api === 'chat-completions' ? current.httpLlm.api : 'auto',
+  );
+  const [httpTimeoutMs, setHttpTimeoutMs] = useState(String(current.httpLlm?.timeoutMs ?? 60000));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const [memories, setMemories] = useState<TopicGroupMemoryStats[]>([]);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
+  const [selectedMemory, setSelectedMemory] = useState<TopicGroupMemorySelection | null>(null);
+  const [memoryPage, setMemoryPage] = useState(1);
+
+  useEffect(() => {
+    const next = props.bot.topicGroupMemory ?? {};
+    setEnabled(next.enabled === true);
+    setInjectMode(next.injectMode === 'off' || next.injectMode === 'summary-and-facts' ? next.injectMode : 'summary');
+    setUpdateMode(next.updateMode === 'off' || next.updateMode === 'manual' ? next.updateMode : 'auto');
+    setMaxPromptChars(String(next.maxPromptChars ?? 8000));
+    setMaxSummaryChars(String(next.maxSummaryChars ?? 10000));
+    setHttpEnabled(next.httpLlm?.enabled !== false);
+    setHttpAutoDiscover(next.httpLlm?.autoDiscoverCodex !== false);
+    setHttpBaseUrl(next.httpLlm?.baseUrl ?? '');
+    setHttpModel(next.httpLlm?.model ?? '');
+    setHttpApi(next.httpLlm?.api === 'responses' || next.httpLlm?.api === 'chat-completions' ? next.httpLlm.api : 'auto');
+    setHttpTimeoutMs(String(next.httpLlm?.timeoutMs ?? 60000));
+  }, [props.bot.topicGroupMemory]);
+
+  const memoryBaseUrl = `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-group-memory`;
+
+  const loadMemories = useCallback(async (): Promise<void> => {
+    setMemoryBusy(true);
+    setMemoryStatus(null);
+    try {
+      const res = await sendJson('GET', memoryBaseUrl);
+      if (!res.ok || !Array.isArray(res.body?.memories)) {
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      const nextMemories = res.body.memories as TopicGroupMemoryStats[];
+      setMemories(nextMemories);
+      setMemoryPage(currentPage => Math.min(
+        currentPage,
+        Math.max(1, Math.ceil(nextMemories.length / TOPIC_GROUP_MEMORY_PAGE_SIZE)),
+      ));
+    } catch (error) {
+      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }, [memoryBaseUrl]);
+
+  useEffect(() => {
+    setMemories([]);
+    setSelectedMemory(null);
+    setMemoryPage(1);
+    void loadMemories();
+  }, [loadMemories]);
+
+  async function viewMemory(chatId: string): Promise<void> {
+    setMemoryBusy(true);
+    setMemoryStatus(null);
+    try {
+      const res = await sendJson('GET', `${memoryBaseUrl}/${encodeURIComponent(chatId)}`);
+      if (!res.ok || !res.body?.stats) {
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      setSelectedMemory({ stats: res.body.stats, memory: res.body.memory ?? null });
+    } catch (error) {
+      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function compactMemory(chatId: string): Promise<void> {
+    setMemoryBusy(true);
+    setMemoryStatus(null);
+    try {
+      const res = await sendJson('POST', `${memoryBaseUrl}/${encodeURIComponent(chatId)}/compact`);
+      if (!res.ok) {
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      setMemoryStatus({
+        text: `✓ ${tr(res.body.compacted ? 'botDefaults.topicGroupMemoryCompacted' : 'botDefaults.topicGroupMemoryCompactNoop')}`,
+        ok: true,
+      });
+      if (res.body.stats) setSelectedMemory({ stats: res.body.stats, memory: res.body.doc ?? null });
+      await loadMemories();
+    } catch (error) {
+      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function deleteMemory(chatId: string): Promise<void> {
+    const chatName = topicGroupMemoryChatName(chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'));
+    if (!window.confirm(tr('botDefaults.topicGroupMemoryDeleteConfirm', { group: chatName }))) return;
+    setMemoryBusy(true);
+    setMemoryStatus(null);
+    try {
+      const res = await sendJson('DELETE', `${memoryBaseUrl}/${encodeURIComponent(chatId)}`);
+      if (!res.ok) {
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      if (selectedMemory?.stats.chatId === chatId) setSelectedMemory(null);
+      setMemoryStatus({ text: `✓ ${tr('botDefaults.topicGroupMemoryDeleted')}`, ok: true });
+      await loadMemories();
+    } catch (error) {
+      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function clearAllMemories(): Promise<void> {
+    if (memories.length === 0) return;
+    if (!window.confirm(tr('botDefaults.topicGroupMemoryClearAllConfirm', { count: memories.length }))) return;
+    setMemoryBusy(true);
+    setMemoryStatus(null);
+    try {
+      const res = await sendJson('POST', memoryBaseUrl);
+      if (!res.ok) {
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      setSelectedMemory(null);
+      setMemoryStatus({ text: `✓ ${tr('botDefaults.topicGroupMemoryClearedAll', { count: res.body.count ?? memories.length })}`, ok: true });
+      await loadMemories();
+    } catch (error) {
+      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function save(patch: Record<string, unknown>): Promise<boolean> {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ topicGroupMemory: patch });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+        return true;
+      }
+      setStatus({ text: `✗ ${responseErrorText(res)}` });
+      return false;
+    } catch (error) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveLimits(): Promise<void> {
+    const promptChars = Number(maxPromptChars);
+    const summaryChars = Number(maxSummaryChars);
+    if (!Number.isInteger(promptChars) || promptChars < 500 || promptChars > 8_000
+      || !Number.isInteger(summaryChars) || summaryChars < 500 || summaryChars > 10_000) {
+      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryLimitsInvalid')}` });
+      return;
+    }
+    await save({ maxPromptChars: promptChars, maxSummaryChars: summaryChars });
+  }
+
+  async function saveHttpLlm(): Promise<void> {
+    const timeoutMs = Number(httpTimeoutMs);
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
+      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryHttpTimeoutInvalid')}` });
+      return;
+    }
+    await save({
+      httpLlm: {
+        enabled: httpEnabled,
+        autoDiscoverCodex: httpAutoDiscover,
+        baseUrl: httpBaseUrl.trim(),
+        model: httpModel.trim(),
+        api: httpApi,
+        timeoutMs,
+      },
+    });
+  }
+
+  const injectOptions: DropdownFieldOption<'off' | 'summary' | 'summary-and-facts'>[] = [
+    { value: 'off', label: tr('botDefaults.topicGroupMemoryInjectOff') },
+    { value: 'summary', label: tr('botDefaults.topicGroupMemoryInjectSummary') },
+    { value: 'summary-and-facts', label: tr('botDefaults.topicGroupMemoryInjectFacts') },
+  ];
+  const updateOptions: DropdownFieldOption<'off' | 'manual' | 'auto'>[] = [
+    { value: 'off', label: tr('botDefaults.topicGroupMemoryUpdateOff') },
+    { value: 'manual', label: tr('botDefaults.topicGroupMemoryUpdateManual') },
+    { value: 'auto', label: tr('botDefaults.topicGroupMemoryUpdateAuto') },
+  ];
+  const httpApiOptions: DropdownFieldOption<'auto' | 'responses' | 'chat-completions'>[] = [
+    { value: 'auto', label: tr('botDefaults.topicGroupMemoryHttpApiAuto') },
+    { value: 'responses', label: 'Responses API' },
+    { value: 'chat-completions', label: 'Chat Completions API' },
+  ];
+  const memoryTotalPages = Math.max(1, Math.ceil(memories.length / TOPIC_GROUP_MEMORY_PAGE_SIZE));
+  const safeMemoryPage = Math.min(memoryPage, memoryTotalPages);
+  const memoryPageStart = (safeMemoryPage - 1) * TOPIC_GROUP_MEMORY_PAGE_SIZE;
+  const visibleMemories = memories.slice(memoryPageStart, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
+  const memoryPageFrom = memories.length === 0 ? 0 : memoryPageStart + 1;
+  const memoryPageTo = Math.min(memories.length, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
+
+  return (
+    <section className="bd-section tgm-memory-section" data-topic-group-memory>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTopicGroupMemory')}</h3>
+      <details className="tgm-memory-help">
+        <summary>{tr('botDefaults.topicGroupMemoryHelpSummary')}</summary>
+        <p>{tr('botDefaults.topicGroupMemoryHelp')}</p>
+      </details>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-topic-group-memory"
+        title={tr('botDefaults.topicGroupMemoryEnabled')}
+        help={tr('botDefaults.topicGroupMemoryEnabledHelp')}
+        onChange={next => {
+          const previous = enabled;
+          setEnabled(next);
+          void save({ enabled: next }).then(ok => { if (!ok) setEnabled(previous); });
+        }}
+      />
+      <div className="bd-row tgm-memory-settings-grid">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.topicGroupMemoryInjectHelp')}>{tr('botDefaults.topicGroupMemoryInjectMode')}</FieldTitle>
+          <DropdownField
+            dataInput="topicGroupMemoryInjectMode"
+            value={injectMode}
+            disabled={busy}
+            options={injectOptions}
+            onChange={next => {
+              const previous = injectMode;
+              setInjectMode(next);
+              void save({ injectMode: next }).then(ok => { if (!ok) setInjectMode(previous); });
+            }}
+          />
+        </div>
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.topicGroupMemoryUpdateHelp')}>{tr('botDefaults.topicGroupMemoryUpdateMode')}</FieldTitle>
+          <DropdownField
+            dataInput="topicGroupMemoryUpdateMode"
+            value={updateMode}
+            disabled={busy}
+            options={updateOptions}
+            onChange={next => {
+              const previous = updateMode;
+              setUpdateMode(next);
+              void save({ updateMode: next }).then(ok => { if (!ok) setUpdateMode(previous); });
+            }}
+          />
+        </div>
+      </div>
+      <div className="bd-row tgm-memory-settings-grid">
+        <label>
+          <span>{tr('botDefaults.topicGroupMemoryMaxPromptChars')}</span>
+          <input type="number" min="500" max="8000" value={maxPromptChars} disabled={busy} onChange={event => setMaxPromptChars(event.currentTarget.value)} />
+        </label>
+        <label>
+          <span>{tr('botDefaults.topicGroupMemoryMaxSummaryChars')}</span>
+          <input type="number" min="500" max="10000" value={maxSummaryChars} disabled={busy} onChange={event => setMaxSummaryChars(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" disabled={busy} data-action="save-topic-group-memory-limits" onClick={() => void saveLimits()}>
+          {tr('botDefaults.save')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-topic-group-memory-status': '' }} />
+      </div>
+      <div className="bd-subsection tgm-memory-http-llm">
+        <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryHttpTitle')}</h4>
+        <p className="bd-section-help">{tr('botDefaults.topicGroupMemoryHttpHelp')}</p>
+        <ToggleRow
+          checked={httpEnabled}
+          disabled={busy}
+          dataAction="toggle-topic-group-memory-http"
+          title={tr('botDefaults.topicGroupMemoryHttpEnabled')}
+          help={tr('botDefaults.topicGroupMemoryHttpEnabledHelp')}
+          onChange={setHttpEnabled}
+        />
+        <ToggleRow
+          checked={httpAutoDiscover}
+          disabled={busy || !httpEnabled}
+          dataAction="toggle-topic-group-memory-http-discovery"
+          title={tr('botDefaults.topicGroupMemoryHttpAutoDiscover')}
+          help={tr('botDefaults.topicGroupMemoryHttpAutoDiscoverHelp')}
+          onChange={setHttpAutoDiscover}
+        />
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryHttpBaseUrl')}</span>
+            <input type="text" placeholder="http://127.0.0.1:8787/v1" value={httpBaseUrl} disabled={busy || !httpEnabled} onChange={event => setHttpBaseUrl(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryHttpModel')}</span>
+            <input type="text" placeholder={tr('botDefaults.topicGroupMemoryHttpModelPlaceholder')} value={httpModel} disabled={busy || !httpEnabled} onChange={event => setHttpModel(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="bd-row tgm-memory-settings-grid">
+          <div className="bd-field">
+            <span>{tr('botDefaults.topicGroupMemoryHttpApi')}</span>
+            <DropdownField dataInput="topicGroupMemoryHttpApi" value={httpApi} disabled={busy || !httpEnabled} options={httpApiOptions} onChange={value => setHttpApi(value as 'auto' | 'responses' | 'chat-completions')} />
+          </div>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryHttpTimeout')}</span>
+            <input type="number" min="1000" max="300000" step="1000" value={httpTimeoutMs} disabled={busy || !httpEnabled} onChange={event => setHttpTimeoutMs(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="actions">
+          <button type="button" className="primary" disabled={busy} onClick={() => void saveHttpLlm()}>{tr('botDefaults.save')}</button>
+        </div>
+      </div>
+      <div className="bd-subsection tgm-memory-management">
+        <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryManagement')}</h4>
+        <div className="tgm-memory-status-strip" data-topic-group-memory-summary>
+          <span>{enabled ? tr('botDefaults.topicGroupMemoryStateEnabled') : tr('botDefaults.topicGroupMemoryStateDisabled')}</span>
+          <span>{tr('botDefaults.topicGroupMemoryCountSummary', { count: memories.length })}</span>
+          <span>{tr('botDefaults.topicGroupMemorySizeSummary', { size: formatMemoryBytes(memories.reduce((sum, item) => sum + item.sizeBytes, 0)) })}</span>
+        </div>
+        <div className="actions">
+          <button type="button" disabled={memoryBusy} onClick={() => void loadMemories()}>
+            {tr('botDefaults.topicGroupMemoryRefresh')}
+          </button>
+          <button type="button" className="danger" disabled={memoryBusy || memories.length === 0} onClick={() => void clearAllMemories()}>
+            {tr('botDefaults.topicGroupMemoryClearAll')}
+          </button>
+          <StatusSpan status={memoryStatus} attr={{ 'data-topic-group-memory-management-status': '' }} />
+        </div>
+        {memories.length === 0 && !memoryBusy
+          ? <div className="tgm-memory-empty">{tr('botDefaults.topicGroupMemoryEmpty')}</div>
+          : (
+            <div className="tgm-memory-table-shell">
+              <div
+                className="tgm-memory-table-wrap"
+                tabIndex={0}
+                role="region"
+                aria-label={tr('botDefaults.topicGroupMemoryTableScrollLabel')}
+              >
+                <table className="tgm-memory-table">
+                  <thead>
+                    <tr>
+                      <th>{tr('botDefaults.topicGroupMemoryChatId')}</th>
+                      <th>{tr('botDefaults.topicGroupMemorySize')}</th>
+                      <th>{tr('botDefaults.topicGroupMemoryEntries')}</th>
+                      <th>{tr('botDefaults.topicGroupMemoryActions')}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleMemories.map(memory => (
+                      <tr key={memory.chatId}>
+                        <td data-label={tr('botDefaults.topicGroupMemoryChatId')}>
+                          <div className="tgm-memory-chat">
+                            <strong>{topicGroupMemoryChatName(memory.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))}</strong>
+                          </div>
+                          {memory.error ? <small className="hint-warn-inline">{memory.error}</small> : null}
+                        </td>
+                        <td data-label={tr('botDefaults.topicGroupMemorySize')}>{formatMemoryBytes(memory.sizeBytes)}</td>
+                        <td data-label={tr('botDefaults.topicGroupMemoryEntries')}>
+                          <span className="tgm-memory-entry-counts">{tr('botDefaults.topicGroupMemoryEntryCounts', {
+                            facts: memory.facts,
+                            decisions: memory.decisions,
+                            questions: memory.openQuestions,
+                            resources: memory.resources,
+                            contributions: memory.recentContributions,
+                          })}</span>
+                        </td>
+                        <td data-label={tr('botDefaults.topicGroupMemoryActions')}>
+                          <div className="tgm-memory-row-actions">
+                            <button type="button" disabled={memoryBusy || !!memory.error} onClick={() => void viewMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryView')}</button>
+                            <button type="button" disabled={memoryBusy || !!memory.error} onClick={() => void compactMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryCompact')}</button>
+                            <button type="button" className="danger" disabled={memoryBusy} onClick={() => void deleteMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryDelete')}</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <nav className="tgm-memory-pagination" aria-label={tr('botDefaults.topicGroupMemoryPaginationLabel')}>
+                <span className="tgm-memory-pagination-status" aria-live="polite">
+                  {tr('botDefaults.topicGroupMemoryPageStatus', {
+                    page: safeMemoryPage,
+                    pages: memoryTotalPages,
+                    from: memoryPageFrom,
+                    to: memoryPageTo,
+                    total: memories.length,
+                  })}
+                </span>
+                <div className="tgm-memory-pagination-actions">
+                  <button type="button" disabled={safeMemoryPage <= 1 || memoryBusy} onClick={() => setMemoryPage(safeMemoryPage - 1)}>
+                    {tr('botDefaults.topicGroupMemoryPrevPage')}
+                  </button>
+                  <button type="button" disabled={safeMemoryPage >= memoryTotalPages || memoryBusy} onClick={() => setMemoryPage(safeMemoryPage + 1)}>
+                    {tr('botDefaults.topicGroupMemoryNextPage')}
+                  </button>
+                </div>
+              </nav>
+            </div>
+          )}
+        <TopicGroupMemoryDetailDialog selected={selectedMemory} onClose={() => setSelectedMemory(null)} />
+      </div>
+    </section>
+  );
+}
+
+function formatMemoryBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {

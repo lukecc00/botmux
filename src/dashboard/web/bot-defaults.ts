@@ -79,6 +79,21 @@ export type BotDefaultsRow = {
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnNewTopic?: boolean;
+  topicGroupMemory?: {
+    enabled?: boolean;
+    injectMode?: 'off' | 'summary' | 'summary-and-facts';
+    updateMode?: 'off' | 'manual' | 'auto';
+    maxPromptChars?: number;
+    maxSummaryChars?: number;
+    httpLlm?: {
+      enabled?: boolean;
+      autoDiscoverCodex?: boolean;
+      baseUrl?: string;
+      model?: string;
+      api?: 'auto' | 'responses' | 'chat-completions';
+      timeoutMs?: number;
+    };
+  };
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   messageQuotaDefaultLimit?: number | null;
@@ -90,6 +105,38 @@ export type BotDefaultsRow = {
   teamRole?: string;
   teamRoleLoading?: boolean;
   error?: string;
+};
+
+export type TopicGroupMemoryStats = {
+  larkAppId: string;
+  chatId: string;
+  path: string;
+  exists: boolean;
+  hasContent: boolean;
+  revision: number | null;
+  updatedAt: string | null;
+  sizeBytes: number;
+  summaryChars: number;
+  facts: number;
+  decisions: number;
+  openQuestions: number;
+  resources: number;
+  recentContributions: number;
+  error?: string;
+};
+
+export type TopicGroupMemoryDocument = {
+  schemaVersion: number;
+  larkAppId: string;
+  chatId: string;
+  updatedAt: string;
+  revision: number;
+  summary: string;
+  facts: unknown[];
+  decisions: unknown[];
+  openQuestions: unknown[];
+  resources: unknown[];
+  recentContributions: unknown[];
 };
 
 export type LoadBotsResult = {

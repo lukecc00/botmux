@@ -154,6 +154,7 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import { clearTopicGroupMemoriesForChat } from './services/topic-group-memory-store.js';
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -835,6 +836,7 @@ const groupsActionDeps: GroupsActionDeps = {
   registryGetByAppId: (id) => registry.getByAppId(id),
   proxyToDaemon,
   closeSessionsMatching,
+  clearTopicGroupMemoriesForChat,
   fetch: fetchDaemonUrl,
 };
 
@@ -3657,6 +3659,31 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    // Topic-group memory status and maintenance. The selected bot daemon owns
+    // the larkAppId partition, so the public dashboard never accepts an app id
+    // inside the memory-store key itself.
+    let mBotMemory: RegExpMatchArray | null;
+    if ((mBotMemory = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-group-memory(?:\/([^/]+)(?:\/(compact))?)?$/))) {
+      const appId = decodeURIComponent(mBotMemory[1]);
+      const chatId = mBotMemory[2] ? decodeURIComponent(mBotMemory[2]) : undefined;
+      const operation = mBotMemory[3];
+      const supported = (req.method === 'GET' && !operation)
+        || (req.method === 'POST' && !chatId && !operation)
+        || (req.method === 'POST' && !!chatId && operation === 'compact')
+        || (req.method === 'DELETE' && !!chatId && !operation);
+      if (supported) {
+        const upstreamPath = req.method === 'POST' && !chatId
+          ? '/api/topic-group-memory/clear'
+          : chatId
+          ? `/api/topic-group-memory/${encodeURIComponent(chatId)}${operation ? `/${operation}` : ''}`
+          : '/api/topic-group-memory';
+        const upstream = await proxyToDaemon(appId, upstreamPath, { method: req.method });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
     }
 
     // PUT /api/bots/:appId/substitute-mode — proxy to that bot's daemon. Body

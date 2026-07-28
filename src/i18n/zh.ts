@@ -743,6 +743,7 @@ export const messages: Record<string, string> = {
   'worker.exited_unexpectedly': '⚠️ {cliName} 会话异常结束（worker exit code: {code}，signal: {signal}），本轮结果可能不完整。请发送新消息重新启动并重试。',
   'worker.session_stopped': '当前对话已经停止，请关注。',
   'worker.session_stopped_unexpected': '当前对话因异常已经停止，本轮结果可能不完整，请关注。',
+  'worker.codex_compaction_summary': '上下文已自动压缩，继续执行中（这不是最终结果）。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

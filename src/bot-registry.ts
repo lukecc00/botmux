@@ -31,6 +31,27 @@ export type {
 } from './types.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+export interface TopicGroupMemoryHttpLlmConfig {
+  /** Prefer a loopback OpenAI-compatible HTTP endpoint before local CLIs. */
+  enabled?: boolean;
+  /** Discover the active loopback provider from CODEX_HOME/config.toml. */
+  autoDiscoverCodex?: boolean;
+  /** Optional explicit loopback base URL, for example http://127.0.0.1:8787/v1. */
+  baseUrl?: string;
+  /** Optional model override. The discovered Codex model is used when absent. */
+  model?: string;
+  api?: 'auto' | 'responses' | 'chat-completions';
+  timeoutMs?: number;
+}
+export interface TopicGroupMemoryConfig {
+  /** Disabled by default so upgrades never change prompt behavior implicitly. */
+  enabled?: boolean;
+  injectMode?: 'off' | 'summary' | 'summary-and-facts';
+  updateMode?: 'off' | 'manual' | 'auto';
+  maxPromptChars?: number;
+  maxSummaryChars?: number;
+  httpLlm?: TopicGroupMemoryHttpLlmConfig;
+}
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
@@ -889,6 +910,10 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /** Per-bot shared memory for independent sessions in the same real topic
+   * group. The store remains keyed by larkAppId + chatId; this config only
+   * controls whether/how that bot reads and writes it. */
+  topicGroupMemory?: TopicGroupMemoryConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
    * the agent sees only a clone of the project + a de-identified config dir,
@@ -1850,6 +1875,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      topicGroupMemory: (() => {
+        const raw = entry.topicGroupMemory;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+        const out: TopicGroupMemoryConfig = {};
+        if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled;
+        if (raw.injectMode === 'off' || raw.injectMode === 'summary' || raw.injectMode === 'summary-and-facts') out.injectMode = raw.injectMode;
+        if (raw.updateMode === 'off' || raw.updateMode === 'manual' || raw.updateMode === 'auto') out.updateMode = raw.updateMode;
+        if (Number.isInteger(raw.maxPromptChars) && raw.maxPromptChars > 0) out.maxPromptChars = Math.min(raw.maxPromptChars, 8_000);
+        if (Number.isInteger(raw.maxSummaryChars) && raw.maxSummaryChars > 0) out.maxSummaryChars = Math.min(raw.maxSummaryChars, 10_000);
+        if (raw.httpLlm && typeof raw.httpLlm === 'object' && !Array.isArray(raw.httpLlm)) {
+          const http: TopicGroupMemoryHttpLlmConfig = {};
+          if (typeof raw.httpLlm.enabled === 'boolean') http.enabled = raw.httpLlm.enabled;
+          if (typeof raw.httpLlm.autoDiscoverCodex === 'boolean') http.autoDiscoverCodex = raw.httpLlm.autoDiscoverCodex;
+          if (typeof raw.httpLlm.baseUrl === 'string' && raw.httpLlm.baseUrl.trim()) http.baseUrl = raw.httpLlm.baseUrl.trim();
+          if (typeof raw.httpLlm.model === 'string' && raw.httpLlm.model.trim()) http.model = raw.httpLlm.model.trim();
+          if (raw.httpLlm.api === 'auto' || raw.httpLlm.api === 'responses' || raw.httpLlm.api === 'chat-completions') http.api = raw.httpLlm.api;
+          if (Number.isInteger(raw.httpLlm.timeoutMs) && raw.httpLlm.timeoutMs > 0) http.timeoutMs = Math.min(raw.httpLlm.timeoutMs, 300_000);
+          if (Object.keys(http).length) out.httpLlm = http;
+        }
+        return Object.keys(out).length ? out : undefined;
+      })(),
       sandbox: entry.sandbox === true,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),

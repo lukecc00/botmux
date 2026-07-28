@@ -194,6 +194,24 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return codexArgs;
     },
 
+    buildIsolatedStructuredRun({ schemaPath, outputPath, model }) {
+      return {
+        args: [
+          'exec',
+          '--ephemeral',
+          '--skip-git-repo-check',
+          '--ignore-rules',
+          '--sandbox', 'read-only',
+          '--output-schema', schemaPath,
+          '--output-last-message', outputPath,
+          '--color', 'never',
+          ...(model?.trim() ? ['--model', model.trim()] : []),
+          '-',
+        ],
+        outputMode: 'output-file',
+      };
+    },
+
     buildResumeCommand({ sessionId, cliSessionId }) {
       // Codex's `resume` is a subcommand (not a flag) and takes Codex's own
       // UUID, not the botmux sessionId. Prefer the persisted cliSessionId;
