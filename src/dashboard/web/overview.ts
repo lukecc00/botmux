@@ -28,7 +28,9 @@ export type BotCard = {
   lastActiveAt: number;
 };
 
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
+// `active` is a persisted open-session state on legacy rows, not a runtime
+// busy signal. Counting it here leaves completed conversations stuck as working.
+const BUSY_STATUSES = new Set(['working', 'analyzing', 'starting']);
 
 /** 把会话按 bot 聚合成"数字员工"卡片数据；在线 bot 没会话也要出现（待命）。
  *  以 larkAppId 为身份键（部分会话缺 botName，按名字聚会裂成两张卡）；

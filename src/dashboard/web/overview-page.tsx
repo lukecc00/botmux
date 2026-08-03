@@ -30,8 +30,10 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 type ActiveSortMode = 'time' | 'attention';
 
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
-const IDLE_STATUSES = new Set(['idle', 'dormant']);
+// Legacy `active` means open, not busy; keep it visible in the active-session
+// list without inflating the working count.
+const BUSY_STATUSES = new Set(['working', 'analyzing', 'starting']);
+const IDLE_STATUSES = new Set(['idle', 'dormant', 'active']);
 const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const ACTIVE_SORT_KEY = 'botmux.overview.activeSort';
 const TEAM_DESKTOP_COLUMNS = 5;

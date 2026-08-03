@@ -24,9 +24,17 @@ interface KanbanRowLike {
 export function deriveKanbanColumn(s: KanbanRowLike): SessionKanbanColumn {
   if (s.status === 'closed') return 'done';
   const manual = normalizeKanbanColumn(s.kanbanColumn);
-  if (manual) return manual;
+  const hasManualPosition = typeof s.kanbanPosition === 'number' && Number.isFinite(s.kanbanPosition);
+  // Backward compatibility: old Dashboard "Start" activation persisted
+  // kanbanColumn=in_progress without a drag/drop position. That was a system
+  // marker, not a human placement, and it leaves completed idle conversations
+  // stuck in progress after upgrade. Real user drags persist kanbanPosition, so
+  // keep honoring those.
+  if (manual && !(manual === 'in_progress' && !hasManualPosition)) return manual;
   if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'in_review';
-  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') {
+  // Legacy rows may expose persisted `active`, which means open, not busy.
+  // Only explicit runtime states belong in the automatic in-progress column.
+  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing') {
     return 'in_progress';
   }
   return 'todo';

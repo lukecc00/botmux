@@ -64,6 +64,12 @@ describe('deriveKanbanColumn', () => {
   it('manual placement wins over runtime derivation', () => {
     expect(deriveKanbanColumn({ status: 'working', kanbanColumn: 'backlog' })).toBe('backlog');
     expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'done' })).toBe('done');
+    expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'in_progress', kanbanPosition: 1024 })).toBe('in_progress');
+  });
+
+  it('ignores legacy auto in_progress markers without a manual position once idle', () => {
+    expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'in_progress' })).toBe('todo');
+    expect(deriveKanbanColumn({ status: 'active', kanbanColumn: 'in_progress' })).toBe('todo');
   });
 
   it('falls back to runtime derivation when manual value is invalid', () => {
@@ -78,9 +84,11 @@ describe('deriveKanbanColumn', () => {
   });
 
   it('maps runtime states to default columns', () => {
-    for (const status of ['starting', 'working', 'analyzing', 'active']) {
+    for (const status of ['starting', 'working', 'analyzing']) {
       expect(deriveKanbanColumn({ status })).toBe('in_progress');
     }
+    // Legacy `active` means the session is open, not that a turn is running.
+    expect(deriveKanbanColumn({ status: 'active' })).toBe('todo');
     expect(deriveKanbanColumn({ status: 'idle' })).toBe('todo');
     expect(deriveKanbanColumn({ status: 'dormant' })).toBe('todo');
   });

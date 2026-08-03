@@ -51,7 +51,7 @@ describe('runtime monitor helpers', () => {
     expect(sessionRuntimeBucket(session({ sessionId: 's5', status: 'mystery' }))).toBe('unknown');
     expect(sessionRuntimeBucket(session({ sessionId: 's6', status: 'waiting' }))).toBe('waiting');
     expect(sessionRuntimeBucket(session({ sessionId: 's7', status: 'analyzing' }))).toBe('working');
-    expect(sessionRuntimeBucket(session({ sessionId: 's8', status: 'active' }))).toBe('working');
+    expect(sessionRuntimeBucket(session({ sessionId: 's8', status: 'active' }))).toBe('idle');
     expect(sessionRuntimeBucket(session({ sessionId: 's9', status: 'dormant' }))).toBe('idle');
   });
 

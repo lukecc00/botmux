@@ -418,7 +418,7 @@ describe('spawnDashboardSession — guards', () => {
 });
 
 describe('activateQueuedSession', () => {
-  it('consumes the wrapped queuedPrompt as the first turn, clears queued, moves to in_progress', async () => {
+  it('consumes the wrapped queuedPrompt and releases backlog to runtime-derived placement', async () => {
     const active = new Map<string, DaemonSession>();
     await spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: '排队的任务', column: 'backlog', role: 'lead',
@@ -435,6 +435,17 @@ describe('activateQueuedSession', () => {
     expect(prompt.content).toContain('<botmux_lead_dispatch>'); // preamble survived park→activate
     expect(ds.session.queued).toBe(false);
     expect(ds.session.queuedPrompt).toBeUndefined();
+    expect(ds.session.kanbanColumn).toBeUndefined();
+  });
+
+  it('preserves an explicit drag into in_progress', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '拖拽启动的任务', column: 'backlog', role: 'solo',
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+
+    expect(await activateQueuedSession(ds, { preserveManualColumn: true })).toMatchObject({ ok: true });
     expect(ds.session.kanbanColumn).toBe('in_progress');
   });
 

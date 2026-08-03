@@ -167,7 +167,8 @@ let appRoot: ReturnType<typeof createRoot> | null = null;
 
 const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
+// Legacy `active` means the conversation is open, not that a turn is running.
+const BUSY_STATUSES = new Set(['working', 'analyzing', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
 
 function icon(children: ReactNode): ReactNode {

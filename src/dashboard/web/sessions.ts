@@ -412,7 +412,10 @@ export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
   if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
   if (s.status === 'starting') return 'starting';
-  if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
+  // `active` is the persisted open/closed lifecycle state used by older rows,
+  // not proof that a model turn is still running. Treat only explicit runtime
+  // states as busy so completed legacy conversations fall back to idle.
+  if (s.status === 'working' || s.status === 'analyzing') return 'working';
   if (s.status === 'dormant') return 'idle';
   return 'idle';
 }

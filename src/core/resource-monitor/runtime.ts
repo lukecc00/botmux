@@ -23,9 +23,11 @@ export interface RuntimeBotInput {
   daemonStatus?: RuntimeDaemonStatus;
 }
 
-const WORKING_STATUSES = new Set(['working', 'analyzing', 'active']);
+const WORKING_STATUSES = new Set(['working', 'analyzing']);
 const STARTING_STATUSES = new Set(['starting', 'queued']);
-const IDLE_STATUSES = new Set(['idle', 'dormant']);
+// `active` is the persisted open/closed lifecycle state used by legacy
+// dashboard rows. It carries no evidence that a model turn is still running.
+const IDLE_STATUSES = new Set(['idle', 'dormant', 'active']);
 
 export function sessionRuntimeBucket(session: Pick<RuntimeSessionInput, 'status' | 'agentAttention'>): RuntimeSessionBucket {
   const status = String(session.status ?? '').toLowerCase();
