@@ -7,6 +7,7 @@ import {
 import type {
   CodexAppFinalMarker,
   CodexAppLifecycleEvent,
+  CodexAppProgressMarker,
   CodexAppRunnerInput,
 } from '../src/services/codex-app-runner-protocol.js';
 
@@ -40,6 +41,7 @@ function createHarness() {
   }> = [];
   const finals: Array<CodexAppFinalMarker & { appTurnId: string }> = [];
   const diagnostics: string[] = [];
+  const progress: CodexAppProgressMarker[] = [];
   const lifecycle: CodexAppLifecycleEvent[] = [];
   const displayed: string[] = [];
   let now = 100;
@@ -79,11 +81,12 @@ function createHarness() {
     ),
     onTurnInput: (_input, prepared) => displayed.push(prepared.visibleText),
     onFinal: marker => finals.push(marker),
+    onProgress: marker => progress.push(marker),
     onDiagnostic: message => diagnostics.push(message),
     onLifecycle: event => lifecycle.push(event),
     now: () => now++,
   });
-  return { controller, requests, finals, diagnostics, lifecycle, displayed };
+  return { controller, requests, finals, progress, diagnostics, lifecycle, displayed };
 }
 
 function completeTurn(controller: CodexAppTurnController, turnId: string, text = 'done'): void {
@@ -168,6 +171,41 @@ describe('CodexAppTurnController', () => {
       replyTurnId: 'om_third',
       content: 'merged',
     })]);
+  });
+
+  it('emits completed commentary as progress separately from the final answer', async () => {
+    const h = createHarness();
+    h.controller.enqueue(input('first', 'om_first'));
+    await flushAsync();
+    h.requests[0].response.resolve({ turn: { id: 'app-1' } });
+    await flushAsync();
+
+    h.controller.handleNotification({
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'app-1',
+        itemId: 'progress-1',
+        delta: 'verified facts and next step',
+      },
+    });
+    h.controller.handleNotification({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'app-1',
+        item: { id: 'progress-1', type: 'agentMessage', phase: 'commentary' },
+      },
+    });
+    completeTurn(h.controller, 'app-1', 'done');
+
+    expect(h.progress).toEqual([{
+      appTurnId: 'app-1',
+      replyTurnId: 'om_first',
+      itemId: 'progress-1',
+      content: 'verified facts and next step',
+    }]);
+    expect(h.finals).toEqual([expect.objectContaining({ content: 'done' })]);
   });
 
   it('can steer after turn/started while turn/start response is pending', async () => {

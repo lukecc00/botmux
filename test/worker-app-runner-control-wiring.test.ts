@@ -22,6 +22,18 @@ describe('worker app-runner control-channel wiring', () => {
     expect(workerSource).not.toContain('const dispatchAttempt = payload.dispatchAttempt');
   });
 
+  it('translates trusted app-runner progress into deduped progress_output', () => {
+    const progressBranch = workerSource.slice(
+      workerSource.indexOf("if (kind === 'progress')"),
+      workerSource.indexOf("if (kind === 'final')"),
+    );
+    expect(progressBranch).toContain('normalizeAppRunnerProgressMarker(payload)');
+    expect(progressBranch).toContain('submittedCodexAppReplyTurnIds.has(marker.replyTurnId)');
+    expect(progressBranch).toContain("type: 'progress_output'");
+    expect(progressBranch).toContain('bridgeProgressProviderUuid(sessionId, trustedReplyTurnId, marker.content)');
+    expect(progressBranch).toContain('const dispatchAttempt = currentBotmuxDispatchAttempt;');
+  });
+
   it('holds stale-busy normal and raw input across old idle and releases only at fresh prompt-ready', () => {
     let state: CodexRunnerFreshnessState = 'stale_waiting_idle';
     const queue = new CodexRunnerFreshnessInputQueue<string, string>(

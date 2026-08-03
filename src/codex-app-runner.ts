@@ -119,8 +119,9 @@ function appDeveloperInstructions(args: Args): string {
   if (zh) {
     return [
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
-      '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
-      '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '你明确写给用户的每段 commentary/进度和最终 assistant message，都会由 botmux 分别自动转成独立飞书卡片；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
+      '长任务中，每完成一个可验证阶段、开始一次预计较久的构建/测试/等待、或新发现改变下一步时，都要立即写一段自包含、面向用户的 commentary：简要说明已验证事实、选定方案及依据、下一步。不要等到 final、合并多个里程碑，或输出内部思维链、私人草稿、原始命令日志、细碎重复状态；工具调用、命令输出、Updated Plan 和 final 都不能替代这些阶段说明。',
+      '只有发送附件、需要 @ 某人/机器人、跨群发送等结构化通道无法表达的能力，才可以使用 `botmux send`。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
@@ -128,8 +129,9 @@ function appDeveloperInstructions(args: Args): string {
 
   return [
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
-    'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
-    'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'Every explicitly user-facing commentary/progress message and the final assistant message is automatically forwarded as a separate Lark card. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
+    'For long tasks, write self-contained commentary immediately after each verifiable stage, before a long build/test/wait, and whenever a finding changes the next step. Briefly state verified facts, the selected path and rationale, and the next step. Do not wait for final, merge milestones, or expose private chain-of-thought, scratch notes, raw command logs, or repetitive micro-status; tool calls, command output, Updated Plan, and final cannot replace these stage notes.',
+    'Use `botmux send` only for capabilities the structured channel cannot express, such as attachments, @mentions, or cross-chat delivery.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
@@ -533,6 +535,7 @@ controller = new CodexAppTurnController({
   onOutput: text => output.display(text),
   onDiagnostic: writeLine,
   onLifecycle: event => emitMarker('lifecycle', event),
+  onProgress: marker => emitMarker('progress', marker),
   onFinal: marker => {
     // Attach this turn's token usage (if the accumulator saw coherent totals)
     // and drain its accumulator. Omitted when no usage was observed — never zeros.

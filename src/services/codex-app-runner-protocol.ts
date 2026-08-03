@@ -12,6 +12,16 @@ export interface CodexAppRunnerInput {
   replyTurnId?: string;
 }
 
+
+export interface CodexAppProgressMarker {
+  content: string;
+  itemId: string;
+  /** Codex app-server turn id, used for protocol matching and deduplication. */
+  appTurnId: string;
+  /** Immutable botmux/Lark reply route. */
+  replyTurnId?: string;
+}
+
 export interface CodexAppFinalMarker {
   content: string;
   startedAtMs?: number;
@@ -140,6 +150,22 @@ export function decodeCodexAppRunnerInput(line: string): CodexAppRunnerInput | u
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
   };
+}
+
+export function normalizeAppRunnerProgressMarker(payload: unknown): CodexAppProgressMarker | undefined {
+  if (!isRecord(payload)) return undefined;
+  const allowedKeys = new Set(['content', 'itemId', 'appTurnId', 'replyTurnId']);
+  if (Object.keys(payload).some(key => !allowedKeys.has(key))) return undefined;
+  const content = optionalNonEmptyString(payload.content)?.trim();
+  const itemId = optionalLifecycleId(payload.itemId);
+  const appTurnId = optionalLifecycleId(payload.appTurnId);
+  const replyTurnId = payload.replyTurnId === undefined
+    ? undefined
+    : optionalLifecycleId(payload.replyTurnId);
+  if (!content || !itemId || !appTurnId || (payload.replyTurnId !== undefined && !replyTurnId)) {
+    return undefined;
+  }
+  return { content, itemId, appTurnId, ...(replyTurnId ? { replyTurnId } : {}) };
 }
 
 export function normalizeAppRunnerFinalMarker(payload: unknown): CodexAppFinalMarker | undefined {

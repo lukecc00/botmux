@@ -5385,8 +5385,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        /--voice 混用；用户回复后自动撤下。
        --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）
     @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
-    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
-    纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
+    过程更新/阶段结论/状态记录一律 --no-mention；只有整轮结束，或明确需要对方确认、
+    决策、授权、补充信息、处理阻塞时才 --mention-back（点名其他人/bot 用 --mention）。
+    长任务按阶段发送“已验证事实 + 选定方案/依据 + 下一步”，不要发送内部思维链、原始日志或细碎状态。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]

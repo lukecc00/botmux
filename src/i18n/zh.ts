@@ -614,7 +614,7 @@ export const messages: Record<string, string> = {
   'ai.routing.must_use_botmux': '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
   'ai.routing.no_visible_output_ok': '重要：`botmux send` 执行成功（退出码 0 / 返回 `{"success":true,...}`）就代表消息已送达用户。因此本轮「终端没有可见文本、直接结束」是完全正常且预期的，不是失败。若之后看到类似「你上一条回复没有可见输出，请继续」这样的提示，那是底层 CLI 的误判，不要因此重发——只有当 `botmux send` 本身报错（非零退出或打印「发送失败」）时才需要重试。',
   'ai.routing.usage_heading': '使用指南：',
-  'ai.routing.usage_send_when': '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
+  'ai.routing.usage_send_when': '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。长任务应在每个可验证阶段完成后、长构建/测试/等待前、新发现改变下一步时，发送简洁决策摘要（已验证事实、选定方案及简短依据、下一步），不要发送内部思维链、草稿或原始命令输出。过程消息用 `--no-mention`，只有整轮结束或需要用户行动时才通知用户。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
   'ai.routing.usage_send_text': '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
   'ai.routing.usage_heredoc': '- 多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.routing.heredoc_example': "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
@@ -634,7 +634,7 @@ export const messages: Record<string, string> = {
   'ai.identity.mention_must': '要跟某个 bot 沟通或协作（让它收到你的消息），**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
   'ai.identity.mention_partners': '- 首轮上下文里的 `<available_bots>` 块会提示当前可协作的 bot（数量少时含 open_id，多时只列名字）；对方 open_id 也可以随时 `botmux bots list` 查',
   'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
-  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。按内容价值选：有实质结论、要对方继续看/确认/决策 → --mention-back（或 --mention 点名）；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰',
+  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。过程更新、阶段结论和状态记录一律 --no-mention；只有整轮结束，或明确需要对方确认、决策、授权、补充信息、处理阻塞时才 --mention-back（或 --mention 点名）。没信息量的"收到"不如不发',
   'ai.identity.mention_when_to': '- 该 --mention 的场景：需要跟对方沟通或协作、用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
   'ai.identity.mention_when_not': '- 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
 
@@ -645,9 +645,10 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': '多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
-  'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
+  'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。长任务应在每个可验证阶段完成后、长构建/测试/等待前、新发现改变下一步时，立即发送简洁决策摘要：已验证事实、选定方案及简短依据、下一步。不要发送内部思维链、私人草稿、原始命令输出或细碎重复状态。只 print/echo 不算回复。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
   'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
-  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
+  'ai.shell.codex_structured_delivery': 'Codex 专用交付规则：每段明确面向用户的 commentary/进度和 final 都会分别自动成为一张当前话题内的飞书卡片。长任务中，每完成一个可验证阶段、开始较久的构建/测试/等待、或新发现改变下一步时，立即写一段自包含的 commentary，包含已验证事实、选定方案及简短依据、下一步；不要等到 final 或合并多个里程碑。工具调用、命令输出、Updated Plan 和 final 不能替代这些阶段说明。只输出可审阅的决策摘要，不要输出内部思维链、私人草稿、原始命令日志或细碎重复状态。普通进度/final 不要再用 `botmux send` 重复发送；附件、@mention、跨群等特殊能力除外。',
+  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。过程更新、阶段结论、状态记录一律用 --no-mention；只有整轮结束，或明确需要对方确认、决策、授权、补充信息、处理阻塞时才用 --mention-back。点名其他人/bot 仍用 --mention。没信息量的"收到"不如不发。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应',
@@ -657,6 +658,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY',
   'ai.followup.reminder_no_resend': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY；send 成功即已送达，本轮无可见文本地结束是正常的，别因「无输出」提示重发',
+  'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者会分别自动同步为当前话题内的飞书卡片。长任务在每个可验证阶段完成后、长构建/测试/等待前、新发现改变下一步时立即写 commentary，简要说明已验证事实、选定方案及依据、下一步；不要等到 final、不要合并里程碑，也不要输出内部思维链、草稿、原始命令日志或细碎状态。普通进度/结果不要用 `botmux send` 重复发送；附件、@mention、跨群除外。',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',

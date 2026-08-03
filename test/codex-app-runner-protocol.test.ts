@@ -5,6 +5,7 @@ import {
   CODEX_APP_INPUT_PREFIX,
   decodeCodexAppRunnerInput,
   normalizeAppRunnerFinalMarker,
+  normalizeAppRunnerProgressMarker,
   normalizeCodexAppLifecycleEvent,
   projectAppRunnerFinalIds,
 } from '../src/services/codex-app-runner-protocol.js';
@@ -72,6 +73,32 @@ describe('Codex App runner input protocol', () => {
     encodedLine({ type: 'message', content: 'x', codexAppInput: { text: 42 } }),
   ])('rejects malformed external input: %s', line => {
     expect(decodeCodexAppRunnerInput(line)).toBeUndefined();
+  });
+});
+
+describe('app runner progress marker normalization', () => {
+  it('accepts a bounded commentary marker and trims its content', () => {
+    expect(normalizeAppRunnerProgressMarker({
+      appTurnId: 'app-turn-1',
+      replyTurnId: 'om_follow_up',
+      itemId: 'commentary-1',
+      content: '  verified facts and next step  ',
+    })).toEqual({
+      appTurnId: 'app-turn-1',
+      replyTurnId: 'om_follow_up',
+      itemId: 'commentary-1',
+      content: 'verified facts and next step',
+    });
+  });
+
+  it.each([
+    null,
+    { appTurnId: 'app-turn-1', itemId: 'commentary-1', content: '   ' },
+    { appTurnId: '', itemId: 'commentary-1', content: 'progress' },
+    { appTurnId: 'app-turn-1', itemId: '', content: 'progress' },
+    { appTurnId: 'app-turn-1', itemId: 'commentary-1', content: 'progress', hidden: true },
+  ])('rejects malformed progress markers: %j', marker => {
+    expect(normalizeAppRunnerProgressMarker(marker)).toBeUndefined();
   });
 });
 

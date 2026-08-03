@@ -14,7 +14,7 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionIfActive, setActiveSessionSafe, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCodexBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -728,7 +728,11 @@ export function buildNewTopicPrompt(
   // (Claude Code builds its own via --append-system-prompt). Source hints
   // freshly from i18n so they respect the resolved locale instead of the
   // static `adapter.systemHints` array that was baked at module load.
-  const hints = adapter.injectsSessionContext ? [] : buildBotmuxShellHints(locale);
+  const hints = adapter.injectsSessionContext
+    ? []
+    : cliId === 'codex'
+      ? buildCodexBotmuxShellHints(locale)
+      : buildBotmuxShellHints(locale);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -928,6 +932,9 @@ export function buildFollowUpContent(
     // applies to the next follow-up turn without a daemon restart.
     const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    if (opts?.cliId === 'codex' || opts?.cliId === 'codex-app') {
+      parts.push(`<codex_delivery>${t('ai.followup.codex_structured_delivery', undefined, opts?.locale)}</codex_delivery>`);
+    }
   }
   if (whiteboardBlock) parts.push(whiteboardBlock);
 

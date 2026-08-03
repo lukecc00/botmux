@@ -284,9 +284,11 @@ import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.j
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
+import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   normalizeAppRunnerFinalMarker,
+  normalizeAppRunnerProgressMarker,
   normalizeCodexAppLifecycleEvent,
   projectAppRunnerFinalIds,
 } from './services/codex-app-runner-protocol.js';
@@ -5542,6 +5544,36 @@ function handleCodexAppMarker(body: string): void {
       type: 'steer_accepted',
       appTurnId: event.appTurnId,
       turnId: event.replyTurnId,
+    });
+    return;
+  }
+
+  if (kind === 'progress') {
+    const marker = normalizeAppRunnerProgressMarker(payload);
+    if (!marker) {
+      log(`${cliName()} rejected malformed progress marker`);
+      return;
+    }
+    const trustedReplyTurnId = marker.replyTurnId
+      && submittedCodexAppReplyTurnIds.has(marker.replyTurnId)
+      ? marker.replyTurnId
+      : undefined;
+    if (!trustedReplyTurnId) {
+      log(
+        `${cliName()} ignored unsubmitted progress reply route `
+        + `(replyTurn=${shortCorrelationId(marker.replyTurnId)})`,
+      );
+      return;
+    }
+    const dispatchAttempt = currentBotmuxDispatchAttempt;
+    send({
+      type: 'progress_output',
+      sessionId,
+      content: marker.content,
+      uuid: bridgeProgressProviderUuid(sessionId, trustedReplyTurnId, marker.content)
+        ?? `app:${marker.appTurnId}:${marker.itemId}`,
+      turnId: trustedReplyTurnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
     return;
   }

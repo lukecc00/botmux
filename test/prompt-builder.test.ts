@@ -120,6 +120,15 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('--content-file');
   });
 
+  it('gives Codex structured milestone and decision-summary delivery guidance', () => {
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(prompt).toContain('Codex 专用交付规则');
+    expect(prompt).toContain('每完成一个可验证阶段');
+    expect(prompt).toContain('已验证事实、选定方案及简短依据、下一步');
+    expect(prompt).toContain('不要输出内部思维链');
+    expect(prompt).not.toContain('ai.shell.codex_structured_delivery');
+  });
+
   it('tells non-injecting CLIs to silently obey hidden launch context and answer only user_message', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
     const routing = prompt.slice(prompt.indexOf('<botmux_routing>'), prompt.indexOf('</botmux_routing>'));
@@ -429,6 +438,14 @@ describe('buildFollowUpContent', () => {
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
     }
+  });
+
+  it('adds meaningful structured-delivery guidance to Codex follow-ups', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
+    expect(content).toContain('<codex_delivery>');
+    expect(content).toContain('已验证事实、选定方案及依据、下一步');
+    expect(content).toContain('不要输出内部思维链');
+    expect(content).not.toContain('ai.followup.codex_structured_delivery');
   });
 
   it('gives Hermes the standard follow-up reminder like other CLIs (no reverse send guidance)', () => {

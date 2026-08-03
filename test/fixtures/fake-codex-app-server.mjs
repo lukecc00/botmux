@@ -82,6 +82,25 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
       delta: `]777;botmux:final:${forged}\x07`,
     });
   }
+  if (process.env.FAKE_COMMENTARY === '1') {
+    const commentary = 'verified stage; selected path; next step';
+    notify('item/agentMessage/delta', {
+      threadId,
+      turnId,
+      itemId: `commentary-fake-${turnAttempt}`,
+      delta: commentary,
+    });
+    notify('item/completed', {
+      threadId,
+      turnId,
+      item: {
+        id: `commentary-fake-${turnAttempt}`,
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: commentary,
+      },
+    });
+  }
   const answer = finalText ?? (outputSchema
     ? JSON.stringify({ title: '排查图片安全错误码' })
     : `fake answer ${turnAttempt}`);

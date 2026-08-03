@@ -1,5 +1,6 @@
 import type {
   CodexAppFinalMarker,
+  CodexAppProgressMarker,
   CodexAppLifecycleCategory,
   CodexAppLifecycleEvent,
   CodexAppLifecycleOperation,
@@ -51,6 +52,7 @@ export interface CodexAppTurnControllerDeps {
   onOutput?(text: string): void;
   onDiagnostic?(message: string): void;
   onLifecycle?(event: CodexAppLifecycleEvent): void;
+  onProgress?(marker: CodexAppProgressMarker): void;
   onFinal(marker: CodexAppFinalMarker & { appTurnId: string }): void;
   onPrompt?(): void;
   now?(): number;
@@ -186,9 +188,25 @@ export class CodexAppTurnController {
     if (message.method === 'item/completed') {
       const item = isRecord(params.item) ? params.item : undefined;
       if (item?.type === 'agentMessage') {
-        const text = typeof item.text === 'string' ? item.text : '';
-        if (item.phase === 'final_answer') turn.finalText = text;
-        else if (!turn.itemText.has(String(item.id ?? '')) && text) turn.allAgentText += text;
+        const itemId = String(item.id ?? '');
+        const text = typeof item.text === 'string'
+          ? item.text
+          : turn.itemText.get(itemId) ?? '';
+        if (item.phase === 'final_answer') {
+          turn.finalText = text;
+        } else if (item.phase === 'commentary') {
+          const content = text.trim();
+          if (content && itemId && turn.appTurnId) {
+            this.deps.onProgress?.({
+              content,
+              itemId,
+              appTurnId: turn.appTurnId,
+              ...(turn.replyTurnId ? { replyTurnId: turn.replyTurnId } : {}),
+            });
+          }
+        } else if (!turn.itemText.has(itemId) && text) {
+          turn.allAgentText += text;
+        }
       }
       return;
     }

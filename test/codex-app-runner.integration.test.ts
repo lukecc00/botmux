@@ -19,6 +19,7 @@ const FAKE_SERVER_FIXTURE = resolve('test/fixtures/fake-codex-app-server.mjs');
 const CONTROL_PREFIX = '::botmux-codex-app:';
 const FINAL_MARKER = /\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/;
 const LIFECYCLE_MARKER = /\x1b\]777;botmux:lifecycle:([A-Za-z0-9+/=]+)\x07/g;
+const PROGRESS_MARKER = /\x1b\]777;botmux:progress:([A-Za-z0-9+/=]+)\x07/g;
 
 interface Harness {
   child: ChildProcessWithoutNullStreams;
@@ -64,6 +65,7 @@ function startRunner(
       FAKE_CODEX_LOG: logPath,
       FAKE_CODEX_VERSION: version,
       FAKE_CODEX_BEHAVIOR: behavior,
+      FAKE_COMMENTARY: behavior === 'commentary' ? '1' : '0',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -141,7 +143,7 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection' | 'commentary';
   includeMissingImage?: boolean;
   includeSidecar?: boolean;
 }): Promise<RunResult> {
@@ -197,6 +199,21 @@ afterEach(async () => {
 });
 
 describe('codex-app-runner app-server protocol integration', () => {
+  it('emits commentary as a progress marker before the separate final marker', async () => {
+    const result = await exerciseRunner({ version: '0.136.0', behavior: 'commentary' });
+    const matches = [...result.output.matchAll(PROGRESS_MARKER)];
+    expect(matches).toHaveLength(1);
+    const progress = JSON.parse(Buffer.from(matches[0][1], 'base64').toString('utf8'));
+    expect(progress).toEqual({
+      appTurnId: 'turn-fake-1',
+      replyTurnId: 'om_integration_123',
+      itemId: 'commentary-fake-1',
+      content: 'verified stage; selected path; next step',
+    });
+    expect(matches[0].index).toBeLessThan(result.output.indexOf('botmux:final:'));
+    expect(result.final.content).toBe('fake answer 1');
+  });
+
   it('sends clean text, hidden context, localImage, and clientUserMessageId on codex >= 0.136', async () => {
     const result = await exerciseRunner({ version: '0.136.0', includeMissingImage: true });
     const initialize = result.requests.find(request => request.method === 'initialize');
