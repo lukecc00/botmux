@@ -2,15 +2,56 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
-  userGoal?: string;
+  /** The real user turn represented by `content` when delivery uses a short
+   * adapter command. Transcript bridges fingerprint this value, while the PTY
+   * receives `content`. */
+  logicalContent?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
-  /** Administrative raw command followed by a real model turn (Codex
-   * /compact handoff). This turn must wait for a genuine prompt instead of
-   * steering into the still-running command. */
-  requireIdle?: boolean;
+}
+
+/**
+ * Run a synchronous CLI/backend reset without losing inputs that have not yet
+ * been dequeued for a PTY write. The reset path intentionally clears the live
+ * queue; restoring the snapshot afterwards keeps those messages distinct from
+ * InflightInputTracker carry-over, which spawnCli prepends ahead of them.
+ */
+export function resetPreservingPendingCliInputs(
+  pending: PendingCliInput[],
+  reset: () => void,
+): void {
+  const queued = pending.splice(0);
+  try {
+    reset();
+  } finally {
+    pending.unshift(...queued);
+  }
+}
+
+/**
+ * A natural managed-CLI exit transfers every durable receipt owned by that
+ * worker generation back to the daemon/hub replay loop. Remove those definitely
+ * unwritten queued copies before the same Node worker auto-restarts, otherwise
+ * attempt N can survive locally while the hub dispatches N+1. An intentional
+ * in-worker restart emits no generation-exit reconciliation, so it preserves
+ * the complete queue instead.
+ */
+export function handoffQueuedDurableInputsOnBackendExit(
+  pending: PendingCliInput[],
+  opts: { intentionalRestart: boolean },
+): PendingCliInput[] {
+  if (opts.intentionalRestart) return [];
+
+  const handedOff: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (item.dispatchAttempt === undefined) continue;
+    pending.splice(index, 1);
+    handedOff.unshift(item);
+  }
+  return handedOff;
 }
 
 export function mergeQueuedCliInput(
@@ -27,9 +68,8 @@ export function mergeQueuedCliInput(
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
-    || tail.requireIdle || next.requireIdle) return false;
+    || tail.logicalContent || next.logicalContent) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
-  tail.userGoal = next.userGoal ?? tail.userGoal;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
 }
@@ -45,8 +85,7 @@ export function pendingInputAllowsTypeAhead(
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
     && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin
-    && !next?.requireIdle;
+    && !next?.vcMeetingImTurnOrigin;
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL
@@ -62,6 +101,101 @@ export function shouldDeferArgsBakedDurablePrompt(opts: {
   return opts.passesInitialPromptViaArgs
     && !opts.adoptMode
     && opts.dispatchAttempt !== undefined;
+}
+
+/** Some backends (tmux in particular) reject long launch command strings before
+ *  the spawned CLI ever sees argv. For adapters that normally bake the first
+ *  prompt into args, route over-limit prompts through the regular input queue
+ *  instead. The comparison is strictly `>` so a prompt exactly at the adapter's
+ *  declared budget keeps legacy args-baked behavior. */
+export function shouldDeferInitialPromptForArgLimit(opts: {
+  passesInitialPromptViaArgs: boolean;
+  prompt?: string;
+  maxInitialPromptArgBytes?: number;
+}): boolean {
+  if (!opts.passesInitialPromptViaArgs) return false;
+  if (!opts.prompt) return false;
+  const limit = opts.maxInitialPromptArgBytes;
+  if (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0) return false;
+  return Buffer.byteLength(opts.prompt, 'utf8') > limit;
+}
+
+/** Resolve the physical first-prompt transport after worker defer policy is
+ * known. A transformed argv prompt can provide a short deferred command while
+ * retaining the original text for bridge attribution. Other adapters keep the
+ * legacy behavior: argv when not deferred, original text in the queue when
+ * deferred. */
+export function resolveInitialPromptDelivery(opts: {
+  originalPrompt?: string;
+  preparedArg?: string;
+  preparedDeferredContent?: string;
+  defer: boolean;
+}): {
+  argvPrompt?: string;
+  queuedContent?: string;
+  logicalContent?: string;
+} {
+  if (!opts.originalPrompt) return {};
+  if (!opts.defer) {
+    return { argvPrompt: opts.preparedArg ?? opts.originalPrompt };
+  }
+  const queuedContent = opts.preparedDeferredContent ?? opts.originalPrompt;
+  return {
+    queuedContent,
+    ...(queuedContent !== opts.originalPrompt
+      ? { logicalContent: opts.originalPrompt }
+      : {}),
+  };
+}
+
+/**
+ * Whether this spawn baked a non-empty first prompt into argv (not the write
+ * queue). Shared base for both Grok pre-exec busy arming and the card-off
+ * "seed working before first idle" path for quiescence argv adapters.
+ *
+ * Riff has passesInitialPromptViaArgs=false → false (queue-after-spawn).
+ */
+export function shouldTrackArgvBakedFirstPrompt(opts: {
+  passesInitialPromptViaArgs: boolean;
+  preparedInitialPrompt?: string | null;
+  queuedInitialPrompt?: string | null;
+}): boolean {
+  if (!opts.passesInitialPromptViaArgs) return false;
+  if (!opts.preparedInitialPrompt?.trim()) return false;
+  if (opts.queuedInitialPrompt) return false;
+  return true;
+}
+
+/**
+ * Whether markPromptReady must treat the first post-spawn ready as
+ * "pre-execution SessionStart" (report working, keep busy) rather than true
+ * end-of-turn idle.
+ *
+ * Strict conditions (PR #633 review):
+ *  - adapter actually bakes the first prompt into argv (`passesInitialPromptViaArgs`)
+ *  - an argv prompt exists and was NOT deferred to the write queue
+ *  - SessionStart ready exists (`injectsReadyHook`) so first ready ≠ completion
+ *  - turn terminal is authoritative (`reliableTurnTerminal`) so a later
+ *    assistant_final/fireIdle will produce a real idle edge
+ *
+ * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
+ * — must return false, or the first markPromptReady would clear isPromptReady
+ * and leave the post-spawn queue flush never firing.
+ * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
+ * idle signal — first ready IS completion; must return false or they stick
+ * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
+ */
+export function shouldArmSpawnArgvInitialPromptBusy(opts: {
+  passesInitialPromptViaArgs: boolean;
+  preparedInitialPrompt?: string | null;
+  queuedInitialPrompt?: string | null;
+  injectsReadyHook: boolean;
+  reliableTurnTerminal: boolean;
+}): boolean {
+  if (!shouldTrackArgvBakedFirstPrompt(opts)) return false;
+  if (!opts.injectsReadyHook) return false;
+  if (!opts.reliableTurnTerminal) return false;
+  return true;
 }
 
 /** Once either side of a queue boundary is durable, stop this batch and wait

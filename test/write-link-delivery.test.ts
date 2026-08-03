@@ -3,11 +3,10 @@
  * session card ("DM 卡") reaches the operator who clicked 「获取操作链接」.
  *
  * Behaviour under test (方案 A): prefer an in-chat "visible-to-you" ephemeral
- * card, but Feishu's ephemeral API only works in plain `group` chats (topic /
- * thread groups reject with 18053, p2p unsupported). chatType can't tell a topic
- * group from a regular one, so we attempt ephemeral for any non-p2p chat and
- * fall back to a private DM on failure. p2p skips straight to the DM. Both
- * channels are private — the fallback never leaks the write token.
+ * card in flat groups. Thread-scope sessions and chat-scope sessions folded
+ * into a thread use DM because Feishu can accept an ephemeral message without
+ * rendering it in the topic panel. Other group failures fall back to DM, and
+ * p2p skips straight to DM. Both channels are private.
  *
  * Run:  pnpm vitest run test/write-link-delivery.test.ts
  */
@@ -73,8 +72,8 @@ const liveDs = (over: Partial<DaemonSession> = {}) => ds({
 beforeEach(() => {
   vi.clearAllMocks();
   botState.owners = [];
-  sendEphemeralCardMock.mockResolvedValue('eph_msg_id');
-  sendUserMessageMock.mockResolvedValue('dm_msg_id');
+  sendEphemeralCardMock.mockReset().mockResolvedValue('eph_msg_id');
+  sendUserMessageMock.mockReset().mockResolvedValue('dm_msg_id');
 });
 
 describe('deliverWriteLinkCard', () => {
@@ -100,6 +99,27 @@ describe('deliverWriteLinkCard', () => {
     expect(sendUserMessageMock).toHaveBeenCalledWith('app', OP, CARD, 'interactive');
   });
 
+  it('DMs a chat-scope session currently folded into a thread', async () => {
+    const r = await deliverWriteLinkCard(ds({
+      scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_topic_root',
+        turnId: 'om_user_turn',
+        updatedAt: new Date().toISOString(),
+      },
+    }), OP, CARD);
+    expect(r).toBe('dm');
+    expect(sendEphemeralCardMock).not.toHaveBeenCalled();
+    expect(sendUserMessageMock).toHaveBeenCalledWith('app', OP, CARD, 'interactive');
+  });
+
+  it('DMs a thread-scope session directly', async () => {
+    const r = await deliverWriteLinkCard(ds({ scope: 'thread' }), OP, CARD);
+    expect(r).toBe('dm');
+    expect(sendEphemeralCardMock).not.toHaveBeenCalled();
+    expect(sendUserMessageMock).toHaveBeenCalledWith('app', OP, CARD, 'interactive');
+  });
+
   it('returns "failed" when both the ephemeral attempt and the DM fallback error', async () => {
     sendEphemeralCardMock.mockRejectedValueOnce(new Error('18053'));
     sendUserMessageMock.mockRejectedValueOnce(new Error('bot not in chat'));
@@ -109,6 +129,20 @@ describe('deliverWriteLinkCard', () => {
 });
 
 describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
+  it('distinguishes a backend that never provides Web Terminal from temporary readiness', async () => {
+    botState.owners = ['ou_owner1'];
+    const r = await deliverWriteLinkCardToOwners(liveDs({
+      session: {
+        sessionId: 'sess1234abcd',
+        rootMessageId: 'om_root',
+        title: 'demo',
+        cliId: 'claude-code',
+        backendType: 'zmx',
+      },
+    }));
+    expect(r).toEqual({ ok: false, error: 'terminal_unsupported', delivered: 0, total: 0, channels: [] });
+  });
+
   it('refuses when the terminal is not ready (no worker token) — never builds a card', async () => {
     botState.owners = ['ou_owner1'];
     const r = await deliverWriteLinkCardToOwners(liveDs({ workerToken: null }));
@@ -126,7 +160,7 @@ describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
 
   it('keeps only ou_-prefixed owners, fans out one private card each', async () => {
     botState.owners = ['ou_a', 'ou_b', 'on_union_not_ou']; // last one filtered out
-    const r = await deliverWriteLinkCardToOwners(liveDs({ chatType: 'group' }));
+    const r = await deliverWriteLinkCardToOwners(liveDs({ chatType: 'group', scope: 'chat' }));
     expect(r.ok).toBe(true);
     expect(r).toMatchObject({ delivered: 2, total: 2, channels: ['ephemeral', 'ephemeral'] });
     expect(sendEphemeralCardMock).toHaveBeenCalledTimes(2);
@@ -143,7 +177,7 @@ describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
       .mockRejectedValueOnce(new Error('18053'))
       .mockResolvedValueOnce('eph_ok');
     sendUserMessageMock.mockRejectedValueOnce(new Error('bot not in chat'));
-    const r = await deliverWriteLinkCardToOwners(liveDs({ chatType: 'group' }));
+    const r = await deliverWriteLinkCardToOwners(liveDs({ chatType: 'group', scope: 'chat' }));
     expect(r.ok).toBe(true); // at least one delivered
     expect(r.delivered).toBe(1);
     expect(r.total).toBe(2);
@@ -160,6 +194,19 @@ describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
 });
 
 describe('deliverWritableTerminalCardTo (/term slash command backend)', () => {
+  it('returns unsupported for a backend with no Web Terminal capability', async () => {
+    const r = await deliverWritableTerminalCardTo(liveDs({
+      session: {
+        sessionId: 'sess1234abcd',
+        rootMessageId: 'om_root',
+        title: 'demo',
+        cliId: 'claude-code',
+        backendType: 'zmx',
+      },
+    }), 'ou_owner');
+    expect(r).toBe('unsupported');
+  });
+
   it('returns not_ready (and never sends) when the terminal has no token', async () => {
     const r = await deliverWritableTerminalCardTo(liveDs({ workerToken: null }), 'ou_owner');
     expect(r).toBe('not_ready');
@@ -168,7 +215,7 @@ describe('deliverWritableTerminalCardTo (/term slash command backend)', () => {
   });
 
   it('delivers a token-bearing card to the single operator (ephemeral in a plain group)', async () => {
-    const r = await deliverWritableTerminalCardTo(liveDs({ chatType: 'group' }), 'ou_owner');
+    const r = await deliverWritableTerminalCardTo(liveDs({ chatType: 'group', scope: 'chat' }), 'ou_owner');
     expect(r).toBe('ephemeral');
     expect(sendEphemeralCardMock).toHaveBeenCalledTimes(1);
     const [, , who, card] = sendEphemeralCardMock.mock.calls[0];

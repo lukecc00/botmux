@@ -3,6 +3,7 @@ import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
   cliIdOf,
+  createRefreshGate,
   displayCliId,
   fallbackCliOptionsState,
   fetchBotDefaults,
@@ -16,25 +17,26 @@ import {
   type BotSubstituteTarget,
   type CliOptionsState,
   type SubstituteTargetResolution,
-  type TopicGroupMemoryDocument,
-  type TopicGroupMemoryStats,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { store } from './store.js';
+import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
   DropdownMenu,
   Html,
   InfoTip as BaseInfoTip,
   LoadingState,
+  OverflowText,
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, chatDisplayTitle, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { botAvatarHtml, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string | number | Record<string, unknown>>;
+type CardPrefPatch = Record<string, boolean | string>;
 
 type JsonResponse = {
   ok: boolean;
@@ -56,6 +58,181 @@ type BotProfileRoleState = {
   error?: string;
   items: BotProfileRoleItem[];
 };
+
+export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
+
+export const BOT_DEFAULTS_TABS: readonly BotDefaultsTab[] = [
+  'common',
+  'sessions',
+  'security',
+  'cards',
+  'advanced',
+];
+
+export function BotDefaultsTabs(props: {
+  active: BotDefaultsTab;
+  onChange(tab: BotDefaultsTab): void;
+}) {
+  const tr = useT();
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const labels: Record<BotDefaultsTab, string> = {
+    common: tr('botDefaults.tabCommon'),
+    sessions: tr('botDefaults.tabSessions'),
+    security: tr('botDefaults.tabSecurity'),
+    cards: tr('botDefaults.tabCards'),
+    advanced: tr('botDefaults.tabAdvanced'),
+  };
+
+  function selectAt(index: number): void {
+    const nextIndex = (index + BOT_DEFAULTS_TABS.length) % BOT_DEFAULTS_TABS.length;
+    const next = BOT_DEFAULTS_TABS[nextIndex]!;
+    props.onChange(next);
+    tabRefs.current[nextIndex]?.focus();
+  }
+
+  return (
+    <nav className="bd-tab-bar" aria-label={tr('botDefaults.tabNavigation')}>
+      <div className="bd-tabs" role="tablist">
+        {BOT_DEFAULTS_TABS.map((tab, index) => (
+          <button
+            ref={node => { tabRefs.current[index] = node; }}
+            key={tab}
+            id={`bd-tab-${tab}`}
+            type="button"
+            role="tab"
+            className={`bd-tab${props.active === tab ? ' active' : ''}`}
+            aria-selected={props.active === tab}
+            aria-controls={`bd-panel-${tab}`}
+            tabIndex={props.active === tab ? 0 : -1}
+            data-bd-tab={tab}
+            onClick={() => props.onChange(tab)}
+            onKeyDown={event => {
+              if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                selectAt(index + 1);
+              } else if (event.key === 'ArrowLeft') {
+                event.preventDefault();
+                selectAt(index - 1);
+              } else if (event.key === 'Home') {
+                event.preventDefault();
+                selectAt(0);
+              } else if (event.key === 'End') {
+                event.preventDefault();
+                selectAt(BOT_DEFAULTS_TABS.length - 1);
+              }
+            }}
+          >
+            {labels[tab]}
+          </button>
+        ))}
+      </div>
+      <small className="bd-tab-hint">{tr('botDefaults.tabHint')}</small>
+    </nav>
+  );
+}
+
+// Two-column waterfall (masonry) for the task panels. A plain row-major grid
+// locks each row to its tallest tile, stranding a short tile beside a tall one
+// with a dead gap below. This lays tiles out by greedily dropping each into the
+// currently shortest column and writing back an inline grid-column /
+// grid-row-start over the CSS 1px row track. Tiles stay direct grid children —
+// never reparented into per-column wrappers — so their unsaved form drafts
+// (the whole point of the focused editor) never remount. Degrades to the plain
+// auto-fill grid when there is only one column (mobile / narrow) or before the
+// first measure.
+const BD_GRID_ROW_PX = 1; // must match grid-auto-rows in style.css
+const BD_GRID_GAP_PX = 14; // must match .bd-tab-grid gap
+
+export function BdTabGrid(props: { children: ReactNode; className?: string }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const grid = ref.current;
+    if (!grid || typeof window === 'undefined') return undefined;
+
+    const clearPlacement = (tiles: HTMLElement[]) => {
+      for (const tile of tiles) {
+        tile.style.gridColumn = '';
+        tile.style.gridRowStart = '';
+        tile.style.gridRowEnd = '';
+      }
+    };
+
+    const layout = () => {
+      const tiles = Array.from(grid.children).filter(
+        (n): n is HTMLElement => n instanceof HTMLElement,
+      );
+      if (!tiles.length) return;
+
+      // A hidden panel (display:none) reports 0 width — skip; the ResizeObserver
+      // re-fires with real geometry the moment the tab becomes visible.
+      const gridWidth = grid.clientWidth;
+      if (gridWidth <= 0) return;
+
+      // Decide the column count from the SAME width the CSS @container rule keys
+      // off (the .bd-detail container), instead of parsing
+      // getComputedStyle().gridTemplateColumns — that value contains spaces
+      // inside minmax(...) and, once we write an inline grid-column, can report a
+      // stale/implicit extra track, which previously produced a rogue 3rd column.
+      // Reading the container keeps JS placement and the CSS track count in lockstep.
+      const container = grid.closest<HTMLElement>('.bd-detail');
+      const decideWidth = container?.clientWidth ?? gridWidth;
+      const columns = decideWidth >= 1024 ? 2 : 1;
+
+      // Single column (mobile / narrow): normal flow already stacks with no gap.
+      if (columns < 2) { clearPlacement(tiles); return; }
+
+      const rowStep = BD_GRID_ROW_PX + BD_GRID_GAP_PX;
+      const colBottom = new Array<number>(columns).fill(0); // running bottom, row units
+
+      for (const tile of tiles) {
+        const spanRows = Math.max(
+          1,
+          Math.ceil((tile.getBoundingClientRect().height + BD_GRID_GAP_PX) / rowStep),
+        );
+        if (tile.classList.contains('bd-tile-wide')) {
+          // full-width tile: start below the tallest column, then level every
+          // column to its bottom so following tiles pack beneath it evenly.
+          const start = Math.max(...colBottom);
+          tile.style.gridColumn = '1 / -1';
+          tile.style.gridRowStart = String(start + 1);
+          tile.style.gridRowEnd = String(start + 1 + spanRows);
+          colBottom.fill(start + spanRows);
+          continue;
+        }
+        // drop into the currently shortest column (true waterfall)
+        let target = 0;
+        for (let c = 1; c < columns; c++) if (colBottom[c]! < colBottom[target]!) target = c;
+        const start = colBottom[target]!;
+        tile.style.gridColumn = String(target + 1);
+        tile.style.gridRowStart = String(start + 1);
+        tile.style.gridRowEnd = String(start + 1 + spanRows);
+        colBottom[target] = start + spanRows;
+      }
+    };
+
+    // Measure after paint; re-run on any tile resize (content toggles, textarea
+    // growth, async loads, tab becoming visible) and on viewport resize.
+    const raf = window.requestAnimationFrame(layout);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => layout()) : null;
+    if (ro) {
+      ro.observe(grid);
+      for (const child of Array.from(grid.children)) ro.observe(child);
+    }
+    window.addEventListener('resize', layout);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro?.disconnect();
+      window.removeEventListener('resize', layout);
+    };
+  });
+
+  return (
+    <div ref={ref} className={props.className ? `bd-tab-grid ${props.className}` : 'bd-tab-grid'}>
+      {props.children}
+    </div>
+  );
+}
 
 function statusClass(status: StatusMessage, extra = ''): string {
   const suffix = status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : '';
@@ -255,6 +432,7 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
 function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -264,16 +442,19 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
-    topicGroupMemory: body.topicGroupMemory,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
     docSubscribeDefaultMode: body.docSubscribeDefaultMode,
   };
 }
 
-function BotDefaultsPage() {
+export function BotDefaultsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
+  // Latest-wins guard: mount's first refresh() and bots.changed-triggered
+  // refresh()es can overlap, so a slow earlier response must not clobber a
+  // newer roster ("后发先回"). Only the latest in-flight request commits.
+  const refreshGateRef = useRef(createRefreshGate());
   const [bots, setBots] = useState<BotDefaultsRow[]>([]);
   const [cliState, setCliState] = useState<CliOptionsState>(fallbackCliOptionsState);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -284,18 +465,25 @@ function BotDefaultsPage() {
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<BotDefaultsTab>('common');
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
+    const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
       const [nextBots, nextCli] = await Promise.all([fetchBotDefaults(), fetchCliOptions()]);
-      if (!mountedRef.current) return;
+      // Drop a stale response: a newer refresh() started after us (e.g. a
+      // bots.changed fired while this request was in flight) — committing here
+      // would overwrite the fresher roster and re-hide the new bot.
+      if (!mountedRef.current || !req.commit()) return;
       setBots(nextBots.bots);
       setLoadError(nextBots.error);
       setCliState(nextCli);
     } finally {
-      if (mountedRef.current) setLoading(false);
+      // Only the latest request owns the loading flag — an out-of-order earlier
+      // response must not flip loading off while the newest is still pending.
+      if (mountedRef.current && req.commit()) setLoading(false);
     }
   }, []);
 
@@ -305,7 +493,14 @@ function BotDefaultsPage() {
     void loadNameMaps().then(() => {
       if (mountedRef.current) setAvatarVersion(value => value + 1);
     });
-    return () => { mountedRef.current = false; };
+    // Auto-refresh the roster when a bot is added / removed / renamed on the
+    // daemon side (SSE bots.changed), so the list stays live without a manual
+    // reload. The bot rows carry their own botName/cliId from /api/bots, so a
+    // plain refresh() is enough to surface a freshly-added bot.
+    const offBots = store.onBotsChanged(() => {
+      if (mountedRef.current) void refresh();
+    });
+    return () => { mountedRef.current = false; offBots(); };
   }, [refresh]);
 
   const filtered = useMemo(() => {
@@ -365,6 +560,8 @@ function BotDefaultsPage() {
         bot={selectedBot}
         cliState={cliState}
         patchBot={patchBot}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
       />
     );
   } else {
@@ -405,6 +602,12 @@ function BotDefaultsPage() {
               onChange={event => setQuery(event.currentTarget.value)}
             />
           </form>
+          <div className="bd-roster-meta">
+            <span>{tr('botDefaults.rosterCount', { count: filtered.length })}</span>
+            {query.trim() && filtered.length !== bots.length ? (
+              <span>{tr('botDefaults.rosterFiltered', { total: bots.length })}</span>
+            ) : null}
+          </div>
           <div className="bd-roster-list">
             {!loadError && filtered.map(bot => (
               <RosterItem
@@ -442,7 +645,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
     >
       <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, size: 'sm' })} />
       <div className="bd-roster-tx">
-        <b>{name}</b>
+        <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
       {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
@@ -450,7 +653,13 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
   );
 }
 
-function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState; patchBot: PatchBot }) {
+function BotDefaultsCard(props: {
+  bot: BotDefaultsRow;
+  cliState: CliOptionsState;
+  patchBot: PatchBot;
+  activeTab: BotDefaultsTab;
+  onTabChange(tab: BotDefaultsTab): void;
+}) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const name = bot.botName ?? bot.larkAppId;
@@ -483,56 +692,113 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
 
   return (
     <article className="bd-card bd-profile" data-appid={bot.larkAppId}>
-      <header className="bd-profile-head">
-        <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
-        <div className="bd-profile-main">
-          <BotProfileIdentity
-            bot={bot}
-            cli={cli}
-            patchBot={patchBot}
-            meta={(
-              <>
-                <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
-                <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small>
-                <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small>
-              </>
-            )}
-          />
+      <div className="bd-profile-chrome">
+        <header className="bd-profile-head">
+          <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
+          <div className="bd-profile-main">
+            <BotProfileIdentity
+              bot={bot}
+              cli={cli}
+              patchBot={patchBot}
+              meta={(
+                <>
+                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
+                  {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
+                </>
+              )}
+            />
+          </div>
+        </header>
+        <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
+      </div>
+      <div className="bd-body bd-tab-panels">
+        <div
+          id="bd-panel-common"
+          role="tabpanel"
+          aria-labelledby="bd-tab-common"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'common'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile">
+              <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
+            </section>
+            <section className="bd-tile">
+              <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+            </section>
+            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
         </div>
-      </header>
-      <div className="bd-body bd-grid">
-        <div className="bd-column">
-          <section className="bd-tile">
-            <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
-            <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+        <div
+          id="bd-panel-sessions"
+          role="tabpanel"
+          aria-labelledby="bd-tab-sessions"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'sessions'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile">
+              <CrossBotSection bot={bot} putCardPref={putCardPref} />
+            </section>
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-security"
+          role="tabpanel"
+          aria-labelledby="bd-tab-security"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'security'}
+        >
+          <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
-            {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {bot.cliId !== 'riff' && bot.sandbox === true ? (
+              <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-cards"
+          role="tabpanel"
+          aria-labelledby="bd-tab-cards"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'cards'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-advanced"
+          role="tabpanel"
+          aria-labelledby="bd-tab-advanced"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'advanced'}
+        >
+          <BdTabGrid>
             {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
                 手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
-          </section>
-          <section className="bd-tile">
-            <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
-        </div>
-        <div className="bd-column">
-          <section className="bd-tile">
-            <SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            <SubstituteModeSection bot={bot} patchBot={patchBot} />
-            <CrossBotSection bot={bot} putCardPref={putCardPref} />
-            <SessionCapSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile bd-topic-group-memory-tile">
-            <TopicGroupMemorySection bot={bot} putCardPref={putCardPref} />
-          </section>
-          <section className="bd-tile">
-            <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
-            <CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />
-            <SummaryTriggerSection bot={bot} patchBot={patchBot} />
-            <BrandSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
+                选了别的 agent 就隐藏，避免无效开关。 */}
+            {bot.cliId === 'codex-app' ? (
+              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+            ) : null}
+            <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
         </div>
       </div>
     </article>
@@ -544,7 +810,6 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
   return (
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
-      <StartupCommandsSection bot={props.bot} patchBot={props.patchBot} />
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
     </section>
@@ -639,6 +904,7 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
   }
 
   return (
+    <>
     <div className="bd-profile-avatar bd-avatar-editable" data-avatar-control>
       <button
         type="button"
@@ -664,14 +930,6 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
           void handleFile(file);
         }}
       />
-      {status ? (
-        <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
-          {status.text}
-          {loginVisible ? (
-            <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
-          ) : null}
-        </small>
-      ) : null}
       {loginOpen ? (
         <FeishuLoginModal
           onClose={() => setLoginOpen(false)}
@@ -683,6 +941,18 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
         />
       ) : null}
     </div>
+    {/* Status renders as a full-width in-flow strip on the header's second grid
+        row (not absolutely positioned under the avatar), so it never overlaps
+        the name-status or the tab bar below. */}
+    {status ? (
+      <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
+        {status.text}
+        {loginVisible ? (
+          <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+        ) : null}
+      </small>
+    ) : null}
+    </>
   );
 }
 
@@ -771,7 +1041,12 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
             aria-label={tr('botDefaults.renameTitle')}
             onClick={() => setEditMode(true)}
           >
-            {tr('botDefaults.renameAction')}
+            {/* Inline pencil SVG instead of a ✎ text glyph: the glyph's ink is
+                asymmetric within its em-box so flexbox centering left it visibly
+                off-center. An SVG centers by geometry. */}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+            </svg>
           </button>
         </div>
       ) : (
@@ -1365,11 +1640,11 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
-  // Read isolation rides the SAME toggle: it applies additionally wherever the
-  // CLI + platform can enforce it (claude/codex on macOS/Linux, no wrapper). Show a
-  // capability line so the owner sees whether THIS bot's sandbox also read-isolates
-  // (the "labelled separately" requirement) — best-effort: write protection always
-  // applies; read isolation only where supported.
+  // The unified fs-policy always provides deny-by-default file read/write
+  // isolation. This capability line is narrower: whether the CLI's global data
+  // root can additionally be redirected into this bot's private BOT_HOME
+  // (claude/codex, no wrapper), keeping CLI credentials/config/history separate
+  // from sibling bots. Keep that distinction explicit in the UI copy.
   const readIsoSupported = bot.readIsolationSupported === true;
   return (
     <section className="bd-section">
@@ -1392,11 +1667,270 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
+// ── Sandbox paths (three-tier whitelist) ──────────────────────────────────────
+type SandboxTier = 'readWrite' | 'readOnly' | 'deny';
+type SandboxTiers = { readWrite: string[]; readOnly: string[]; deny: string[] };
+
+/** Restrictiveness ranking — mirrors fs-policy.ts RESTRICTIVENESS so a same-path
+ *  cross-tier conflict resolves the SAME way the sandbox will (deny > ro > rw). */
+const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnly: 1, deny: 2 };
+
+/** Effective access for `path` under the three tiers: DEEPEST (longest-prefix)
+ *  matching rule wins; at equal depth (same path across tiers) the MORE
+ *  RESTRICTIVE tier wins — mirrors fs-policy.ts accessForPath + mergeFsRules so
+ *  the UI's live labels + path tester agree with what the sandbox enforces.
+ *  `home` expands a leading `~` the same way the worker does before matching, so
+ *  `~`-relative entries line up with absolute tree nodes. */
+export function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
+  const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
+  const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
+  const target = norm(path);
+  const covers = (parent: string, child: string) => {
+    const a = norm(parent), b = norm(child);
+    return a === b || b.startsWith(a === '/' ? '/' : a + '/');
+  };
+  const depth = (p: string) => norm(p) === '/' ? 0 : norm(p).split('/').filter(Boolean).length;
+  let best: { access: SandboxTier; ruleDepth: number; rule: string } | undefined;
+  const consider = (access: SandboxTier, rule: string) => {
+    if (!covers(rule, target)) return;
+    const d = depth(rule);
+    if (!best || d > best.ruleDepth
+      || (d === best.ruleDepth && SBX_RESTRICTIVENESS[access] > SBX_RESTRICTIVENESS[best.access])) {
+      best = { access, ruleDepth: d, rule };
+    }
+  };
+  for (const p of tiers.readWrite) consider('readWrite', p);
+  for (const p of tiers.readOnly) consider('readOnly', p);
+  for (const p of tiers.deny) consider('deny', p);
+  return best ? { access: best.access, rule: best.rule } : { access: 'none' };
+}
+
+function emptyTiers(): SandboxTiers { return { readWrite: [], readOnly: [], deny: [] }; }
+function normTiers(t?: BotDefaultsRow['sandboxPaths']): SandboxTiers {
+  if (!t) return emptyTiers();
+  return { readWrite: [...(t.readWrite ?? [])], readOnly: [...(t.readOnly ?? [])], deny: [...(t.deny ?? [])] };
+}
+function tiersEqual(a: SandboxTiers, b: SandboxTiers): boolean {
+  const k = (x: string[]) => [...x].sort().join('\n');
+  return k(a.readWrite) === k(b.readWrite) && k(a.readOnly) === k(b.readOnly) && k(a.deny) === k(b.deny);
+}
+/** Serialize tiers to the copy-paste text form (one path per line, tier-tagged). */
+function tiersToText(t: SandboxTiers): string {
+  const lines: string[] = [];
+  for (const p of t.readWrite) lines.push(`rw  ${p}`);
+  for (const p of t.readOnly) lines.push(`ro  ${p}`);
+  for (const p of t.deny) lines.push(`deny ${p}`);
+  return lines.join('\n');
+}
+/** Parse the copy-paste text form back into tiers. Tolerates `rw`/`readWrite`,
+ *  `ro`/`readOnly`, `deny`/`-`; blank lines and `#` comments are ignored. */
+function textToTiers(text: string): SandboxTiers {
+  const t = emptyTiers();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^(\S+)\s+(.+)$/.exec(line);
+    if (!m) continue;
+    const tag = m[1].toLowerCase();
+    const path = m[2].trim();
+    if (tag === 'rw' || tag === 'readwrite' || tag === 'rw:') t.readWrite.push(path);
+    else if (tag === 'ro' || tag === 'readonly' || tag === 'ro:') t.readOnly.push(path);
+    else if (tag === 'deny' || tag === '-' || tag === 'deny:') t.deny.push(path);
+  }
+  return t;
+}
+
+function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [tiers, setTiers] = useState<SandboxTiers>(() => normTiers(bot.sandboxPaths));
+  const [text, setText] = useState<string>(() => tiersToText(normTiers(bot.sandboxPaths)));
+  const [textMode, setTextMode] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const [testPath, setTestPath] = useState('');
+  // Lazy directory tree: path → child dir list (undefined = not yet loaded).
+  const [children, setChildren] = useState<Record<string, { name: string; path: string }[]>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [roots, setRoots] = useState<{ name: string; path: string }[]>([]);
+  // Canonical $HOME (first fs-list root) — used to expand `~` in tiers/tester
+  // the SAME way the worker does, so `~`-relative entries match absolute tree
+  // nodes and effective-access labels are accurate.
+  const [homeRoot, setHomeRoot] = useState<string>('~');
+
+  const saved = useMemo(() => normTiers(bot.sandboxPaths), [bot.sandboxPaths]);
+  useEffect(() => { setTiers(normTiers(bot.sandboxPaths)); setText(tiersToText(normTiers(bot.sandboxPaths))); }, [bot.sandboxPaths]);
+  const dirty = !tiersEqual(tiers, saved);
+
+  const loadDir = useCallback(async (path: string) => {
+    try {
+      const q = path ? `?path=${encodeURIComponent(path)}` : '';
+      const r = await fetch(`/api/fs/list${q}`);
+      const j = await r.json();
+      if (!j.ok) return;
+      if (!path) {
+        setRoots(j.entries.map((e: any) => ({ name: e.name, path: e.path })));
+        // Backend returns canonical $HOME explicitly (realpath'd) so `~` expansion
+        // here matches the realpath'd child nodes + the worker's sandbox binds.
+        if (typeof j.home === 'string' && j.home.startsWith('/')) setHomeRoot(j.home);
+      } else setChildren(prev => ({ ...prev, [path]: j.entries.map((e: any) => ({ name: e.name, path: e.path })) }));
+    } catch { /* listing is best-effort; manual/text entry still works */ }
+  }, []);
+  useEffect(() => { if (!textMode && roots.length === 0) void loadDir(''); }, [textMode, roots.length, loadDir]);
+
+  // The tier a path is EXPLICITLY set to (undefined = inherits from ancestor).
+  const explicitTier = useCallback((path: string): SandboxTier | undefined => {
+    const n = path.replace(/\/+$/, '') || '/';
+    if (tiers.readWrite.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'readWrite';
+    if (tiers.readOnly.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'readOnly';
+    if (tiers.deny.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'deny';
+    return undefined;
+  }, [tiers]);
+
+  // Cycle a node: inherit → readWrite → readOnly → deny → inherit.
+  const cycleNode = useCallback((path: string) => {
+    setStatus(null);
+    const n = path.replace(/\/+$/, '') || '/';
+    const cur = explicitTier(path);
+    const next: SandboxTier | undefined =
+      cur === undefined ? 'readWrite' : cur === 'readWrite' ? 'readOnly' : cur === 'readOnly' ? 'deny' : undefined;
+    setTiers(prev => {
+      const strip = (arr: string[]) => arr.filter(p => (p.replace(/\/+$/, '') || '/') !== n);
+      const t: SandboxTiers = { readWrite: strip(prev.readWrite), readOnly: strip(prev.readOnly), deny: strip(prev.deny) };
+      if (next) t[next].push(path);
+      setText(tiersToText(t));
+      return t;
+    });
+  }, [explicitTier]);
+
+  function syncFromText(next: string) {
+    setText(next);
+    setTiers(textToTiers(next));
+    setStatus(null);
+  }
+
+  async function save() {
+    setBusy(true); setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-paths`, tiers);
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.sbxPathsSaved')}`, ok: true });
+        patchBot(bot.larkAppId, { sandboxPaths: res.body.sandboxPaths ?? { readWrite: [], readOnly: [], deny: [] } });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tierBadge = (a: SandboxTier | 'none') =>
+    a === 'readWrite' ? tr('botDefaults.sbxRw')
+    : a === 'readOnly' ? tr('botDefaults.sbxRo')
+    : a === 'deny' ? tr('botDefaults.sbxDeny')
+    : tr('botDefaults.sbxNone');
+
+  function TreeNode(props: { name: string; path: string; depth: number }): ReactNode {
+    const { name, path, depth } = props;
+    const isOpen = expanded.has(path);
+    const explicit = explicitTier(path);
+    const eff = effectiveAccess(tiers, path, homeRoot);
+    const kids = children[path];
+    return (
+      <div className="bd-sbx-node">
+        <div className="bd-sbx-row" style={{ paddingLeft: depth * 16 }}>
+          <span
+            className="bd-sbx-twisty"
+            onClick={() => {
+              setExpanded(prev => { const s = new Set(prev); s.has(path) ? s.delete(path) : s.add(path); return s; });
+              if (!kids) void loadDir(path);
+            }}
+          >{isOpen ? '▾' : '▸'}</span>
+          <span className="bd-sbx-name" title={path}>{name}</span>
+          <button
+            type="button"
+            className={`bd-sbx-state bd-sbx-state-${explicit ?? 'inherit'}`}
+            data-action="cycle-sandbox-path"
+            data-path={path}
+            title={explicit ? undefined : `${tr('botDefaults.sbxInherit')}: ${tierBadge(eff.access)}`}
+            onClick={() => cycleNode(path)}
+          >
+            {explicit ? tierBadge(explicit) : `↳ ${tierBadge(eff.access)}`}
+          </button>
+        </div>
+        {isOpen && (
+          <div className="bd-sbx-kids">
+            {kids?.map(c => <TreeNode key={c.path} name={c.name} path={c.path} depth={depth + 1} />)}
+            {kids && kids.length === 0 && (
+              <div className="bd-sbx-empty" style={{ paddingLeft: (depth + 1) * 16 + 20 }}>{tr('botDefaults.sbxNoSubdirs')}</div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const testResult = testPath.trim() ? effectiveAccess(tiers, testPath.trim(), homeRoot) : null;
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSandboxPaths')}</h3>
+      <p className="bd-section-note">{tr('botDefaults.sbxPathsHelp')}</p>
+      <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
+        <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
+          {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}
+        </button>
+      </div>
+
+      {textMode ? (
+        <textarea
+          className="bd-sbx-text"
+          data-field="sandbox-paths-text"
+          rows={8}
+          value={text}
+          spellCheck={false}
+          placeholder={'rw  ~/my-data\nro  ~/reference-repos\ndeny ~/my-data/secrets'}
+          onChange={e => syncFromText(e.target.value)}
+        />
+      ) : (
+        <div className="bd-sbx-tree" data-field="sandbox-paths-tree">
+          {roots.map(r => <TreeNode key={r.path} name={r.name} path={r.path} depth={0} />)}
+        </div>
+      )}
+
+      <div className="bd-sbx-tester">
+        <input
+          className="bd-sbx-test-input"
+          data-field="sandbox-path-test"
+          placeholder={tr('botDefaults.sbxTestPlaceholder')}
+          value={testPath}
+          onChange={e => setTestPath(e.target.value)}
+        />
+        {testResult && (
+          <span className={`bd-sbx-test-out bd-sbx-state-${testResult.access}`} data-test-access={testResult.access}>
+            {tierBadge(testResult.access)}{testResult.rule ? ` ← ${testResult.rule}` : ''}
+          </span>
+        )}
+      </div>
+
+      <div className="actions">
+        <button type="button" className="bd-btn bd-btn-primary" data-action="save-sandbox-paths" disabled={busy || !dirty} onClick={() => void save()}>
+          {tr('botDefaults.sbxPathsSave')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-sandbox-paths-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
 const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
   { value: '', labelKey: 'botDefaults.backendAuto' },
   { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
   { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
   { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
+  { value: 'zmx', labelKey: 'botDefaults.backendZmx' },
   { value: 'pty', labelKey: 'botDefaults.backendPty' },
 ];
 
@@ -1461,6 +1995,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const { bot, patchBot } = props;
   const [loaded, setLoaded] = useState(typeof bot.teamRole === 'string');
   const [role, setRole] = useState(typeof bot.teamRole === 'string' ? bot.teamRole : '');
+  const [injectMode, setInjectMode] = useState<RoleInjectMode>('every');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -1486,6 +2021,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         if (r.ok && body.ok) {
           const next = body.role ?? '';
           setRole(next);
+          setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
           setLoaded(true);
           patchBot(bot.larkAppId, { teamRole: next });
         } else {
@@ -1498,15 +2034,31 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     return () => { active = false; };
   }, [bot.larkAppId, bot.teamRole, patchBot, tr]);
 
-  async function putRole(nextRole: string, deleted: boolean): Promise<void> {
+  // injectMode isn't cached on the bot row, so when the team role is already
+  // resolved (cache hit above skips the GET) fetch just the mode once per bot.
+  useEffect(() => {
+    let active = true;
+    if (typeof bot.teamRole !== 'string') return () => { active = false; };
+    void (async () => {
+      try {
+        const r = await fetch(`/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`);
+        const body = await r.json().catch(() => ({}));
+        if (active && r.ok && body.ok) setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
+      } catch { /* keep default 'every' */ }
+    })();
+    return () => { active = false; };
+  }, [bot.larkAppId]);
+
+  async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
     if (!loaded) return;
     setStatus(null);
     setBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole });
+      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode });
       if (res.ok && res.body.ok) {
         const stored = nextRole.trim();
         setRole(stored);
+        if (res.body.injectMode === 'once' || res.body.injectMode === 'every') setInjectMode(res.body.injectMode);
         patchBot(bot.larkAppId, { teamRole: stored });
         setStatus({ text: `✓ ${deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved')}`, ok: true });
       } else {
@@ -1519,6 +2071,11 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  const injectOptions: Array<{ value: RoleInjectMode; label: string }> = [
+    { value: 'every', label: tr('roles.injectModeEvery') },
+    { value: 'once', label: tr('roles.injectModeOnce') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.roleHelp')}>{tr('botDefaults.sectionRole')}</FieldTitle></h3>
@@ -1530,6 +2087,19 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         value={role}
         onChange={event => setRole(event.currentTarget.value)}
       />
+      <div className="bd-role-inject">
+        <span className="bd-subsection-title"><FieldTitle help={tr('roles.injectModeHint')}>{tr('roles.injectModeLabel')}</FieldTitle></span>
+        <DropdownMenu<RoleInjectMode>
+          id={`bd-role-inject-${bot.larkAppId}`}
+          className="bd-role-inject-menu"
+          ariaLabel={tr('roles.injectModeLabel')}
+          disabled={!loaded || busy}
+          label={dropdownLabel(injectOptions, injectMode)}
+          value={injectMode}
+          options={injectOptions}
+          onChange={mode => { const next = mode === 'once' ? 'once' : 'every'; setInjectMode(next); void putRole(role, role.trim() === '', next); }}
+        />
+      </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />
@@ -1631,9 +2201,10 @@ function ProfileRoles(props: { appId: string }) {
   );
 }
 
-function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -1642,28 +2213,64 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.disableStreamingCard, bot.privateCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
-  async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
+  async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
     setStatus(null);
     try {
       const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        rollback?.();
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
     } catch (e: any) {
+      rollback?.();
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setBusy(null);
     }
   }
 
+  const usageDisplayOptions: DropdownFieldOption<'streaming' | 'footer' | 'off'>[] = [
+    { value: 'streaming', label: tr('botDefaults.usageDisplayStreaming') },
+    { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
+    { value: 'off', label: tr('botDefaults.usageDisplayOff') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
+      {bot.usageSupported === true && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.usageDisplayHelp')}>{tr('botDefaults.usageDisplay')}</FieldTitle>
+            <DropdownField
+              dataInput="usageDisplay"
+              ariaLabel={tr('botDefaults.usageDisplay')}
+              value={usageDisplay}
+              disabled={busy === 'usage'}
+              options={usageDisplayOptions}
+              onChange={next => {
+                const previous = usageDisplay;
+                setUsageDisplay(next);
+                void savePatch(
+                  { usageDisplay: next },
+                  'usage',
+                  () => setUsageDisplay(previous),
+                );
+              }}
+            />
+          </div>
+        </div>
+      )}
       <div className="bd-toggle-grid bd-card-behavior-grid">
         <ToggleRow
           checked={disableStreaming}
@@ -1884,7 +2491,7 @@ function SessionModeSection(props: {
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
   const tr = useT();
-  const [p2p, setP2p] = useState(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+  const [p2p, setP2p] = useState(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -1895,7 +2502,7 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
-    setP2p(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+    setP2p(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
     setRegular(regularGroupMode(props.bot));
     setMention(mentionMode(props.bot));
     setDocMode(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -1914,7 +2521,7 @@ function SessionModeSection(props: {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
       if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'chat' ? 'chat' : 'thread' });
+        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'thread' ? 'thread' : 'chat' });
         setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -2049,6 +2656,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const [replyMode, setReplyMode] = useState<'thread' | 'quote'>(initial?.replyMode === 'quote' ? 'quote' : 'thread');
   const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
   const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
+  const [excludedChatsText, setExcludedChatsText] = useState(() => formatSubstituteChats(initial?.excludedChats));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -2142,13 +2750,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
     setControlCard(next?.disableControlCard !== true);
     setChatsText(formatSubstituteChats(next?.chats));
+    setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -2169,6 +2778,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
         setControlCard(next?.disableControlCard !== true);
         setChatsText(formatSubstituteChats(next?.chats));
+        setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -2241,7 +2851,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -2324,6 +2934,19 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
             value={chatsText}
             disabled={busy}
             onChange={event => setChatsText(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteExcludedChatsHelp')}>{tr('botDefaults.substituteExcludedChats')}</FieldTitle>
+          <textarea
+            data-input="substituteExcludedChats"
+            rows={3}
+            placeholder={tr('botDefaults.substituteExcludedChatsPlaceholder')}
+            value={excludedChatsText}
+            disabled={busy}
+            onChange={event => setExcludedChatsText(event.currentTarget.value)}
           />
         </label>
       </div>
@@ -2447,527 +3070,15 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
 }
 
 function regularGroupMode(bot: BotDefaultsRow): string {
-  return bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared' || bot.regularGroupReplyMode === 'chat-topic'
+  return bot.regularGroupReplyMode === 'chat' || bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared'
     ? bot.regularGroupReplyMode
-    : 'chat';
+    : 'chat-topic';
 }
 
 function mentionMode(bot: BotDefaultsRow): string {
   return bot.regularGroupMentionMode === 'topic' || bot.regularGroupMentionMode === 'never' || bot.regularGroupMentionMode === 'ambient'
     ? bot.regularGroupMentionMode
     : 'always';
-}
-
-type TopicGroupMemorySelection = {
-  stats: TopicGroupMemoryStats;
-  memory: TopicGroupMemoryDocument | null;
-};
-
-const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10;
-
-function topicGroupMemoryChatName(chatId: string, fallback: string): string {
-  return chatDisplayTitle({ chatId })?.trim() || fallback;
-}
-
-function topicGroupMemoryForDisplay(memory: TopicGroupMemoryDocument | null): Record<string, unknown> | null {
-  if (!memory) return null;
-  const { larkAppId: _larkAppId, chatId: _chatId, ...visible } = memory;
-  return visible;
-}
-
-function TopicGroupMemoryDetailDialog(props: {
-  selected: TopicGroupMemorySelection | null;
-  onClose(): void;
-}) {
-  const tr = useT();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  const chatName = props.selected
-    ? topicGroupMemoryChatName(props.selected.stats.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))
-    : null;
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.selected && !dialog.open) {
-      try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
-    } else if (!props.selected && dialog.open) {
-      dialog.close();
-    }
-  }, [props.selected]);
-
-  useEffect(() => () => {
-    const dialog = dialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
-
-  return (
-    <dialog
-      ref={dialogRef}
-      className="tgm-memory-detail-dialog"
-      data-topic-group-memory-detail-dialog
-      aria-label={chatName ? tr('botDefaults.topicGroupMemoryDetail', { name: chatName }) : undefined}
-      onCancel={event => {
-        event.preventDefault();
-        props.onClose();
-      }}
-      onClose={props.onClose}
-      onClick={event => {
-        if (event.target === event.currentTarget) props.onClose();
-      }}
-    >
-      {props.selected && chatName ? (
-        <article className="tgm-memory-detail-card">
-          <header className="tgm-memory-detail-head">
-            <div className="tgm-memory-detail-title">
-              <h3>{tr('botDefaults.topicGroupMemoryDetail', { name: chatName })}</h3>
-            </div>
-            <button type="button" onClick={props.onClose}>
-              {tr('botDefaults.topicGroupMemoryDetailClose')}
-            </button>
-          </header>
-          <div className="tgm-memory-detail-body">
-            <pre>{JSON.stringify(topicGroupMemoryForDisplay(props.selected.memory), null, 2)}</pre>
-          </div>
-        </article>
-      ) : null}
-    </dialog>
-  );
-}
-
-function TopicGroupMemorySection(props: {
-  bot: BotDefaultsRow;
-  putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
-}) {
-  const tr = useT();
-  const current = props.bot.topicGroupMemory ?? {};
-  const [enabled, setEnabled] = useState(current.enabled === true);
-  const [injectMode, setInjectMode] = useState<'off' | 'summary' | 'summary-and-facts'>(
-    current.injectMode === 'off' || current.injectMode === 'summary-and-facts' ? current.injectMode : 'summary',
-  );
-  const [updateMode, setUpdateMode] = useState<'off' | 'manual' | 'auto'>(
-    current.updateMode === 'off' || current.updateMode === 'manual' ? current.updateMode : 'auto',
-  );
-  const [maxPromptChars, setMaxPromptChars] = useState(String(current.maxPromptChars ?? 8000));
-  const [maxSummaryChars, setMaxSummaryChars] = useState(String(current.maxSummaryChars ?? 10000));
-  const [httpEnabled, setHttpEnabled] = useState(current.httpLlm?.enabled !== false);
-  const [httpAutoDiscover, setHttpAutoDiscover] = useState(current.httpLlm?.autoDiscoverCodex !== false);
-  const [httpBaseUrl, setHttpBaseUrl] = useState(current.httpLlm?.baseUrl ?? '');
-  const [httpModel, setHttpModel] = useState(current.httpLlm?.model ?? '');
-  const [httpApi, setHttpApi] = useState<'auto' | 'responses' | 'chat-completions'>(
-    current.httpLlm?.api === 'responses' || current.httpLlm?.api === 'chat-completions' ? current.httpLlm.api : 'auto',
-  );
-  const [httpTimeoutMs, setHttpTimeoutMs] = useState(String(current.httpLlm?.timeoutMs ?? 60000));
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
-  const [memories, setMemories] = useState<TopicGroupMemoryStats[]>([]);
-  const [memoryBusy, setMemoryBusy] = useState(false);
-  const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
-  const [selectedMemory, setSelectedMemory] = useState<TopicGroupMemorySelection | null>(null);
-  const [memoryPage, setMemoryPage] = useState(1);
-
-  useEffect(() => {
-    const next = props.bot.topicGroupMemory ?? {};
-    setEnabled(next.enabled === true);
-    setInjectMode(next.injectMode === 'off' || next.injectMode === 'summary-and-facts' ? next.injectMode : 'summary');
-    setUpdateMode(next.updateMode === 'off' || next.updateMode === 'manual' ? next.updateMode : 'auto');
-    setMaxPromptChars(String(next.maxPromptChars ?? 8000));
-    setMaxSummaryChars(String(next.maxSummaryChars ?? 10000));
-    setHttpEnabled(next.httpLlm?.enabled !== false);
-    setHttpAutoDiscover(next.httpLlm?.autoDiscoverCodex !== false);
-    setHttpBaseUrl(next.httpLlm?.baseUrl ?? '');
-    setHttpModel(next.httpLlm?.model ?? '');
-    setHttpApi(next.httpLlm?.api === 'responses' || next.httpLlm?.api === 'chat-completions' ? next.httpLlm.api : 'auto');
-    setHttpTimeoutMs(String(next.httpLlm?.timeoutMs ?? 60000));
-  }, [props.bot.topicGroupMemory]);
-
-  const memoryBaseUrl = `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-group-memory`;
-
-  const loadMemories = useCallback(async (): Promise<void> => {
-    setMemoryBusy(true);
-    setMemoryStatus(null);
-    try {
-      const res = await sendJson('GET', memoryBaseUrl);
-      if (!res.ok || !Array.isArray(res.body?.memories)) {
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      const nextMemories = res.body.memories as TopicGroupMemoryStats[];
-      setMemories(nextMemories);
-      setMemoryPage(currentPage => Math.min(
-        currentPage,
-        Math.max(1, Math.ceil(nextMemories.length / TOPIC_GROUP_MEMORY_PAGE_SIZE)),
-      ));
-    } catch (error) {
-      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
-  }, [memoryBaseUrl]);
-
-  useEffect(() => {
-    setMemories([]);
-    setSelectedMemory(null);
-    setMemoryPage(1);
-    void loadMemories();
-  }, [loadMemories]);
-
-  async function viewMemory(chatId: string): Promise<void> {
-    setMemoryBusy(true);
-    setMemoryStatus(null);
-    try {
-      const res = await sendJson('GET', `${memoryBaseUrl}/${encodeURIComponent(chatId)}`);
-      if (!res.ok || !res.body?.stats) {
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      setSelectedMemory({ stats: res.body.stats, memory: res.body.memory ?? null });
-    } catch (error) {
-      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
-  }
-
-  async function compactMemory(chatId: string): Promise<void> {
-    setMemoryBusy(true);
-    setMemoryStatus(null);
-    try {
-      const res = await sendJson('POST', `${memoryBaseUrl}/${encodeURIComponent(chatId)}/compact`);
-      if (!res.ok) {
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      setMemoryStatus({
-        text: `✓ ${tr(res.body.compacted ? 'botDefaults.topicGroupMemoryCompacted' : 'botDefaults.topicGroupMemoryCompactNoop')}`,
-        ok: true,
-      });
-      if (res.body.stats) setSelectedMemory({ stats: res.body.stats, memory: res.body.doc ?? null });
-      await loadMemories();
-    } catch (error) {
-      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
-  }
-
-  async function deleteMemory(chatId: string): Promise<void> {
-    const chatName = topicGroupMemoryChatName(chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'));
-    if (!window.confirm(tr('botDefaults.topicGroupMemoryDeleteConfirm', { group: chatName }))) return;
-    setMemoryBusy(true);
-    setMemoryStatus(null);
-    try {
-      const res = await sendJson('DELETE', `${memoryBaseUrl}/${encodeURIComponent(chatId)}`);
-      if (!res.ok) {
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      if (selectedMemory?.stats.chatId === chatId) setSelectedMemory(null);
-      setMemoryStatus({ text: `✓ ${tr('botDefaults.topicGroupMemoryDeleted')}`, ok: true });
-      await loadMemories();
-    } catch (error) {
-      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
-  }
-
-  async function clearAllMemories(): Promise<void> {
-    if (memories.length === 0) return;
-    if (!window.confirm(tr('botDefaults.topicGroupMemoryClearAllConfirm', { count: memories.length }))) return;
-    setMemoryBusy(true);
-    setMemoryStatus(null);
-    try {
-      const res = await sendJson('POST', memoryBaseUrl);
-      if (!res.ok) {
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      setSelectedMemory(null);
-      setMemoryStatus({ text: `✓ ${tr('botDefaults.topicGroupMemoryClearedAll', { count: res.body.count ?? memories.length })}`, ok: true });
-      await loadMemories();
-    } catch (error) {
-      setMemoryStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
-  }
-
-  async function save(patch: Record<string, unknown>): Promise<boolean> {
-    setBusy(true);
-    setStatus(null);
-    try {
-      const res = await props.putCardPref({ topicGroupMemory: patch });
-      if (res.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-        return true;
-      }
-      setStatus({ text: `✗ ${responseErrorText(res)}` });
-      return false;
-    } catch (error) {
-      setStatus({ text: `✗ ${caughtErrorText(error)}` });
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveLimits(): Promise<void> {
-    const promptChars = Number(maxPromptChars);
-    const summaryChars = Number(maxSummaryChars);
-    if (!Number.isInteger(promptChars) || promptChars < 500 || promptChars > 8_000
-      || !Number.isInteger(summaryChars) || summaryChars < 500 || summaryChars > 10_000) {
-      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryLimitsInvalid')}` });
-      return;
-    }
-    await save({ maxPromptChars: promptChars, maxSummaryChars: summaryChars });
-  }
-
-  async function saveHttpLlm(): Promise<void> {
-    const timeoutMs = Number(httpTimeoutMs);
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
-      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryHttpTimeoutInvalid')}` });
-      return;
-    }
-    await save({
-      httpLlm: {
-        enabled: httpEnabled,
-        autoDiscoverCodex: httpAutoDiscover,
-        baseUrl: httpBaseUrl.trim(),
-        model: httpModel.trim(),
-        api: httpApi,
-        timeoutMs,
-      },
-    });
-  }
-
-  const injectOptions: DropdownFieldOption<'off' | 'summary' | 'summary-and-facts'>[] = [
-    { value: 'off', label: tr('botDefaults.topicGroupMemoryInjectOff') },
-    { value: 'summary', label: tr('botDefaults.topicGroupMemoryInjectSummary') },
-    { value: 'summary-and-facts', label: tr('botDefaults.topicGroupMemoryInjectFacts') },
-  ];
-  const updateOptions: DropdownFieldOption<'off' | 'manual' | 'auto'>[] = [
-    { value: 'off', label: tr('botDefaults.topicGroupMemoryUpdateOff') },
-    { value: 'manual', label: tr('botDefaults.topicGroupMemoryUpdateManual') },
-    { value: 'auto', label: tr('botDefaults.topicGroupMemoryUpdateAuto') },
-  ];
-  const httpApiOptions: DropdownFieldOption<'auto' | 'responses' | 'chat-completions'>[] = [
-    { value: 'auto', label: tr('botDefaults.topicGroupMemoryHttpApiAuto') },
-    { value: 'responses', label: 'Responses API' },
-    { value: 'chat-completions', label: 'Chat Completions API' },
-  ];
-  const memoryTotalPages = Math.max(1, Math.ceil(memories.length / TOPIC_GROUP_MEMORY_PAGE_SIZE));
-  const safeMemoryPage = Math.min(memoryPage, memoryTotalPages);
-  const memoryPageStart = (safeMemoryPage - 1) * TOPIC_GROUP_MEMORY_PAGE_SIZE;
-  const visibleMemories = memories.slice(memoryPageStart, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
-  const memoryPageFrom = memories.length === 0 ? 0 : memoryPageStart + 1;
-  const memoryPageTo = Math.min(memories.length, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
-
-  return (
-    <section className="bd-section tgm-memory-section" data-topic-group-memory>
-      <h3 className="bd-section-title">{tr('botDefaults.sectionTopicGroupMemory')}</h3>
-      <details className="tgm-memory-help">
-        <summary>{tr('botDefaults.topicGroupMemoryHelpSummary')}</summary>
-        <p>{tr('botDefaults.topicGroupMemoryHelp')}</p>
-      </details>
-      <ToggleRow
-        checked={enabled}
-        disabled={busy}
-        dataAction="toggle-topic-group-memory"
-        title={tr('botDefaults.topicGroupMemoryEnabled')}
-        help={tr('botDefaults.topicGroupMemoryEnabledHelp')}
-        onChange={next => {
-          const previous = enabled;
-          setEnabled(next);
-          void save({ enabled: next }).then(ok => { if (!ok) setEnabled(previous); });
-        }}
-      />
-      <div className="bd-row tgm-memory-settings-grid">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.topicGroupMemoryInjectHelp')}>{tr('botDefaults.topicGroupMemoryInjectMode')}</FieldTitle>
-          <DropdownField
-            dataInput="topicGroupMemoryInjectMode"
-            value={injectMode}
-            disabled={busy}
-            options={injectOptions}
-            onChange={next => {
-              const previous = injectMode;
-              setInjectMode(next);
-              void save({ injectMode: next }).then(ok => { if (!ok) setInjectMode(previous); });
-            }}
-          />
-        </div>
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.topicGroupMemoryUpdateHelp')}>{tr('botDefaults.topicGroupMemoryUpdateMode')}</FieldTitle>
-          <DropdownField
-            dataInput="topicGroupMemoryUpdateMode"
-            value={updateMode}
-            disabled={busy}
-            options={updateOptions}
-            onChange={next => {
-              const previous = updateMode;
-              setUpdateMode(next);
-              void save({ updateMode: next }).then(ok => { if (!ok) setUpdateMode(previous); });
-            }}
-          />
-        </div>
-      </div>
-      <div className="bd-row tgm-memory-settings-grid">
-        <label>
-          <span>{tr('botDefaults.topicGroupMemoryMaxPromptChars')}</span>
-          <input type="number" min="500" max="8000" value={maxPromptChars} disabled={busy} onChange={event => setMaxPromptChars(event.currentTarget.value)} />
-        </label>
-        <label>
-          <span>{tr('botDefaults.topicGroupMemoryMaxSummaryChars')}</span>
-          <input type="number" min="500" max="10000" value={maxSummaryChars} disabled={busy} onChange={event => setMaxSummaryChars(event.currentTarget.value)} />
-        </label>
-      </div>
-      <div className="actions">
-        <button type="button" className="primary" disabled={busy} data-action="save-topic-group-memory-limits" onClick={() => void saveLimits()}>
-          {tr('botDefaults.save')}
-        </button>
-        <StatusSpan status={status} attr={{ 'data-topic-group-memory-status': '' }} />
-      </div>
-      <div className="bd-subsection tgm-memory-http-llm">
-        <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryHttpTitle')}</h4>
-        <p className="bd-section-help">{tr('botDefaults.topicGroupMemoryHttpHelp')}</p>
-        <ToggleRow
-          checked={httpEnabled}
-          disabled={busy}
-          dataAction="toggle-topic-group-memory-http"
-          title={tr('botDefaults.topicGroupMemoryHttpEnabled')}
-          help={tr('botDefaults.topicGroupMemoryHttpEnabledHelp')}
-          onChange={setHttpEnabled}
-        />
-        <ToggleRow
-          checked={httpAutoDiscover}
-          disabled={busy || !httpEnabled}
-          dataAction="toggle-topic-group-memory-http-discovery"
-          title={tr('botDefaults.topicGroupMemoryHttpAutoDiscover')}
-          help={tr('botDefaults.topicGroupMemoryHttpAutoDiscoverHelp')}
-          onChange={setHttpAutoDiscover}
-        />
-        <div className="bd-row tgm-memory-settings-grid">
-          <label>
-            <span>{tr('botDefaults.topicGroupMemoryHttpBaseUrl')}</span>
-            <input type="text" placeholder="http://127.0.0.1:8787/v1" value={httpBaseUrl} disabled={busy || !httpEnabled} onChange={event => setHttpBaseUrl(event.currentTarget.value)} />
-          </label>
-          <label>
-            <span>{tr('botDefaults.topicGroupMemoryHttpModel')}</span>
-            <input type="text" placeholder={tr('botDefaults.topicGroupMemoryHttpModelPlaceholder')} value={httpModel} disabled={busy || !httpEnabled} onChange={event => setHttpModel(event.currentTarget.value)} />
-          </label>
-        </div>
-        <div className="bd-row tgm-memory-settings-grid">
-          <div className="bd-field">
-            <span>{tr('botDefaults.topicGroupMemoryHttpApi')}</span>
-            <DropdownField dataInput="topicGroupMemoryHttpApi" value={httpApi} disabled={busy || !httpEnabled} options={httpApiOptions} onChange={value => setHttpApi(value as 'auto' | 'responses' | 'chat-completions')} />
-          </div>
-          <label>
-            <span>{tr('botDefaults.topicGroupMemoryHttpTimeout')}</span>
-            <input type="number" min="1000" max="300000" step="1000" value={httpTimeoutMs} disabled={busy || !httpEnabled} onChange={event => setHttpTimeoutMs(event.currentTarget.value)} />
-          </label>
-        </div>
-        <div className="actions">
-          <button type="button" className="primary" disabled={busy} onClick={() => void saveHttpLlm()}>{tr('botDefaults.save')}</button>
-        </div>
-      </div>
-      <div className="bd-subsection tgm-memory-management">
-        <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryManagement')}</h4>
-        <div className="tgm-memory-status-strip" data-topic-group-memory-summary>
-          <span>{enabled ? tr('botDefaults.topicGroupMemoryStateEnabled') : tr('botDefaults.topicGroupMemoryStateDisabled')}</span>
-          <span>{tr('botDefaults.topicGroupMemoryCountSummary', { count: memories.length })}</span>
-          <span>{tr('botDefaults.topicGroupMemorySizeSummary', { size: formatMemoryBytes(memories.reduce((sum, item) => sum + item.sizeBytes, 0)) })}</span>
-        </div>
-        <div className="actions">
-          <button type="button" disabled={memoryBusy} onClick={() => void loadMemories()}>
-            {tr('botDefaults.topicGroupMemoryRefresh')}
-          </button>
-          <button type="button" className="danger" disabled={memoryBusy || memories.length === 0} onClick={() => void clearAllMemories()}>
-            {tr('botDefaults.topicGroupMemoryClearAll')}
-          </button>
-          <StatusSpan status={memoryStatus} attr={{ 'data-topic-group-memory-management-status': '' }} />
-        </div>
-        {memories.length === 0 && !memoryBusy
-          ? <div className="tgm-memory-empty">{tr('botDefaults.topicGroupMemoryEmpty')}</div>
-          : (
-            <div className="tgm-memory-table-shell">
-              <div
-                className="tgm-memory-table-wrap"
-                tabIndex={0}
-                role="region"
-                aria-label={tr('botDefaults.topicGroupMemoryTableScrollLabel')}
-              >
-                <table className="tgm-memory-table">
-                  <thead>
-                    <tr>
-                      <th>{tr('botDefaults.topicGroupMemoryChatId')}</th>
-                      <th>{tr('botDefaults.topicGroupMemorySize')}</th>
-                      <th>{tr('botDefaults.topicGroupMemoryEntries')}</th>
-                      <th>{tr('botDefaults.topicGroupMemoryActions')}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleMemories.map(memory => (
-                      <tr key={memory.chatId}>
-                        <td data-label={tr('botDefaults.topicGroupMemoryChatId')}>
-                          <div className="tgm-memory-chat">
-                            <strong>{topicGroupMemoryChatName(memory.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))}</strong>
-                          </div>
-                          {memory.error ? <small className="hint-warn-inline">{memory.error}</small> : null}
-                        </td>
-                        <td data-label={tr('botDefaults.topicGroupMemorySize')}>{formatMemoryBytes(memory.sizeBytes)}</td>
-                        <td data-label={tr('botDefaults.topicGroupMemoryEntries')}>
-                          <span className="tgm-memory-entry-counts">{tr('botDefaults.topicGroupMemoryEntryCounts', {
-                            facts: memory.facts,
-                            decisions: memory.decisions,
-                            questions: memory.openQuestions,
-                            resources: memory.resources,
-                            contributions: memory.recentContributions,
-                          })}</span>
-                        </td>
-                        <td data-label={tr('botDefaults.topicGroupMemoryActions')}>
-                          <div className="tgm-memory-row-actions">
-                            <button type="button" disabled={memoryBusy || !!memory.error} onClick={() => void viewMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryView')}</button>
-                            <button type="button" disabled={memoryBusy || !!memory.error} onClick={() => void compactMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryCompact')}</button>
-                            <button type="button" className="danger" disabled={memoryBusy} onClick={() => void deleteMemory(memory.chatId)}>{tr('botDefaults.topicGroupMemoryDelete')}</button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <nav className="tgm-memory-pagination" aria-label={tr('botDefaults.topicGroupMemoryPaginationLabel')}>
-                <span className="tgm-memory-pagination-status" aria-live="polite">
-                  {tr('botDefaults.topicGroupMemoryPageStatus', {
-                    page: safeMemoryPage,
-                    pages: memoryTotalPages,
-                    from: memoryPageFrom,
-                    to: memoryPageTo,
-                    total: memories.length,
-                  })}
-                </span>
-                <div className="tgm-memory-pagination-actions">
-                  <button type="button" disabled={safeMemoryPage <= 1 || memoryBusy} onClick={() => setMemoryPage(safeMemoryPage - 1)}>
-                    {tr('botDefaults.topicGroupMemoryPrevPage')}
-                  </button>
-                  <button type="button" disabled={safeMemoryPage >= memoryTotalPages || memoryBusy} onClick={() => setMemoryPage(safeMemoryPage + 1)}>
-                    {tr('botDefaults.topicGroupMemoryNextPage')}
-                  </button>
-                </div>
-              </nav>
-            </div>
-          )}
-        <TopicGroupMemoryDetailDialog selected={selectedMemory} onClose={() => setSelectedMemory(null)} />
-      </div>
-    </section>
-  );
-}
-
-function formatMemoryBytes(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return '0 B';
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -3019,8 +3130,8 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title">{tr('botDefaults.sectionSessionCap')}</h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSessionCap')}</h3>
       <div className="bd-row bd-quota">
         <label>
           <FieldTitle help={tr('botDefaults.maxLiveWorkersHelp')}>{tr('botDefaults.maxLiveWorkers')}</FieldTitle>
@@ -3039,7 +3150,7 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -3072,8 +3183,8 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
       <textarea
         data-input="startupCommands"
         rows={3}
@@ -3086,7 +3197,102 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <button type="button" className="primary" data-action="save-startup-commands" disabled={busy} onClick={() => void save()}>{tr('botDefaults.startupCommandsSave')}</button>
         <StatusSpan status={status} attr={{ 'data-startup-commands-status': '' }} />
       </div>
-    </div>
+    </section>
+  );
+}
+
+// Slash 命令权限：把 /botconfig 的 customPassthroughCommands（透传给 CLI）与
+// canTalkDaemonCommands（daemon 命令降到 canTalk）搬到 Dashboard 可视化编辑。
+// 两者都是 stringList immediate 字段，走各自的 PUT 代理路由，空串＝清除回默认。
+function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPassthrough(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  }, [props.bot.customPassthroughCommands]);
+  // 分开两个 effect：只让「被保存的那个字段」的 prop 变化重置对应输入框，否则保存
+  // 一个字段触发 patchBot 重渲染会连带把另一个字段的未保存草稿一并清空。
+  useEffect(() => {
+    setCanTalk(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
+  }, [props.bot.canTalkDaemonCommands]);
+
+  async function savePassthrough(): Promise<void> {
+    setStatus(null);
+    setBusy('passthrough');
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.customPassthroughCommands === 'string' ? res.body.customPassthroughCommands : '';
+        setPassthrough(next);
+        props.patchBot(props.bot.larkAppId, { customPassthroughCommands: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveCanTalk(): Promise<void> {
+    setStatus(null);
+    setBusy('cantalk');
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/cantalk-daemon-commands`, { canTalkDaemonCommands: canTalk });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.canTalkDaemonCommands === 'string' ? res.body.canTalkDaemonCommands : '';
+        setCanTalk(next);
+        props.patchBot(props.bot.larkAppId, { canTalkDaemonCommands: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.sectionSlashCommandsHelp')}>{tr('botDefaults.sectionSlashCommands')}</FieldTitle></h3>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
+        <textarea
+          data-input="customPassthroughCommands"
+          rows={2}
+          placeholder={tr('botDefaults.customPassthroughPlaceholder')}
+          value={passthrough}
+          disabled={busy === 'passthrough'}
+          onChange={event => setPassthrough(event.currentTarget.value)}
+        />
+        <div className="actions">
+          <button type="button" className="primary" data-action="save-custom-passthrough" disabled={busy === 'passthrough'} onClick={() => void savePassthrough()}>{tr('botDefaults.customPassthroughSave')}</button>
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.canTalkDaemonHelp')}>{tr('botDefaults.canTalkDaemon')}</FieldTitle></h4>
+        <textarea
+          data-input="canTalkDaemonCommands"
+          rows={2}
+          placeholder={tr('botDefaults.canTalkDaemonPlaceholder')}
+          value={canTalk}
+          disabled={busy === 'cantalk'}
+          onChange={event => setCanTalk(event.currentTarget.value)}
+        />
+        <div className="actions">
+          <button type="button" className="primary" data-action="save-cantalk-daemon" disabled={busy === 'cantalk'} onClick={() => void saveCanTalk()}>{tr('botDefaults.canTalkDaemonSave')}</button>
+        </div>
+      </div>
+      <StatusSpan status={status} attr={{ 'data-slash-commands-status': '' }} />
+    </section>
   );
 }
 

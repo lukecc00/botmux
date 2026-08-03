@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -7,8 +7,10 @@ import {
   readMaintenanceStateTo,
   writeMaintenanceStateTo,
   buildRestartLauncher,
+  detachedRestartEnv,
   maintenanceRestartLogPath,
   globalInstallUpdateCwd,
+  spawnDetachedRestart,
   type MaintenanceDeps,
   type MaintenanceState,
 } from '../src/core/maintenance.js';
@@ -30,9 +32,18 @@ interface Opts {
 
 function makeDeps(cfg: MaintenanceConfig, opts: Opts = {}) {
   const state: MaintenanceState = JSON.parse(JSON.stringify(opts.init ?? {}));
-  const calls = { update: 0, restart: 0, writes: 0, intents: [] as RestartIntent[], logs: [] as string[] };
+  const calls = {
+    update: 0,
+    restart: 0,
+    writes: 0,
+    locks: 0,
+    outsideLock: [] as string[],
+    intents: [] as RestartIntent[],
+    logs: [] as string[],
+  };
   let ver = opts.startVer ?? '2.64.0';
   const installTo = opts.installTo ?? '2.65.0';
+  let locked = false;
   const deps: MaintenanceDeps = {
     now: () => NOON,
     readConfig: () => cfg,
@@ -40,10 +51,26 @@ function makeDeps(cfg: MaintenanceConfig, opts: Opts = {}) {
     writeState: () => { calls.writes++; },
     anyBusy: () => opts.busy ?? false,
     isLocalDev: () => opts.localDev ?? false,
+    withUpdateLock: (fn) => {
+      calls.locks++;
+      locked = true;
+      try { fn(); } finally { locked = false; }
+    },
     currentVersion: () => ver,
-    runUpdate: () => { calls.update++; if (opts.updateThrows) throw new Error('npm fail'); ver = installTo; },
-    writeIntent: (i) => { calls.intents.push(i); },
-    triggerRestart: () => { calls.restart++; },
+    runUpdate: () => {
+      if (!locked) calls.outsideLock.push('update');
+      calls.update++;
+      if (opts.updateThrows) throw new Error('npm fail');
+      ver = installTo;
+    },
+    writeIntent: (i) => {
+      if (!locked) calls.outsideLock.push('intent');
+      calls.intents.push(i);
+    },
+    triggerRestart: () => {
+      if (!locked) calls.outsideLock.push('restart');
+      calls.restart++;
+    },
     log: (m) => { calls.logs.push(m); },
   };
   return { deps, calls, state };
@@ -70,6 +97,8 @@ describe('runMaintenanceTick', () => {
     runMaintenanceTick(deps);
     expect(calls.update).toBe(1);
     expect(calls.restart).toBe(1);
+    expect(calls.locks).toBe(1);
+    expect(calls.outsideLock).toEqual([]);
     expect(calls.intents).toEqual([expect.objectContaining({ kind: 'update', oldVersion: '2.64.0', newVersion: '2.65.0' })]);
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
@@ -163,6 +192,27 @@ describe('buildRestartLauncher', () => {
   });
 });
 
+describe('detachedRestartEnv', () => {
+  it('drops runtime env snapshots before launching a managed restart', () => {
+    const inherited = {
+      WEB_EXTERNAL_HOST: '10.255.64.131',
+      BOTMUX_DASHBOARD_EXTERNAL_HOST: '10.255.64.131',
+      BOTMUX_DASHBOARD_HOST: '127.0.0.1',
+      BOTMUX_DASHBOARD_PORT: '7991',
+      BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
+      BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
+      // Mirrors DAEMON_ENV_KEYS: a baked BOTMUX_PUBLIC_URL must be stripped too,
+      // else a detached restart keeps the stale proxy base instead of reloading
+      // it from ~/.botmux/.env.
+      BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
+      PATH: '/usr/bin',
+    };
+
+    expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
+    expect(inherited.WEB_EXTERNAL_HOST).toBe('10.255.64.131');
+  });
+});
+
 describe('maintenanceRestartLogPath', () => {
   afterEach(() => vi.unstubAllEnvs());
   it('points at ~/.botmux/logs/maintenance-restart.log', () => {
@@ -176,6 +226,43 @@ describe('globalInstallUpdateCwd', () => {
   it('runs npm global updates from HOME instead of inheriting the process cwd', () => {
     vi.stubEnv('HOME', '/home/bot');
     expect(globalInstallUpdateCwd()).toBe('/home/bot');
+  });
+});
+
+describe('spawnDetachedRestart', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('passes the restart lease to the actual detached CLI driver', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-restart-driver-'));
+    const packageRoot = join(dir, 'package');
+    const output = join(dir, 'driver.json');
+    const dataDir = join(dir, 'data');
+    mkdirSync(join(packageRoot, 'dist'), { recursive: true });
+    writeFileSync(join(packageRoot, 'dist', 'cli.js'), [
+      "const { writeFileSync } = require('node:fs');",
+      `writeFileSync(${JSON.stringify(output)}, JSON.stringify({`,
+      '  id: process.env.BOTMUX_RESTART_LEASE_ID,',
+      '  dir: process.env.BOTMUX_RESTART_LEASE_DIR,',
+      '  args: process.argv.slice(2),',
+      '}));',
+    ].join('\n'));
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+
+    try {
+      const child = spawnDetachedRestart('test', packageRoot, 'lease-123');
+      expect(child.pid).toEqual(expect.any(Number));
+      for (let i = 0; i < 50 && !existsSync(output); i++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual({
+        id: 'lease-123',
+        dir: dataDir,
+        args: ['restart'],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

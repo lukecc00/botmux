@@ -13,6 +13,20 @@ import { tmpdir } from 'os';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
+const fsControl = vi.hoisted(() => ({ failSessionWrite: false }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    writeFileSync: (...args: Parameters<typeof actual.writeFileSync>) => {
+      if (fsControl.failSessionWrite && String(args[0]).includes('sessions.json.')) {
+        throw new Error('simulated session repair write failure');
+      }
+      return actual.writeFileSync(...args);
+    },
+  };
+});
+
 // Mock config so we can point session.dataDir at a temp directory
 let tempDir: string;
 
@@ -45,11 +59,13 @@ import {
   init,
   createSession,
   getSession,
+  getOwnedSession,
   listSessions,
   closeSession,
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
+  repairMissingChatScope,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -62,6 +78,7 @@ function makeTempDir(): string {
 
 beforeEach(() => {
   tempDir = makeTempDir();
+  fsControl.failSessionWrite = false;
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
   init();
@@ -74,6 +91,15 @@ afterEach(() => {
 // ─── init() ───────────────────────────────────────────────────────────────
 
 describe('init()', () => {
+  it('keeps cross-file discovery read-only and exposes owner-scoped lookup separately', () => {
+    init('app-A');
+    const ownedByA = createSession('chat1', 'root1', 'Bot A');
+
+    init('app-B');
+    expect(getSession(ownedByA.sessionId)?.sessionId).toBe(ownedByA.sessionId);
+    expect(getOwnedSession(ownedByA.sessionId)).toBeUndefined();
+  });
+
   it('should create the data directory on first operation if it does not exist', () => {
     const subDir = join(tempDir, 'nested', 'data');
     tempDir = subDir;
@@ -104,6 +130,116 @@ describe('init()', () => {
     expect(loaded).toBeDefined();
     expect(loaded!.title).toBe('Pre-existing');
     expect(loaded!.status).toBe('active');
+  });
+
+  it('repairs only the scope-less oc_=root chat corruption signature', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const records = {
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      legacyThread: {
+        sessionId: 'legacyThread',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        title: 'Legacy thread',
+        status: 'active',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, JSON.stringify(records));
+
+    init();
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('legacyThread')?.scope).toBeUndefined();
+    const persisted = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(persisted.broken.scope).toBe('chat');
+    expect(persisted.legacyThread.scope).toBeUndefined();
+  });
+
+  it('ignores malformed entries while repairing healthy sessions', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, JSON.stringify({
+      missingChatId: { sessionId: 'missing-chat-id' },
+      primitive: 'not-a-session',
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      healthy: {
+        sessionId: 'healthy',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        scope: 'thread',
+        title: 'Healthy thread',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+    }));
+
+    init();
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('healthy')?.title).toBe('Healthy thread');
+    expect(listSessions()).toHaveLength(4);
+  });
+
+  it('repairs the corruption signature through the shared deserialization helper', () => {
+    const record: Record<string, unknown> = {
+      sessionId: 'broken',
+      chatId: 'oc_chat',
+      rootMessageId: 'oc_chat',
+    };
+
+    expect(repairMissingChatScope(record)).toBe(true);
+    expect(record.scope).toBe('chat');
+    expect(repairMissingChatScope(record)).toBe(false);
+    expect(repairMissingChatScope(null)).toBe(false);
+    expect(repairMissingChatScope({ sessionId: 'malformed' })).toBe(false);
+  });
+
+  it('keeps loaded sessions available when persisting a scope repair fails', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, JSON.stringify({
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      healthy: {
+        sessionId: 'healthy',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        scope: 'thread',
+        title: 'Healthy thread',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+    }));
+
+    fsControl.failSessionWrite = true;
+    init();
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('healthy')?.title).toBe('Healthy thread');
+    expect(listSessions()).toHaveLength(2);
+    expect(JSON.parse(readFileSync(fp, 'utf-8')).broken.scope).toBeUndefined();
   });
 
   it('should reset state when called again', () => {

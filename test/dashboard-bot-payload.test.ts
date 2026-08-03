@@ -2,6 +2,26 @@ import { describe, expect, it } from 'vitest';
 import { botDefaultsPayload, botSummaryPayload } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
+    const row = botDefaultsPayload(
+      { larkAppId: 'app_contract', botName: 'BotContract', cliId: 'codex', model: 'gpt-5' },
+      {},
+    );
+    const editableFields = [
+      'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
+      'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
+      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'codexAppCleanInput',
+      'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
+      'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
+      'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
+      'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
+      'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
+      'summaryRange', 'writableTerminalLinkInCard',
+    ];
+    expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
   it('includes authoritative cliId in group roster bot summaries', () => {
     expect(botSummaryPayload({
       larkAppId: 'cli_traex',
@@ -54,11 +74,86 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('projects slash-command config fields (customPassthrough / canTalkDaemon) as strings, defaulting to empty', () => {
+    const daemon = { larkAppId: 'app_slash', botName: 'BotS', cliId: 'claude-code' };
+    // 上游 IPC 给的是 space-joined 字符串 → 原样带出供 Dashboard 输入框回填。
+    expect(botDefaultsPayload(daemon, {
+      customPassthroughCommands: '/goal /export',
+      canTalkDaemonCommands: '/status /help',
+    })).toMatchObject({
+      customPassthroughCommands: '/goal /export',
+      canTalkDaemonCommands: '/status /help',
+    });
+    // 缺省（未配置）→ 空串，输入框显示 placeholder，不会渲染成 undefined。
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      customPassthroughCommands: '',
+      canTalkDaemonCommands: '',
+    });
+    // 非字符串（异常上游）→ 兜底空串，绝不把对象/数组塞进输入框。
+    expect(botDefaultsPayload(daemon, {
+      customPassthroughCommands: ['/goal'] as any,
+      canTalkDaemonCommands: 42 as any,
+    })).toMatchObject({
+      customPassthroughCommands: '',
+      canTalkDaemonCommands: '',
+    });
+  });
+
+  it('projects launchShell so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_shell', botName: 'BotShell', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { launchShell: '/usr/bin/zsh' })).toMatchObject({
+      launchShell: '/usr/bin/zsh',
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ launchShell: '' });
+    expect(botDefaultsPayload(daemon, { launchShell: ['zsh'] as any })).toMatchObject({
+      launchShell: '',
+    });
+  });
+
+  it('projects docSubscribeDefaultMode so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_doc', botName: 'BotDoc', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, { docSubscribeDefaultMode: 'all' })).toMatchObject({
+      docSubscribeDefaultMode: 'all',
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      docSubscribeDefaultMode: 'mention-only',
+    });
+    expect(botDefaultsPayload(daemon, { docSubscribeDefaultMode: 'invalid' })).toMatchObject({
+      docSubscribeDefaultMode: 'mention-only',
+    });
+  });
+
   it('projects Codex App clean history mode as an explicit default-off boolean', () => {
     const daemon = { larkAppId: 'app_codex', botName: 'Codex', cliId: 'codex-app' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ codexAppCleanInput: false });
     expect(botDefaultsPayload(daemon, { codexAppCleanInput: true }))
       .toMatchObject({ codexAppCleanInput: true });
+  });
+
+  it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {
+    const daemon = { larkAppId: 'app_usage', botName: 'Usage', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ usageDisplay: 'streaming' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'footer' }))
+      .toMatchObject({ usageDisplay: 'footer' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'off' }))
+      .toMatchObject({ usageDisplay: 'off' });
+    // Legacy boolean projects to 'off'.
+    expect(botDefaultsPayload(daemon, { showUsageInCardFooter: false }))
+      .toMatchObject({ usageDisplay: 'off' });
+  });
+
+  it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {
+    const daemon = { larkAppId: 'app_sbx', botName: 'Sbx', cliId: 'claude-code' };
+    // Absent → null (pure deny-by-default baseline, no rules to render).
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ sandboxPaths: null });
+    // Present → normalized to three string arrays, non-strings filtered out.
+    expect(botDefaultsPayload(daemon, {
+      sandboxPaths: { readWrite: ['~/my-data', 123], readOnly: ['~/.claude'], deny: ['~/my-data/secrets'] },
+    })).toMatchObject({
+      sandboxPaths: { readWrite: ['~/my-data'], readOnly: ['~/.claude'], deny: ['~/my-data/secrets'] },
+    });
+    // Malformed (array instead of object) → null, never a crash.
+    expect(botDefaultsPayload(daemon, { sandboxPaths: ['nope'] as any })).toMatchObject({ sandboxPaths: null });
   });
 
   it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {

@@ -3,49 +3,58 @@
  *
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
- * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback cares about two `response_item.payload.type === 'message'` shapes
- * plus Codex's authoritative turn-completion event:
+ * and creates the file lazily on the first user submit. The bridge fallback
+ * cares about exactly two records:
  *
- *   - role=user             → the user's prompt text (input_text content)
- *   - role=assistant +
- *     phase=commentary      → a model-authored, user-facing progress update
- *   - role=assistant + phase=final_answer + "Handoff Summary..."
- *                            → automatic context-compaction notice (progress)
- *   - event_msg.task_complete with last_agent_message
- *                            → the model's final reply
+ *   - user turn-start: `response_item.payload` message role=user
+ *     (input_text content). Stable across every codex version.
+ *   - turn terminal: `event_msg.payload` `task_complete`, which carries the
+ *     final visible text in `last_agent_message` (may be empty) and fires
+ *     exactly ONCE per turn.
  *
- * Why almost all `event_msg` records are ignored:
- *   - `response_item` is canonical for user prompts and commentary, but not
- *     for turn completion. Codex also writes `phase=final_answer` while doing
- *     an automatic context compaction: that message is a Handoff Summary for
- *     the continuation model, not the answer that should terminate the Lark
- *     turn. Only `event_msg.task_complete` proves the outer Codex turn ended.
- *     Its `last_agent_message` is therefore the sole normal final-output
- *     source. Handoff Summary records are still surfaced as progress so the
- *     user can see that context compaction happened, but they never close the
- *     Lark turn.
- *   - Narrow exceptions are structured error records and `task_complete` with
- *     no `last_agent_message`. Codex writes the latter both for intentionally
- *     answer-less turns and failed turns. Some releases nest
- *     `codex_error_info` below `task_complete.error`, while others can emit an
- *     independent `error` / `stream_error` event. Preserve a known
- *     context-window failure directly and otherwise emit an ambiguous boundary
- *     for the worker to reconcile against the turn-scoped terminal output.
- *   - role=developer (system instructions), reasoning, function_call*, and
- *     function_call_output remain excluded. Commentary is intentionally kept
- *     separate from final answers so callers can mirror only the model's clean
- *     progress prose without scraping terminal tool output.
+ * Why task_complete and NOT the assistant `response_item` message:
+ *   - Codex USED to tag the final assistant message `phase:'final_answer'`,
+ *     which older readers keyed on. Newer codex (observed >=0.146, and
+ *     model-provider dependent) DROPPED that field: the final assistant
+ *     message and every mid-turn assistant message are now byte-identically
+ *     `phase:undefined`, so no assistant `response_item` is a safe boundary —
+ *     keying on one would close the turn on the first mid-turn preamble and
+ *     truncate (or, if a stale second final is buffered, double-emit).
+ *   - `task_complete` is present in every observed schema (0.139 / 0.145 /
+ *     0.146), fires once per turn, and dedups codex's THREE representations of
+ *     one answer (event_msg agent_message / response_item message / event_msg
+ *     task_complete) down to a single emit — no cross-source dedup needed.
+ *   - A cancelled turn writes `turn_aborted` (no task_complete); we surface it
+ *     as an `ambiguous` terminal so the durable delivery is released instead
+ *     of wedging as "running" forever.
+ *
+ * This mirrors the traex reader (traex-transcript.ts), which adopted the same
+ * task_complete boundary earlier for the identical no-reliable-phase reason.
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readdirSync,
+  readlinkSync,
+  readSync,
+  statSync,
+  type Dirent,
+} from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 
 const IS_LINUX = platform() === 'linux';
+const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
+const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
 /** Extract the cliSessionId encoded in a rollout filename. Codex's session
  *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
@@ -139,76 +148,13 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
-  /** Non-terminal progress subtype. Context-compaction summaries are shown to
-   * the user with locale-specific chrome by the worker, but remain ordinary
-   * progress for queueing/retry semantics. */
+  /** Non-terminal progress subtype. */
   progressKind?: 'compaction_summary';
-  /** Structured terminal upgrade that may arrive before or after the empty
-   * task_complete boundary. It upgrades the currently collecting or most
-   * recently closed ambiguous turn without creating a second final. */
+  /** Structured terminal upgrade that may arrive before/after an empty task_complete. */
   terminalOnly?: boolean;
   terminalEvidence?: string;
   terminalViewportEvidence?: string;
   submittedInputAtTerminal?: string;
-}
-
-export type CodexTerminalDiagnostic = 'context_window_exceeded' | 'stream_disconnected';
-
-const CODEX_CONTEXT_WINDOW_DIAGNOSTIC = "codex ran out of room in the model's context window";
-const CODEX_STREAM_DISCONNECTED_DIAGNOSTIC = 'stream disconnected before completion';
-const CODEX_STREAM_CLOSED_DIAGNOSTIC = 'stream closed before response.completed';
-
-function normalizeTerminalDiagnosticText(content: string): string {
-  return content.replace(/\r/g, '').replace(/\s+/g, ' ').toLowerCase();
-}
-
-function hasExplicitContextDiagnosticLine(content: string): boolean {
-  return content.replace(/\r/g, '\n').split('\n').some(line => {
-    // Codex renders a terminal failure as an unindented `■ ...` line. TUI
-    // input echoes are prefixed by `› ` (first line) or indentation
-    // (continuations), even when the user pastes the same diagnostic text.
-    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
-    return normalizedLine.startsWith(`■ ${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`)
-      || normalizedLine.startsWith(`■${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`);
-  });
-}
-
-function hasExplicitStreamDiagnosticLine(content: string): boolean {
-  return content.replace(/\r/g, '\n').split('\n').some(line => {
-    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
-    return normalizedLine.startsWith(`■ ${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
-      || normalizedLine.startsWith(`■${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
-      || normalizedLine.startsWith(`■ ${CODEX_STREAM_CLOSED_DIAGNOSTIC}`)
-      || normalizedLine.startsWith(`■${CODEX_STREAM_CLOSED_DIAGNOSTIC}`);
-  });
-}
-
-/** Classify the exact terminal diagnostics that can disambiguate an empty
- * `task_complete`. Keep this deliberately narrow: this is only a fallback for
- * releases that omit the structured failure from rollout JSONL. The worker
- * applies it to the current turn's PTY tail after seeing an ambiguous terminal,
- * never to arbitrary transcript/user text. */
-export function classifyCodexTerminalDiagnostic(
-  content: string,
-  opts: { ignoreContext?: boolean; requireTerminalLine?: boolean } = {},
-): CodexTerminalDiagnostic | undefined {
-  const normalized = normalizeTerminalDiagnosticText(content);
-  if (!opts.ignoreContext && hasExplicitContextDiagnosticLine(content)) {
-    return 'context_window_exceeded';
-  }
-  if ((normalized.includes(CODEX_STREAM_DISCONNECTED_DIAGNOSTIC)
-    || normalized.includes(CODEX_STREAM_CLOSED_DIAGNOSTIC))
-    && (!opts.requireTerminalLine || hasExplicitStreamDiagnosticLine(content))) {
-    return 'stream_disconnected';
-  }
-  return undefined;
-}
-
-/** Backwards-compatible predicate for callers that only care whether a
- * terminal is abnormal. New routing must use classifyCodexTerminalDiagnostic
- * so context exhaustion cannot fall into ordinary stream-retry recovery. */
-export function isCodexAbnormalTerminationOutput(content: string): boolean {
-  return classifyCodexTerminalDiagnostic(content) !== undefined;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -275,24 +221,72 @@ export interface CodexDrainResult {
  *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
  *  directory tree is small (year/month/day) — a one-shot recursive scan
  *  is cheap enough that we don't bother caching. */
-export function findCodexRolloutBySessionId(cliSessionId: string): string | undefined {
-  const sessionsRoot = codexSessionsRoot();
-  if (!cliSessionId || !existsSync(sessionsRoot)) return undefined;
+export function findCodexRolloutBySessionId(
+  cliSessionId: string,
+  opts?: { codexHome?: string; noFollow?: boolean },
+): string | undefined {
+  const sessionsRoot = opts?.codexHome
+    ? join(opts.codexHome, 'sessions')
+    : codexSessionsRoot();
+  if (!cliSessionId) return undefined;
+  try {
+    // BOT_HOME is untrusted and requires no-follow roots. A normal CODEX_HOME
+    // remains compatible with legitimate user-managed symlinks.
+    if (opts?.noFollow && opts.codexHome && !lstatSync(opts.codexHome).isDirectory()) return undefined;
+    const rootStat = opts?.noFollow ? lstatSync(sessionsRoot) : statSync(sessionsRoot);
+    if (!rootStat.isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
   const suffix = `-${cliSessionId}.jsonl`;
-  const stack: string[] = [sessionsRoot];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
+  let visitedEntries = 0;
   while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const name of entries) {
-      const full = join(dir, name);
-      let st: ReturnType<typeof statSync>;
-      try { st = statSync(full); } catch { continue; }
-      if (st.isDirectory()) {
-        stack.push(full);
-      } else if (st.isFile() && name.endsWith(suffix)) {
-        return full;
+    const { dir, depth } = stack.pop()!;
+    try {
+      const dirStat = opts?.noFollow ? lstatSync(dir) : statSync(dir);
+      if (!dirStat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    let directory: ReturnType<typeof opendirSync>;
+    try { directory = opendirSync(dir); } catch { continue; }
+    try {
+      let entry: Dirent | null;
+      while ((entry = directory.readSync()) !== null) {
+        visitedEntries++;
+        if (opts?.noFollow && visitedEntries > UNTRUSTED_SESSION_SCAN_MAX_ENTRIES) {
+          return undefined;
+        }
+        const full = join(dir, entry.name);
+        let isDirectory = entry.isDirectory();
+        let isFile = entry.isFile();
+        // Some filesystems report DT_UNKNOWN. Resolve those with the same trust
+        // policy, but never stat through a known symlink in untrusted BOT_HOME.
+        if (!isDirectory && !isFile && !entry.isSymbolicLink()) {
+          try {
+            const stat = opts?.noFollow ? lstatSync(full) : statSync(full);
+            isDirectory = stat.isDirectory();
+            isFile = stat.isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isDirectory) {
+          if (!opts?.noFollow || depth < UNTRUSTED_SESSION_SCAN_MAX_DEPTH) {
+            stack.push({ dir: full, depth: depth + 1 });
+          }
+        } else if (isFile && entry.name.endsWith(suffix)) {
+          try {
+            const fileStat = opts?.noFollow ? lstatSync(full) : statSync(full);
+            if (fileStat.isFile()) return full;
+          } catch {
+            continue;
+          }
+        }
       }
+    } finally {
+      try { directory.closeSync(); } catch { /* already closed */ }
     }
   }
   return undefined;
@@ -314,23 +308,34 @@ const HISTORY_TAIL_BYTES = 4 * 1024 * 1024;
  *  between the two. Only the trailing `maxTailBytes` of the file is scanned. */
 export function findCodexSessionIdByBotmuxSessionId(
   botmuxSessionId: string,
-  opts?: { maxTailBytes?: number },
+  opts?: { maxTailBytes?: number; codexHome?: string; noFollow?: boolean },
 ): string | undefined {
   if (!botmuxSessionId) return undefined;
-  const historyPath = codexHistoryPath();
-  if (!existsSync(historyPath)) return undefined;
+  const historyPath = opts?.codexHome
+    ? join(opts.codexHome, 'history.jsonl')
+    : codexHistoryPath();
+  let fd: number | undefined;
   try {
-    const size = statSync(historyPath).size;
+    // O_NOFOLLOW rejects a symlink swapped in after lstat; O_NONBLOCK keeps a
+    // malicious FIFO from blocking the daemon. fstat then accepts only regular
+    // files. (O_NOFOLLOW is available on the supported Linux/macOS targets.)
+    if (opts?.noFollow && opts.codexHome && !lstatSync(opts.codexHome).isDirectory()) return undefined;
+    const pathStat = opts?.noFollow ? lstatSync(historyPath) : statSync(historyPath);
+    if (!pathStat.isFile()) return undefined;
+    fd = openSync(
+      historyPath,
+      constants.O_RDONLY
+        | (opts?.noFollow ? (constants.O_NOFOLLOW ?? 0) : 0)
+        | (constants.O_NONBLOCK ?? 0),
+    );
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) return undefined;
+    const size = opened.size;
     const maxTailBytes = Math.max(1, opts?.maxTailBytes ?? HISTORY_TAIL_BYTES);
     const start = Math.max(0, size - maxTailBytes);
     const length = size - start;
-    const fd = openSync(historyPath, 'r');
     const buf = Buffer.alloc(length);
-    try {
-      readSync(fd, buf, 0, length, start);
-    } finally {
-      closeSync(fd);
-    }
+    readSync(fd, buf, 0, length, start);
     let text = buf.toString('utf8');
     if (start > 0) {
       // The window almost certainly opens mid-line — drop the partial line.
@@ -353,6 +358,10 @@ export function findCodexSessionIdByBotmuxSessionId(
     }
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed / invalid fd */ }
+    }
   }
   return undefined;
 }
@@ -373,23 +382,15 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
-function isHandoffSummaryText(text: string): boolean {
-  return /^Handoff Summary\b/i.test(text.trim());
-}
-
-function codexErrorInfo(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== 'object') return undefined;
-  if (typeof (payload as any).codex_error_info === 'string') {
-    return (payload as any).codex_error_info;
-  }
-  const error = (payload as any).error;
-  return error && typeof error === 'object'
-    ? codexErrorInfo(error)
-    : undefined;
-}
-
-function isContextWindowErrorInfo(value: string | undefined): boolean {
-  return value?.replace(/[-_]/g, '').toLowerCase() === 'contextwindowexceeded';
+/** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
+ *  durable-delivery terminal outcome. Mirrors the traex reader. */
+function codexAbortErrorCode(reason: unknown): string {
+  const normalized = (typeof reason === 'string' ? reason : 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64) || 'unknown';
+  return `codex_turn_aborted:${normalized}`;
 }
 
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
@@ -429,73 +430,62 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    const ts = typeof obj?.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const p = obj?.payload;
+    if (!p || typeof p !== 'object') continue;
+    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
-    if (obj?.type === 'event_msg'
-      && (obj.payload?.type === 'error' || obj.payload?.type === 'stream_error')
-      && isContextWindowErrorInfo(codexErrorInfo(obj.payload))) {
+    // User turn-start: response_item message role=user. Stable across every
+    // codex version, and the ONLY event the RPC rollout-match probe reads
+    // (codex-rpc-lifecycle.rolloutUserTurnMatches), so it must stay a
+    // response_item user message.
+    if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+      const text = joinTextBlocks(p.content, 'input_text');
+      if (!text) continue;
+      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      continue;
+    }
+    // Turn terminal: event_msg `task_complete` carries the final visible text
+    // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
+    // This is the SOLE assistant_final source. Codex assistant `response_item`
+    // messages are NOT a safe boundary: the `phase:'final_answer'` marker was
+    // dropped (>=0.146), and mid-turn assistant messages are byte-identical to
+    // the final one (both phase:undefined) — keying on them would close a turn
+    // on the first mid-turn preamble and truncate/duplicate. Taking only
+    // task_complete also dedups codex's triple representation of one answer
+    // (event_msg agent_message / response_item message / event_msg
+    // task_complete). Mirrors the traex reader. See file header.
+    if (obj.type === 'event_msg'
+      && p.type === 'task_complete'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+      });
+      continue;
+    }
+    // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
+    // task_complete. Side effects may already have run, so release the durable
+    // delivery as `ambiguous` rather than wedge the turn as running forever.
+    if (obj.type === 'event_msg'
+      && p.type === 'turn_aborted'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
         text: '',
-        terminalStatus: 'failed',
-        terminalErrorCode: 'codex_context_window_exceeded',
-        terminalOnly: true,
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: codexAbortErrorCode(p.reason),
       });
       continue;
     }
-    if (obj?.type === 'event_msg' && obj.payload?.type === 'task_complete') {
-      const lastAgentMessage = typeof obj.payload.last_agent_message === 'string'
-        ? obj.payload.last_agent_message
-        : '';
-      const errorInfo = codexErrorInfo(obj.payload);
-      const contextWindowExceeded = isContextWindowErrorInfo(errorInfo);
-      events.push({
-        uuid: `${path}:${lineStart}`,
-        timestampMs,
-        kind: 'assistant_final',
-        text: lastAgentMessage,
-        terminalStatus: contextWindowExceeded
-          ? 'failed'
-          : (lastAgentMessage.trim().length > 0 ? 'completed' : 'ambiguous'),
-        terminalErrorCode: contextWindowExceeded
-          ? 'codex_context_window_exceeded'
-          : (lastAgentMessage.trim().length > 0
-              ? undefined
-              : 'codex_task_complete_without_final_candidate'),
-      });
-      continue;
-    }
-    if (obj?.type !== 'response_item') continue;
-    const p = obj.payload;
-    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
-    if (p.role === 'user') {
-      const text = joinTextBlocks(p.content, 'input_text');
-      if (!text) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && p.phase === 'commentary') {
-      const text = joinTextBlocks(p.content, 'output_text');
-      if (!text) continue;
-      events.push({
-        uuid: `${path}:${lineStart}`,
-        timestampMs,
-        kind: 'assistant_progress',
-        text,
-      });
-    } else if (p.role === 'assistant' && p.phase === 'final_answer') {
-      const text = joinTextBlocks(p.content, 'output_text');
-      if (!text || !isHandoffSummaryText(text)) continue;
-      events.push({
-        uuid: `${path}:${lineStart}`,
-        timestampMs,
-        kind: 'assistant_progress',
-        text,
-        progressKind: 'compaction_summary',
-      });
-    }
-    // Skip role=developer (instructions) and any reasoning / function_call*
-    // events — see file header for rationale.
+    // Everything else is skipped: role=developer/system instructions,
+    // reasoning, function_call*, and every assistant `response_item` message
+    // (mid-turn OR final) — the turn boundary comes only from task_complete.
   }
   return { events, newOffset, pendingTail };
 }

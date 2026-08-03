@@ -41,6 +41,21 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
   });
 
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
+  });
+
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('hello'));
@@ -111,13 +126,17 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
   });
 
-  it('freezes type-ahead inputs already written when context handoff starts', () => {
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
     const t = new InflightInputTracker();
-    t.onWrite({ content: 'wrapped-1', userGoal: 'goal-1', turnId: 'a' });
-    t.onWrite({ content: 'wrapped-2', userGoal: 'goal-2', turnId: 'b' });
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
 
-    expect(t.takeForHandoff('a').map(i => i.userGoal)).toEqual(['goal-1', 'goal-2']);
-    expect(t.onCliExit()).toBe(0);
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
   });
 
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {
@@ -162,29 +181,6 @@ describe('InflightInputTracker', () => {
     t.onWrite(item('turn-3'));
     t.onTurnComplete();
     expect(t.onCliExit()).toBe(0);
-    expect(t.takeCarryOver()).toEqual([]);
-  });
-
-  it('recovers an exact failed turn after a premature idle clear', () => {
-    const t = new InflightInputTracker();
-    t.onWrite(item('continue the task', 'failed-turn'));
-    t.onTurnComplete();
-
-    expect(t.onTurnFailed('failed-turn', input => ({
-      ...input,
-      content: `${input.content}\nRECOVER`,
-    }))).toBe(1);
-    expect(t.takeCarryOver()).toEqual([item('continue the task\nRECOVER', 'failed-turn')]);
-  });
-
-  it('does not recover a durable delivery through the worker-local path', () => {
-    const t = new InflightInputTracker();
-    t.onWrite({ content: 'durable', turnId: 'durable-turn', dispatchAttempt: 2 });
-    expect(t.onTurnFailed(
-      'durable-turn',
-      input => input,
-      input => input.dispatchAttempt === undefined,
-    )).toBe(0);
     expect(t.takeCarryOver()).toEqual([]);
   });
 });

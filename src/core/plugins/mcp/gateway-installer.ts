@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CliAdapter, McpGatewayInstallSpec } from '../../../adapters/cli/types.js';
@@ -6,10 +6,13 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readMaterializedPlugin } from '../materializer.js';
+import {
+  MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_OWNER_ENV,
+} from './environment.js';
 
 const GATEWAY_START = '# >>> botmux mcp gateway';
 const GATEWAY_END = '# <<< botmux mcp gateway';
-const GATEWAY_OWNER_ENV = 'BOTMUX_MCP_GATEWAY';
 
 export interface GatewayEntryReport {
   cliId: string;
@@ -24,8 +27,17 @@ export interface GatewayEntry {
 }
 
 export function defaultGatewayEntry(): GatewayEntry {
+  // Canonicalize $HOME: on a symlinked-home host (/home/u → /data00/home/u) the
+  // lexical path is written into the CLI's MCP config, but the file sandbox binds
+  // only CANONICAL exec dirs — the lexical /home/u prefix doesn't exist in the
+  // bwrap root, so codex/gemini's `botmux mcp serve` launch fails with
+  // "No such file or directory" and MCP startup aborts. realpath the home root
+  // so the command path lands on a bound dir. Same file off-sandbox, so it's a
+  // safe no-op on non-symlinked hosts.
+  let home = homedir();
+  try { home = realpathSync(home); } catch { /* keep lexical if unresolvable */ }
   return {
-    command: process.env.BOTMUX_BIN_PATH ?? join(homedir(), '.botmux', 'bin', 'botmux'),
+    command: process.env.BOTMUX_BIN_PATH ?? join(home, '.botmux', 'bin', 'botmux'),
     args: ['mcp', 'serve'],
   };
 }
@@ -113,6 +125,7 @@ function renderCodexEntry(entry: GatewayEntry): string {
     '[mcp_servers.botmux]',
     `command = ${JSON.stringify(entry.command)}`,
     `args = [${entry.args.map(value => JSON.stringify(value)).join(', ')}]`,
+    `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     GATEWAY_END,
   ].join('\n');
 }
@@ -141,7 +154,12 @@ function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
     type: 'stdio',
     command: entry.command,
     args: entry.args,
-    env: { [GATEWAY_OWNER_ENV]: '1' },
+    env: {
+      [MCP_GATEWAY_OWNER_ENV]: '1',
+      // Claude expands these from the owning CLI process when it starts the
+      // stdio relay. Empty defaults keep standalone Claude runs valid.
+      ...Object.fromEntries(MCP_GATEWAY_FORWARDED_ENV_KEYS.map(key => [key, `\${${key}:-}`])),
+    },
   };
 }
 
@@ -172,7 +190,7 @@ function isOwnedJsonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const env = (value as Record<string, unknown>).env;
   return !!env && typeof env === 'object' && !Array.isArray(env)
-    && (env as Record<string, unknown>)[GATEWAY_OWNER_ENV] === '1';
+    && (env as Record<string, unknown>)[MCP_GATEWAY_OWNER_ENV] === '1';
 }
 
 function removeClaudeEntry(path: string): boolean {

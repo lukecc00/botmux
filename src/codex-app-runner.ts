@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Buffer } from 'node:buffer';
-import type { CodexAppTurnInput } from './types.js';
 import {
   buildCodexAppTurnStartParams,
   isCleanInputCapabilityError,
-  isCodexAppStreamDisconnectError,
-  isCodexAppTurnInput,
   parseCodexVersion,
+  supportsClientUserMessageId,
   type CodexVersion,
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import {
+  CodexAppRpcResponseError,
+  CodexAppTransportError,
+  CodexAppTurnController,
+  type CodexAppPreparedInput,
+} from './services/codex-app-turn-controller.js';
+import {
+  CODEX_APP_INPUT_PREFIX,
+  decodeCodexAppRunnerInput,
+  type CodexAppRunnerInput,
+} from './services/codex-app-runner-protocol.js';
+import {
+  TurnTokenUsageAccumulator,
+  parseTokenUsagePair,
+} from './services/codex-app-token-usage.js';
 
 type JsonObject = Record<string, any>;
 
@@ -22,6 +35,8 @@ interface Args {
   botName?: string;
   botOpenId?: string;
   locale?: string;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 interface PendingRequest {
@@ -30,37 +45,7 @@ interface PendingRequest {
   method: string;
 }
 
-interface ActiveTurn {
-  /** Codex app-server's native turn id. This is used only to correlate
-   * notifications from the server; botmux routing uses the stable client
-   * message id carried alongside the queued input. */
-  nativeTurnId?: string;
-  serverStarted: boolean;
-  startedAtMs: number;
-  finalText: string;
-  allAgentText: string;
-  itemText: Map<string, string>;
-  /** Stable botmux/Lark turn id copied from clientUserMessageId. */
-  stableTurnId?: string;
-  dispatchAttempt?: number;
-  terminalFailure?: { kind: 'stream_disconnected' | 'failed'; message: string };
-  done: Promise<void>;
-  resolveDone: () => void;
-}
-
-interface QueuedInput {
-  content: string;
-  codexAppInput?: CodexAppTurnInput;
-  turnId?: string;
-  dispatchAttempt?: number;
-}
-
 const output = new RunnerControlWriter();
-const recentMarkers: Array<{ kind: string; payload: any }> = [];
-
-function asError(value: unknown): Error {
-  return value instanceof Error ? value : new Error(String(value));
-}
 
 function parseArgs(argv: string[]): Args {
   const out: Args = {
@@ -78,28 +63,15 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
+    else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
 }
 
 function emitMarker(kind: string, payload: unknown): void {
-  recentMarkers.push({ kind, payload });
-  if (recentMarkers.length > 512) recentMarkers.splice(0, recentMarkers.length - 512);
   output.marker(kind, payload);
-}
-
-function replayMarkers(turns: Array<{ turnId: string; dispatchAttempt?: number }>): void {
-  const allowed = (payload: any): boolean => turns.some(turn =>
-    payload?.turnId === turn.turnId
-    && payload?.dispatchAttempt === turn.dispatchAttempt,
-  );
-  for (const marker of recentMarkers) {
-    if (marker.kind === 'thread' || allowed(marker.payload)) {
-      output.marker(marker.kind, marker.payload);
-    }
-  }
-  output.marker('replay_ack', { count: turns.length });
 }
 
 function writeLine(text = ''): void {
@@ -121,9 +93,8 @@ function appDeveloperInstructions(args: Args): string {
   if (zh) {
     return [
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
-      '你明确写给用户的每段 commentary/进度和最终 assistant message，都会由 botmux 分别自动转成独立飞书卡片；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
-      '长任务中，每完成一个可验证的阶段、开始一次预计较久的构建/测试/等待、或拿到影响下一步的新结论，都要立即写一段自包含、面向用户的 commentary；不要等到整轮 final，也不要把多次里程碑合并成一段。尤其是“阶段结论 → 工具调用 → 下一阶段说明 → 长命令/等待”，工具前后两段说明都必须分别写成 commentary；工具调用、命令输出、Updated Plan 和 final 都不能替代或吞并它们。',
-      '只有发送附件、需要 @ 某人/机器人、跨群发送等结构化通道无法表达的能力，才可以使用 `botmux send`。',
+      '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
+      '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
@@ -131,9 +102,8 @@ function appDeveloperInstructions(args: Args): string {
 
   return [
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
-    'Every user-facing commentary/progress message and the final assistant message is automatically forwarded as a separate Lark card. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
-    'For long tasks, write a self-contained commentary immediately after each verifiable stage, before a long build/test/wait, and when a new finding changes the next step. Do not wait for the final answer or merge distinct milestones. In a “stage result → tool call → next-stage note → long command/wait” sequence, write both notes as separate commentary messages; tool calls, command output, Updated Plan, and final cannot replace or absorb them.',
-    'Use `botmux send` only for capabilities the structured channel cannot express, such as attachments, @mentions, or cross-chat delivery.',
+    'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
+    'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
@@ -146,9 +116,9 @@ class AppServerClient {
   private pending = new Map<number, PendingRequest>();
   private notificationHandlers: Array<(msg: JsonObject) => void> = [];
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
+  private fatalHandlers: Array<(error: CodexAppTransportError) => void> = [];
   private lastStderr = '';
-  private fatalError?: Error;
-  private fatalHandlers: Array<(error: Error) => void> = [];
+  private fatalError?: CodexAppTransportError;
 
   constructor(private readonly codexBin: string, private readonly cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
@@ -158,7 +128,7 @@ class AppServerClient {
     });
 
     this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
-    this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
+    this.child.stdin.on('error', err => this.failAll(new CodexAppTransportError(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
       this.lastStderr = (this.lastStderr + text).slice(-8000);
@@ -168,10 +138,10 @@ class AppServerClient {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
         ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
         : '';
-      this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
+      this.failAll(new CodexAppTransportError(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
     });
     this.child.on('exit', (code, signal) => {
-      const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      const err = this.fatalError ?? new CodexAppTransportError(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
       this.failAll(err);
     });
   }
@@ -184,8 +154,9 @@ class AppServerClient {
     this.requestHandlers.push(handler);
   }
 
-  onFatal(handler: (error: Error) => void): void {
+  onFatal(handler: (error: CodexAppTransportError) => void): void {
     this.fatalHandlers.push(handler);
+    if (this.fatalError) handler(this.fatalError);
   }
 
   async initialize(): Promise<void> {
@@ -203,8 +174,8 @@ class AppServerClient {
       try {
         this.write({ jsonrpc: '2.0', id, method, params });
       } catch (err) {
-        this.pending.delete(id);
-        reject(asError(err));
+        const message = err instanceof Error ? err.message : String(err);
+        this.failAll(new CodexAppTransportError(`Codex app-server write failed: ${message}`));
       }
     });
   }
@@ -229,8 +200,12 @@ class AppServerClient {
   }
 
   private failAll(err: Error): void {
-    const firstFailure = !this.fatalError;
-    this.fatalError = this.fatalError ?? err;
+    const firstFailure = this.fatalError === undefined;
+    this.fatalError = this.fatalError ?? (
+      err instanceof CodexAppTransportError
+        ? err
+        : new CodexAppTransportError(err.message)
+    );
     const fatal = this.fatalError;
     for (const pending of this.pending.values()) pending.reject(fatal);
     this.pending.clear();
@@ -262,7 +237,7 @@ class AppServerClient {
       const pending = this.pending.get(msg.id);
       if (!pending) return;
       this.pending.delete(msg.id);
-      if (msg.error) pending.reject(new Error(`${pending.method}: ${JSON.stringify(msg.error)}`));
+      if (msg.error) pending.reject(new CodexAppRpcResponseError(pending.method, msg.error));
       else pending.resolve(msg.result);
       return;
     }
@@ -292,14 +267,36 @@ try {
 const client = new AppServerClient(args.codexBin, args.cwd);
 let threadId = args.threadId;
 let threadReady = false;
-let activeTurn: ActiveTurn | null = null;
-const queue: QueuedInput[] = [];
 let inputBuffer = '';
-let processing = false;
-let cleanInputUnsupported = false;
 let codexVersionChecked = false;
 let codexVersion: CodexVersion | undefined;
 let cleanVersionWarningShown = false;
+let controller: CodexAppTurnController;
+
+/** Per-turn token accumulators keyed by codex appTurnId. Fed by
+ *  thread/tokenUsage/updated notifications; drained (and deleted) when the
+ *  matching turn's final marker is emitted. Bounded by turn lifetime — a turn
+ *  that never finalizes leaves at most one stale entry, cleared on next final. */
+const usageAccumulators = new Map<string, TurnTokenUsageAccumulator>();
+/** Only one turn is active at a time; a small cap bounds leakage from turns
+ *  that never emit a final marker. */
+const MAX_USAGE_ACCUMULATORS = 8;
+
+/** Get (or create, with bounded pruning) the usage accumulator for a turn. */
+function getOrCreateUsageAccumulator(turnId: string): TurnTokenUsageAccumulator {
+  let acc = usageAccumulators.get(turnId);
+  if (!acc) {
+    // Bounded pruning: a turn that never emits a final marker (crash/interrupt)
+    // would otherwise leak its accumulator. Evict the oldest insertion at the cap.
+    if (usageAccumulators.size >= MAX_USAGE_ACCUMULATORS) {
+      const oldest = usageAccumulators.keys().next().value;
+      if (oldest !== undefined) usageAccumulators.delete(oldest);
+    }
+    acc = new TurnTokenUsageAccumulator();
+    usageAccumulators.set(turnId, acc);
+  }
+  return acc;
+}
 
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
@@ -316,22 +313,6 @@ function detectedCodexVersion(): CodexVersion | undefined {
     codexVersion = undefined;
   }
   return codexVersion;
-}
-
-function makeTurn(stableTurnId?: string, dispatchAttempt?: number): ActiveTurn {
-  let resolveDone!: () => void;
-  const done = new Promise<void>(resolve => { resolveDone = resolve; });
-  return {
-    startedAtMs: Date.now(),
-    serverStarted: false,
-    finalText: '',
-    allAgentText: '',
-    itemText: new Map(),
-    ...(stableTurnId ? { stableTurnId } : {}),
-    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    done,
-    resolveDone,
-  };
 }
 
 function handleServerRequest(msg: JsonObject): boolean {
@@ -368,87 +349,33 @@ function handleServerRequest(msg: JsonObject): boolean {
 }
 
 function handleNotification(msg: JsonObject): void {
-  const params = msg.params ?? {};
-  if (!activeTurn || params.threadId !== threadId) return;
-  if (activeTurn.nativeTurnId && params.turnId && params.turnId !== activeTurn.nativeTurnId) return;
-
-  if (msg.method === 'turn/started') {
-    activeTurn.serverStarted = true;
-    activeTurn.nativeTurnId = params.turn?.id ?? params.turnId ?? activeTurn.nativeTurnId;
-    return;
-  }
-
-  if (msg.method === 'item/started') {
-    const item = params.item;
-    if (item?.type === 'commandExecution') {
-      writeLine(`\n$ ${item.command}`);
-    } else if (item?.type === 'fileChange') {
-      writeLine('\n[files changed]');
-    }
-    return;
-  }
-
-  if (msg.method === 'item/agentMessage/delta') {
-    const delta = String(params.delta ?? '');
-    const itemId = String(params.itemId ?? '');
-    activeTurn.itemText.set(itemId, (activeTurn.itemText.get(itemId) ?? '') + delta);
-    activeTurn.allAgentText += delta;
-    output.display(delta);
-    return;
-  }
-
-  if (msg.method === 'item/commandExecution/outputDelta' || msg.method === 'item/fileChange/outputDelta') {
-    output.display(String(params.delta ?? ''));
-    return;
-  }
-
-  if (msg.method === 'item/completed') {
-    const item = params.item;
-    if (item?.type === 'agentMessage') {
-      if (item.phase === 'final_answer') activeTurn.finalText = String(item.text ?? '');
-      else if (item.phase === 'commentary') {
-        const content = String(item.text ?? activeTurn.itemText.get(String(item.id ?? '')) ?? '').trim();
-        if (content) {
-          emitMarker('progress', {
-            ...(activeTurn.stableTurnId ? { turnId: activeTurn.stableTurnId } : {}),
-            ...(activeTurn.nativeTurnId ? { nativeTurnId: activeTurn.nativeTurnId } : {}),
-            ...(activeTurn.dispatchAttempt !== undefined
-              ? { dispatchAttempt: activeTurn.dispatchAttempt }
-              : {}),
-            itemId: String(item.id ?? ''),
-            content,
-          });
-        }
-      } else if (!activeTurn.itemText.has(item.id) && item.text) {
-        activeTurn.allAgentText += String(item.text);
+  // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
+  // Feed the accumulator for the matching appTurnId; the controller ignores this
+  // method, so we handle it here and still delegate for everything else.
+  if (msg.method === 'thread/tokenUsage/updated') {
+    const params = (msg.params ?? {}) as JsonObject;
+    const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+    if (turnId) {
+      const usage = (params.tokenUsage ?? {}) as JsonObject;
+      const parsed = parseTokenUsagePair(usage.total, usage.last);
+      const acc = getOrCreateUsageAccumulator(turnId);
+      if (parsed) {
+        acc.update(parsed.total, parsed.last);
+      } else {
+        // Malformed usage for a KNOWN turn: poison it (sticky). Silently skipping
+        // would let a later valid notification rebuild a fresh baseline and report
+        // only the last completion — a plausible-looking undercount. This also
+        // covers asymmetric cacheWrite presence (total has it, last omits it or
+        // vice-versa), where a 0-default would misattribute cache-create tokens.
+        acc.poison('malformed tokenUsage notification');
       }
+    } else {
+      // No turnId to attribute usage to — can't fold it into any turn. Surface a
+      // protocol warning rather than dropping it entirely silently.
+      writeLine('[codex-app] tokenUsage notification without turnId (ignored)');
     }
-    return;
   }
-
-  if (msg.method === 'error') {
-    if (params.willRetry === true) return;
-    const error = params.error ?? {};
-    activeTurn.terminalFailure = {
-      kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
-      message: String(error.message ?? 'Codex App turn failed'),
-    };
-    activeTurn.resolveDone();
-    return;
-  }
-
-  if (msg.method === 'turn/completed') {
-    const turn = params.turn;
-    if (turn?.id && activeTurn.nativeTurnId && turn.id !== activeTurn.nativeTurnId) return;
-    if ((turn?.status === 'failed' || turn?.error) && !activeTurn.finalText) {
-      const error = turn?.error ?? {};
-      activeTurn.terminalFailure = {
-        kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
-        message: String(error.message ?? `Codex App turn ${turn?.status ?? 'failed'}`),
-      };
-    }
-    activeTurn.resolveDone();
-  }
+  controller?.handleNotification(msg);
 }
 
 async function ensureThread(): Promise<string> {
@@ -461,6 +388,12 @@ async function ensureThread(): Promise<string> {
         cwd: args.cwd,
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
+        // Intentionally NO model / model_reasoning_effort here: on resume the
+        // app-server restores the thread's persisted {model, provider, effort}
+        // triple, and sending any single override would short-circuit that
+        // restoration (drifting model/provider to the current default). Per-turn
+        // overrides are applied on the fresh thread/start below only. Mirrors the
+        // RPC engine's resume contract (see codex-rpc-engine.resumeThread).
         config: { shell_environment_policy: { inherit: 'all' } },
         developerInstructions: appDeveloperInstructions(args),
         excludeTurns: true,
@@ -484,7 +417,17 @@ async function ensureThread(): Promise<string> {
     cwd: args.cwd,
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
-    config: { shell_environment_policy: { inherit: 'all' } },
+    config: {
+      shell_environment_policy: { inherit: 'all' },
+      // Per-turn reasoning effort → codex config key (ThreadStartParams accepts an
+      // arbitrary config map). Codex 0.145 accepts low/medium/high/xhigh and echoes
+      // xhigh back verbatim, so pass it through unchanged (no downgrade).
+      ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort } : {}),
+    },
+    // Per-turn model override → ThreadStartParams top-level model. Only set on a
+    // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
+    // matching the API's fresh-spawn-only override semantics.
+    ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
@@ -506,172 +449,91 @@ async function ensureThread(): Promise<string> {
   return startedThreadId;
 }
 
-async function runTurn(message: QueuedInput): Promise<void> {
-  const tid = await ensureThread();
-  const turn = makeTurn(
-    message.turnId ?? message.codexAppInput?.clientUserMessageId,
-    message.dispatchAttempt,
-  );
-  activeTurn = turn;
-  const version = message.codexAppInput ? detectedCodexVersion() : undefined;
-  let built = buildCodexAppTurnStartParams({
-    threadId: tid,
+function prepareControllerInput(
+  message: CodexAppRunnerInput,
+  structuredDisabled: boolean,
+): CodexAppPreparedInput {
+  const version = message.codexAppInput || message.replyTurnId
+    ? detectedCodexVersion()
+    : undefined;
+  const built = buildCodexAppTurnStartParams({
+    threadId: threadId ?? '',
     cwd: args.cwd,
     legacyContent: message.content,
     codexAppInput: message.codexAppInput,
     codexVersion: version,
-    structuredDisabled: cleanInputUnsupported,
+    structuredDisabled,
   });
-  if (message.codexAppInput && !built.structured && !cleanInputUnsupported && !cleanVersionWarningShown) {
+  if (
+    message.codexAppInput
+    && !built.structured
+    && !structuredDisabled
+    && !cleanVersionWarningShown
+  ) {
     cleanVersionWarningShown = true;
     const found = version ? `${version.major}.${version.minor}.${version.patch}` : 'unknown';
     writeLine(`[codex-app] clean input requires codex >= 0.135.0 (found ${found}); using legacy prompt`);
   }
-  for (const path of built.skippedImages) {
-    writeLine(`[codex-app] skipped unreadable local image: ${path}`);
-  }
-  writeLine();
-  writeLine('[user]');
-  writeLine(built.structured && message.codexAppInput ? message.codexAppInput.text : message.content);
-  writeLine();
+  const clientUserMessageId = !structuredDisabled
+    && message.replyTurnId
+    && version
+    && supportsClientUserMessageId(version)
+    ? message.replyTurnId
+    : built.params.clientUserMessageId;
+  return {
+    input: built.params.input,
+    ...(built.params.additionalContext
+      ? { additionalContext: built.params.additionalContext }
+      : {}),
+    ...(clientUserMessageId ? { clientUserMessageId } : {}),
+    visibleText: message.codexAppInput?.text ?? message.content,
+    structured: built.structured,
+    skippedImages: built.skippedImages,
+  };
+}
 
-  let result;
-  try {
-    result = await client.request('turn/start', built.params);
-  } catch (err) {
-    if (!built.structured || turn.serverStarted || !isCleanInputCapabilityError(err)) throw err;
-    // The app-server explicitly rejected the experimental field before a turn
-    // started. Disable structured input for this runner lifetime and retry the
-    // preserved legacy prompt exactly once.
-    cleanInputUnsupported = true;
-    writeLine('[codex-app] clean input unsupported by app-server; retrying this turn with the legacy prompt');
-    built = buildCodexAppTurnStartParams({
-      threadId: tid,
-      cwd: args.cwd,
-      legacyContent: message.content,
-      codexAppInput: message.codexAppInput,
-      codexVersion: version,
-      structuredDisabled: true,
-    });
-    result = await client.request('turn/start', built.params);
-  }
-  turn.nativeTurnId = result.turn?.id ?? turn.nativeTurnId;
-  await turn.done;
-
-  if (turn.terminalFailure) {
-    const stableTurnId = turn.stableTurnId;
-    emitMarker('terminal', {
-      ...(stableTurnId ? { turnId: stableTurnId } : {}),
-      ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
-      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-      status: 'failed',
-      errorCode: turn.terminalFailure.kind === 'stream_disconnected'
-        ? 'codex_stream_disconnected'
-        : 'codex_app_turn_failed',
-      message: turn.terminalFailure.message,
-    });
-    writeLine(`[codex-app] ${turn.terminalFailure.message}`);
+controller = new CodexAppTurnController({
+  cwd: args.cwd,
+  ensureThread,
+  request: (method, params) => client.request(method, params),
+  prepareInput: prepareControllerInput,
+  isStartCapabilityError: isCleanInputCapabilityError,
+  onTurnInput(_input, prepared) {
     writeLine();
-    activeTurn = null;
-    return;
-  }
-
-  const finalText = (turn.finalText || turn.allAgentText).trim();
-  const completedAtMs = Date.now();
-  if (finalText) {
-    // clientUserMessageId is the daemon-frozen botmux/Lark turn identity. The
-    // app-server generates a different id for the same logical turn; exposing
-    // that native id as `turnId` breaks daemon wait maps, VC suppression and
-    // reply routing. When no structured sidecar exists, omit turnId so the
-    // worker deliberately falls back to its current botmux turn attribution.
-    const stableTurnId = turn.stableTurnId;
-    emitMarker('final', {
-      ...(stableTurnId ? { turnId: stableTurnId } : {}),
-      ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
-      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-      content: finalText,
-      startedAtMs: turn.startedAtMs,
-      completedAtMs,
-    });
-  }
-  writeLine();
-  activeTurn = null;
-}
-
-async function drainQueue(): Promise<void> {
-  if (processing) return;
-  processing = true;
-  try {
-    while (queue.length > 0) {
-      const next = queue.shift()!;
-      try {
-        await runTurn(next);
-      } catch (err: any) {
-        const message = `Codex App runner error: ${err?.message ?? err}`;
-        const completedAtMs = Date.now();
-        const stableTurnId = next.turnId ?? next.codexAppInput?.clientUserMessageId;
-        const nativeTurnId = activeTurn?.nativeTurnId;
-        writeLine(message);
-        emitMarker('terminal', {
-          ...(stableTurnId ? { turnId: stableTurnId } : {}),
-          ...(nativeTurnId ? { nativeTurnId } : {}),
-          ...(next.dispatchAttempt !== undefined ? { dispatchAttempt: next.dispatchAttempt } : {}),
-          status: 'failed',
-          errorCode: isCodexAppStreamDisconnectError(err)
-            ? 'codex_stream_disconnected'
-            : 'codex_app_runner_error',
-          message,
-          startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
-          completedAtMs,
-        });
-        activeTurn = null;
-      }
-      prompt();
+    writeLine('[user]');
+    writeLine(prepared.visibleText);
+    writeLine();
+  },
+  onOutput: text => output.display(text),
+  onDiagnostic: writeLine,
+  onLifecycle: event => emitMarker('lifecycle', event),
+  onFinal: marker => {
+    // Attach this turn's token usage (if the accumulator saw coherent totals)
+    // and drain its accumulator. Omitted when no usage was observed — never zeros.
+    const acc = marker.appTurnId ? usageAccumulators.get(marker.appTurnId) : undefined;
+    const usage = acc?.result() ?? undefined;
+    // Surface a protocol anomaly rather than silently omitting usage — a
+    // regression/negative-baseline should be visible in the runner log.
+    if (acc?.warning && !usage) {
+      writeLine(`[codex-app] token usage dropped for turn ${marker.appTurnId ?? '?'}: ${acc.warning}`);
     }
-  } finally {
-    processing = false;
-  }
-}
+    if (marker.appTurnId) usageAccumulators.delete(marker.appTurnId);
+    emitMarker('final', usage ? { ...marker, usage } : marker);
+    writeLine();
+  },
+  onPrompt: prompt,
+});
 
 function enqueueLine(line: string): void {
   const trimmed = line.trim();
   if (!trimmed) return;
-  if (trimmed.startsWith('::botmux-codex-app:')) {
-    const encoded = trimmed.slice('::botmux-codex-app:'.length);
-    try {
-      const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
-      if (decoded?.type === 'replay' && Array.isArray(decoded.turns)) {
-        replayMarkers(decoded.turns.filter((turn: any) =>
-          turn && typeof turn.turnId === 'string'
-          && (turn.dispatchAttempt === undefined || Number.isInteger(turn.dispatchAttempt)),
-        ));
-        prompt();
-        return;
-      }
-      if (decoded?.type === 'message' && typeof decoded.content === 'string') {
-        const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
-          ? decoded.codexAppInput
-          : undefined;
-        if (decoded.codexAppInput !== undefined && !codexAppInput) {
-          writeLine('[codex-app] ignored invalid structured input sidecar');
-        }
-        queue.push({
-          content: decoded.content,
-          codexAppInput,
-          ...(typeof decoded.turnId === 'string' ? { turnId: decoded.turnId } : {}),
-          ...(Number.isInteger(decoded.dispatchAttempt)
-            ? { dispatchAttempt: decoded.dispatchAttempt }
-            : {}),
-        });
-        void drainQueue();
-      }
-    } catch (err: any) {
-      writeLine(`[codex-app] bad botmux input: ${err?.message ?? err}`);
-    }
+  if (trimmed.startsWith(CODEX_APP_INPUT_PREFIX)) {
+    const decoded = decodeCodexAppRunnerInput(trimmed);
+    if (decoded) controller.enqueue(decoded);
+    else writeLine('[codex-app] bad botmux input');
     return;
   }
-  queue.push({ content: line });
-  void drainQueue();
+  controller.enqueue({ type: 'message', content: line });
 }
 
 function handleInput(data: Buffer): void {
@@ -694,13 +556,10 @@ function handleInput(data: Buffer): void {
 async function main(): Promise<void> {
   client.onRequest(handleServerRequest);
   client.onNotification(handleNotification);
-  client.onFatal((error) => {
-    if (!activeTurn) return;
-    activeTurn.terminalFailure = {
-      kind: isCodexAppStreamDisconnectError(error) ? 'stream_disconnected' : 'failed',
-      message: error.message,
-    };
-    activeTurn.resolveDone();
+  client.onFatal(error => {
+    controller.handleFatal(error);
+    process.exitCode = 1;
+    process.stdout.write('', () => process.exit(1));
   });
   await client.initialize();
   await ensureThread();

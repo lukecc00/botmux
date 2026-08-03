@@ -3,6 +3,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { hermesSessionExists } from '../../services/hermes-transcript.js';
 
 export function createHermesAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -14,16 +15,20 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     id: 'hermes',
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass }) {
       const args: string[] = [];
-      if (resume) args.push('--resume', sessionId);
+      if (resume) args.push('--resume', resumeSessionId ?? sessionId);
       if (!disableCliBypass) args.push('--yolo', '--accept-hooks');
       args.push('--pass-session-id');
       return args;
     },
 
-    buildResumeCommand({ sessionId }) {
-      return `hermes --resume ${sessionId}`;
+    buildResumeCommand({ sessionId, cliSessionId }) {
+      return `hermes --resume ${cliSessionId ?? sessionId}`;
+    },
+
+    checkResumeTargetExists({ sessionId, cliSessionId, stateDbPath }) {
+      return hermesSessionExists(cliSessionId ?? sessionId, stateDbPath);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -56,12 +61,25 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     completionPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
-    // Hermes emits an explicit BOTMUX_READY_COMMAND once prompt_toolkit's real
-    // input composer has rendered.  Arm Botmux's ready-gate so the first queued
-    // Lark prompt waits for that true-ready signal instead of relying on the
-    // screen-level ❯ marker alone.  Do not opt into type-ahead: before the first
-    // prompt Hermes can silently drop input typed during TUI initialization.
-    injectsReadyHook: true,
+    // Do NOT arm Botmux's ready-gate for Hermes. #353 set injectsReadyHook here
+    // on the premise that Hermes shell-executes BOTMUX_READY_COMMAND once its
+    // prompt_toolkit composer renders — a cross-repo contract the shipped Hermes
+    // never honored: `grep BOTMUX_READY_COMMAND` across hermes-agent 0.18.x is
+    // empty, and Hermes exposes no composer-ready hook at all (its shell-hooks
+    // fire only at turn boundaries — on_session_start emits from
+    // conversation_loop AFTER the first prompt is already submitted, too late to
+    // gate the first prompt on). So the signal never arrives and the gate always
+    // falls through its 45s READY_SIGNAL_TIMEOUT_MS, delaying the FIRST cold-start
+    // message by ~45s even though the real ❯ composer is up in ~3.6s.
+    //
+    // Empirically the ❯ readyPattern above IS the earliest reliable readiness
+    // signal: a PTY probe of the real binary shows the fully-chromed input box
+    // (border + status bar + "/help for commands") at ~3.6s, and Hermes has NO
+    // cjadk-style startup selector that would make ❯ a false positive. So we rely
+    // on the IdleDetector's ❯ match + deferFirstPromptTimeoutUntilReady (queue
+    // the first message until the real ❯ appears, 90s hard cap). Do NOT opt into
+    // type-ahead: before the first prompt Hermes can silently drop input typed
+    // during TUI initialization (see #342).
     deferFirstPromptTimeoutUntilReady: true,
     altScreen: false,
   };

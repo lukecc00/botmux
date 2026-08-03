@@ -8,6 +8,14 @@
  * disk and threads them through here.
  *
  * Rules:
+ *   - Non-adopt + no-reply sentinel terminator: suppress the whole turn.
+ *     Botmux-aware models use this explicit protocol when a turn genuinely
+ *     needs no chat response. The signal is the LAST non-empty line of the
+ *     final being exactly `BOTMUX_NO_REPLY` — models almost always explain
+ *     the silence first and then append the token on its own line, so a
+ *     full-string exact match leaked the literal token into Lark. A token
+ *     that only appears inline (mid-sentence, or with prose after it) is
+ *     still a normal answer and is NOT guessed away. See isBridgeNoReplyFinal.
  *   - Adopt mode never suppresses: in /adopt the model in the adopted
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
@@ -30,19 +38,45 @@
  *     nextBoundaryMs) — without that, a model that's still mid-tool-use
  *     for turn N+1 could leak a send credit into turn N's window.
  */
-import { createHash } from 'node:crypto';
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
 
+export const BRIDGE_NO_REPLY_SENTINEL = 'BOTMUX_NO_REPLY';
+
+export function isBridgeNoReplyFinal(finalText: string | undefined): boolean {
+  if (finalText === undefined) return false;
+  // Suppress the whole turn when the model's final ENDS WITH a standalone
+  // no-reply sentinel line. We look at the LAST non-empty line only:
+  //   - pure `BOTMUX_NO_REPLY`                       → suppress
+  //   - `<prose>\n\nBOTMUX_NO_REPLY`                 → suppress the whole turn
+  //   - a final whose last non-empty line is prose   → NOT a no-reply signal
+  //     (the token inline in a sentence, or followed by more prose, still posts)
+  // Full-string exact match was too brittle: botmux-aware models almost always
+  // explain the silence first ("...no reply needed.") and then append the token
+  // on its own line, which exact match let leak the literal token into Lark.
+  // Trade-off (accepted): a genuine answer that happens to end with a bare
+  // sentinel line is dropped WHOLE — the product wants a fully silent no-reply
+  // turn over the safer strip-and-forward. The last-non-empty-line rule (not a
+  // substring / endsWith test) keeps that risk to finals the model deliberately
+  // terminated with the sentinel.
+  const lines = finalText.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line.length === 0) continue;
+    return line === BRIDGE_NO_REPLY_SENTINEL;
+  }
+  return false;
+}
+
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
   contentLength?: number;
-  /** Stable digest of the normalized body. Lets the final fallback distinguish
-   * a manually mirrored commentary send from a send of the final answer. */
-  contentHash?: string;
+  /** Bounded, whitespace-compacted copy for dashboard session previews.
+   *  The fallback gate still uses contentLength only. */
+  previewText?: string;
 }
 
 export interface BridgeGateInput {
@@ -56,20 +90,45 @@ export interface BridgeGateInput {
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
-  /** Transcript-native commentary emitted earlier in this exact turn. A
-   *  matching explicit send is only the required progress mirror and must not
-   *  consume the later final-answer fallback. */
-  progressTexts?: readonly string[];
+  /** Explicit transcript terminal semantics. Undefined preserves the
+   * historical "assistant_final means completed" behavior. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
-function bridgeContentHash(normalized: string): string {
-  return createHash('sha256').update(normalized).digest('hex').slice(0, 32);
+const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
+
+/** Bounded, newline-preserving copy of a `botmux send` body for dashboard
+ *  previews. Unlike the fingerprint normaliser (which collapses ALL whitespace
+ *  incl. newlines into single spaces — right for dedup, wrong for display), this
+ *  keeps line breaks so the dashboard can render the reply's Markdown structure
+ *  (paragraphs / lists / code blocks). Horizontal runs of spaces/tabs within a
+ *  line are collapsed and trailing spaces trimmed to keep the stored copy tidy;
+ *  blank-line runs are capped at one to bound size without flattening structure. */
+export function buildBridgeSendPreviewText(content: string): string | undefined {
+  const tidy = String(content ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!tidy) return undefined;
+  return tidy.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
+    ? `${tidy.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
+    : tidy;
 }
 
-export function buildBridgeSendMarkerContent(content: string): Pick<BridgeSendMarker, 'contentLength' | 'contentHash'> | undefined {
+export function buildBridgeSendMarkerContent(
+  content: string,
+): Pick<BridgeSendMarker, 'contentLength' | 'previewText'> | undefined {
   const normalized = normaliseForFingerprint(content);
   if (!normalized) return undefined;
-  return { contentLength: normalized.length, contentHash: bridgeContentHash(normalized) };
+  return {
+    // Length stays fingerprint-normalized: the fallback gate compares it against
+    // normalise(finalText).length, so it must not count preview-only newlines.
+    contentLength: normalized.length,
+    // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
+    previewText: buildBridgeSendPreviewText(content),
+  };
 }
 
 type StructuredBridgeSendMarker = BridgeSendMarker & {
@@ -86,37 +145,17 @@ function finalIsMateriallyLongerThanSends(finalLength: number, markers: readonly
     && finalLength - maxSentLength >= MATERIAL_FINAL_MIN_EXTRA_CHARS;
 }
 
-function markerSetCoversFinal(
-  markers: readonly BridgeSendMarker[],
-  finalText: string | undefined,
-  progressTexts: readonly string[] | undefined,
-): boolean {
+function markerSetCoversFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
   if (markers.length === 0) return false;
-
-  const normalizedProgress = (progressTexts ?? [])
-    .map(text => normaliseForFingerprint(text))
-    .filter(Boolean);
-  const progressHashes = new Set(normalizedProgress.map(bridgeContentHash));
-  const progressLengths = new Set(normalizedProgress.map(text => text.length));
-  const finalMarkers = markers.filter(marker => {
-    if (marker.contentHash) return !progressHashes.has(marker.contentHash);
-    // Rolling-upgrade compatibility: older CLI markers only contain the
-    // normalized body length.  An exact commentary-length hit is sufficient
-    // to identify the required mirror as progress, while any unmatched legacy
-    // marker stays conservative and may still suppress to avoid duplicate
-    // finals.  Hash-bearing markers remain the authoritative path.
-    return marker.contentLength === undefined || !progressLengths.has(marker.contentLength);
-  });
-  if (finalMarkers.length === 0) return false;
 
   // Back-compat: old marker files only have sentAtMs/messageId. Keep the old
   // conservative behavior for those entries instead of risking duplicates.
-  if (finalMarkers.some(m => !hasStructuredContentMarker(m))) return true;
+  if (markers.some(m => !hasStructuredContentMarker(m))) return true;
 
   const finalNormalized = normaliseForFingerprint(finalText ?? '');
   if (!finalNormalized) return true;
 
-  const structuredMarkers = finalMarkers.filter(hasStructuredContentMarker);
+  const structuredMarkers = markers.filter(hasStructuredContentMarker);
   return !finalIsMateriallyLongerThanSends(finalNormalized.length, structuredMarkers);
 }
 
@@ -127,10 +166,52 @@ export function shouldSuppressBridgeEmit(
   adoptMode: boolean,
 ): boolean {
   if (adoptMode) return false;
+  if (isBridgeNoReplyFinal(turn.finalText)) return true;
   if (turn.isLocal) return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
-  return markerSetCoversFinal(markersInWindow, turn.finalText, turn.progressTexts);
+  return markerSetCoversFinal(markersInWindow, turn.finalText);
+}
+
+/** Some structured CLIs can report a durable completed turn while their
+ * terminal event carries no final text. If there was no explicit `botmux send`
+ * in that turn window, silently completing leaves the Lark thread with no
+ * visible outcome. Emit a diagnostic fallback only for that narrow case.
+ *
+ * Scope note (shared path): this gate feeds worker.ts:emitReadyCodexTurns,
+ * which is shared by every structured-bridge CLI (Codex / Traex / Cursor / Pi /
+ * Grok / Hermes / Mtr / Coco). In practice only two of them can produce an
+ * empty-finalText `assistant_final` that reaches here:
+ *   - Traex — `task_complete` with an empty `last_agent_message`
+ *     (terminalStatus undefined → treated as completed below);
+ *   - Grok  — `turn_completed` + stop_reason `end_turn` where the post-tool
+ *     buffer is empty (terminalStatus 'completed').
+ * The other six drainers drop empty text before enqueue (`if (!text) continue`),
+ * so the fallback is unreachable for them.
+ *
+ * terminalStatus dependency: `undefined` is admitted as "completed" for
+ * back-compat with legacy assistant_final events. This relies on Traex encoding
+ * a cancel/abort as `turn_aborted` (terminalStatus 'ambiguous', excluded here)
+ * rather than as an empty `task_complete`. If that fork contract ever changes,
+ * a cancelled turn could surface a spurious "completed but empty" diagnostic.
+ *
+ * Marker caveat: `shouldSuppressBridgeEmit` only sees `botmux send` markers, and
+ * detoured sends (`--top-level` / `--into` / `--override-chat`) intentionally
+ * write no marker (cli.ts shouldRecordBridgeMarker). A turn whose only visible
+ * reply went out via such a send therefore still trips this diagnostic; the
+ * user-facing string (i18n `worker.empty_final_completed`) is worded to account
+ * for that case rather than asserting no send happened. */
+export function shouldEmitEmptyCompletedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
+  if ((turn.finalText ?? '').trim().length > 0) return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }

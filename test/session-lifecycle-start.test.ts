@@ -56,6 +56,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
@@ -76,6 +77,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
@@ -210,6 +214,28 @@ beforeEach(() => {
   });
 });
 
+describe('persistent backend target handoff', () => {
+  it('passes the recorded shared Herdr target back to a replacement worker', () => {
+    const target = {
+      backendType: 'herdr' as const,
+      sessionName: 'original-work',
+      agentName: 'botmux-sid-star',
+    };
+    const ds = makeDs();
+    ds.session.backendType = 'herdr';
+    ds.session.persistentBackendTarget = target;
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      backendType: 'herdr',
+      persistentBackendTarget: target,
+    }));
+  });
+});
+
 describe('Codex App clean-input feature gate', () => {
   const payload = {
     content: '<user_message>legacy</user_message>',
@@ -326,7 +352,7 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.managedTurnOrigin).toBeUndefined();
   });
 
-  it('keeps previous-turn attribution fallback for a non-empty accepted prompt', () => {
+  it('does not lend a previous human turn to a non-empty system prompt', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const ds = makeDs({
       currentReplyTarget: {
@@ -346,12 +372,13 @@ describe('Codex App clean-input feature gate', () => {
     forkWorker(ds, payload, { resume: true });
 
     const worker = forkMock.mock.results.at(-1)!.value;
-    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
       prompt: payload.content,
-      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'om_current_vc' },
-      turnId: 'om_current_vc',
-      vcMeetingImTurnOrigin: origin,
+      promptCodexAppInput: { text: 'clean' },
     }));
+    expect(init.turnId).toBeUndefined();
+    expect(init.vcMeetingImTurnOrigin).toBeUndefined();
   });
 
   it('starts an old queued activation without a sidecar and a modern one with exactly one', () => {
@@ -442,6 +469,58 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
+describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {
+  // A tmux-adopted claude-code session whose bridge worker has exited. When a
+  // new Lark turn arrives, the daemon's worker-null branch now routes adopt
+  // sessions to forkAdoptWorker (not forkWorker, which would spawn a fresh
+  // bmx-* CLI and lose bridge semantics). forkAdoptWorker must carry that
+  // turn's prompt + turnId into the init so the worker delivers it to the
+  // observed pane instead of dropping it.
+  function makeAdoptDs(): DaemonSession {
+    return makeDs({
+      adoptedFrom: {
+        source: 'tmux',
+        tmuxTarget: 'work:0.0',
+        originalCliPid: 4242,
+        sessionId: 'sess-adopt-live',
+        cliId: 'claude-code',
+        cwd: '/repo',
+        paneCols: 200,
+        paneRows: 50,
+      },
+    });
+  }
+
+  it('forwards the re-fork prompt + turnId into the adopt init (not dropped)', () => {
+    const ds = makeAdoptDs();
+    forkAdoptWorker(ds, { prompt: '<bridge>hello from Lark</bridge>', turnId: 'om_refork_turn' });
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      adoptMode: true,
+      adoptSource: 'tmux',
+      adoptTmuxTarget: 'work:0.0',
+      cliId: 'claude-code',
+      prompt: '<bridge>hello from Lark</bridge>',
+      turnId: 'om_refork_turn',
+    }));
+  });
+
+  it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {
+    const ds = makeAdoptDs();
+    forkAdoptWorker(ds, { restoredFromMetadata: true });
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      adoptMode: true,
+      prompt: '',
+    }));
+    expect(init.turnId).toBeUndefined();
+  });
+});
+
 describe('session.start lifecycle integration', () => {
   it('emits session.start after forkWorker spawns a worker', () => {
     forkWorker(makeDs(), 'hello', false);
@@ -498,6 +577,128 @@ describe('session.start lifecycle integration', () => {
     expect(enforceLiveSessionCap).toHaveBeenCalledTimes(2);
   });
 
+  it('persists an exact root-bound dispatch receipt only from the live worker generation', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff).toEqual({
+      rootMessageId: 'om_dispatch_root',
+      committedAt: expect.any(String),
+      workerGeneration: 1,
+    });
+    expect(ds.session.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+
+    const prior = ds.session.dispatchInputReceipts;
+    ds.worker = makeFakeWorker();
+    vi.mocked(sessionStore.updateSession).mockClear();
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_stale_worker' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts).toBe(prior);
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+  });
+
+  it('does not fork a worker when the generation reservation cannot be persisted', () => {
+    const ds = makeDs();
+    const currentWorker = makeFakeWorker();
+    ds.worker = currentWorker;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.cliId = 'codex';
+    ds.session.backendType = 'tmux';
+    ds.session.sandbox = false;
+    ds.session.sandboxHidePaths = [];
+    ds.session.sandboxReadonlyPaths = [];
+    ds.session.sandboxNetwork = true;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('generation persistence failed');
+    });
+
+    expect(() => forkWorker(ds, 'hello', false)).toThrow(
+      'generation persistence failed',
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(currentWorker.send).not.toHaveBeenCalled();
+    expect(currentWorker.kill).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(currentWorker);
+    expect(ds.workerGeneration).toBe(4);
+    expect(ds.session.workerGeneration).toBe(4);
+  });
+
+  it('rotates the persisted generation before replacement IPC and rejects the old worker receipt', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    // A daemon restore/refork replaces the Node worker. Generation 2 is
+    // persisted immediately; the generation-1 receipt remains audit evidence
+    // but can no longer satisfy acceptance.
+    forkWorker(ds, 'replacement', { resume: true });
+    const replacementWorker = forkMock.mock.results.at(-1)!.value;
+    expect(ds.worker).toBe(replacementWorker);
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    vi.mocked(sessionStore.updateSession).mockClear();
+    firstWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    firstWorker.emit('exit', 0, null);
+    await Promise.resolve();
+    expect(ds.worker).toBe(replacementWorker);
+    expect(ds.session.workerGeneration).toBe(2);
+
+    replacementWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(2);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('fences the persisted generation when the ACKing worker exits before dispatch polling', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.session.pid = worker.pid;
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    vi.mocked(sessionStore.updateSession).mockClear();
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+    expect(ds.worker).toBeNull();
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(ds.session.pid).toBeUndefined();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
   it('emits session.start after forkAdoptWorker spawns an adopt worker', () => {
     forkAdoptWorker(makeDs({
       adoptedFrom: {
@@ -546,6 +747,306 @@ describe('session.start lifecycle integration', () => {
       type: 'init',
       pluginBindings: ['demo'],
       skillPolicy: { include: ['skill:deploy'] },
+    }));
+  });
+
+  it('passes the persisted Lark topic title to a fresh Codex worker before its first prompt', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '@TestBot 排查这个 TTP logid',
+        nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+      },
+    });
+    forkWorker(ds, `
+<botmux_routing>routing instructions</botmux_routing>
+<user_message>
+@TestBot 排查这个 TTP logid 的失败原因
+</user_message>
+`, false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+      nativeSessionTitlePrompt: '排查这个 TTP logid 的失败原因',
+    }));
+  });
+
+  it('waits when a fresh Codex topic only contains the bot mention', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '@@TestBot',
+        nativeSessionTitle: '[BotMux·Lark] @@TestBot',
+        chatDisplayName: 'BotMux 标题优化群',
+      },
+    });
+    forkWorker(ds, `
+<user_message>
+@@TestBot
+</user_message>
+`, false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+  });
+
+  it('reapplies the group fallback when a pending Codex worker restarts before any content', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
+        nativeSessionTitleAwaitingContent: true,
+        chatDisplayName: 'BotMux 标题优化群',
+      },
+    });
+    forkWorker(ds, '<user_message>@@TestBot</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+  });
+
+  it('consumes only the first meaningful follow-up for a pending Codex title', () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      session: {
+        ...makeDs().session,
+        cliId: 'codex',
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>@@TestBot</user_message>', 'om_mention')).toBe(true);
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>@@TestBot</user_message>',
+      turnId: 'om_mention',
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>@TestBot 帮我查下当前会话标题</user_message>', 'om_topic')).toBe(true);
+    expect(ds.session.nativeSessionTitle).toBe('[BotMux·Lark] 帮我查下当前会话标题');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>@TestBot 帮我查下当前会话标题</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] 帮我查下当前会话标题',
+      nativeSessionTitlePrompt: '帮我查下当前会话标题',
+      turnId: 'om_topic',
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>第二条有效内容</user_message>', 'om_later')).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>第二条有效内容</user_message>',
+      turnId: 'om_later',
+    });
+  });
+
+  it('consumes a pending Codex title when a stopped worker resumes', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-pending',
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+    forkWorker(ds, '<user_message>@TestBot 分析图片安全拦截</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] 分析图片安全拦截',
+      nativeSessionTitlePrompt: '分析图片安全拦截',
+    }));
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+  });
+
+  it('passes the pending fallback when a stopped Codex worker has no native session id yet', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+    forkWorker(ds, '<user_message>@TestBot 分析 worker 启动失败</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] 分析 worker 启动失败',
+      nativeSessionTitlePrompt: '分析 worker 启动失败',
+    }));
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+  });
+
+  it('keeps a persisted user-defined title when a fresh Codex worker starts', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '我的手动标题',
+        nativeSessionTitle: '我的手动标题',
+        nativeSessionTitleUserDefined: true,
+      },
+    });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      nativeSessionTitle: '我的手动标题',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+  });
+
+  it('does not invent a title while resuming a legacy Codex session', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-1',
+      },
+    });
+    forkWorker(ds, 'hello', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).not.toHaveProperty('nativeSessionTitle');
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+  });
+
+  it('reapplies a managed Lark title after its Codex session resumes', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-manual',
+        nativeSessionTitle: '[BotMux·Lark] 我的持久化标题',
+      },
+    });
+    forkWorker(ds, '继续处理', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      cliSessionId: 'codex-native-manual',
+      nativeSessionTitle: '[BotMux·Lark] 我的持久化标题',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+  });
+
+  it('persists a generated native title from the current worker', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] 原始内容',
+      },
+    });
+    forkWorker(ds, '<user_message>原始内容</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', {
+      type: 'native_session_title_generated',
+      title: '[BotMux·Lark] 排查图片安全拦截',
+    });
+
+    expect(ds.session.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+    expect(ds.initConfig?.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
+    expect(ds.initConfig?.nativeSessionTitlePrompt).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('ignores a late generated title after the user explicitly renames the session', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '用户标题',
+        nativeSessionTitleUserDefined: true,
+      },
+    });
+    forkWorker(ds, '<user_message>原始内容</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', {
+      type: 'native_session_title_generated',
+      title: '[BotMux·Lark] 迟到的模型标题',
+    });
+
+    expect(ds.session.nativeSessionTitle).toBe('用户标题');
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
+  const adopt = () => makeDs({
+    adoptedFrom: {
+      tmuxTarget: 'bmx-deadbeef:0.0',
+      originalCliPid: 23456,
+      sessionId: 'codex-session',
+      cliId: 'codex',
+      cwd: '/repo',
+    },
+  });
+
+  it('legacy readIsolation:true → refuses to adopt + clears stale adopt metadata (no fork/session.start)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ readIsolation: true }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+    forkAdoptWorker(ds);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    // fail-closed: no worker=null pseudo-adopt lingers; next msg cold-starts sandboxed
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
+
+  it('new sandbox:true → refuses to adopt (would run unsandboxed) + clears metadata', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+    forkAdoptWorker(ds);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
+
+  it('global BOTMUX_SANDBOX=1 → refuses to adopt even when the bot has no per-bot flag', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '1');
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    forkAdoptWorker(adopt());
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    vi.unstubAllEnvs();
+  });
+
+  it('no sandbox anywhere → adopt proceeds (fork + session.start)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    forkAdoptWorker(adopt());
+    expect(forkMock).toHaveBeenCalled();
+    expect(emitHookEventMock).toHaveBeenCalledWith('session.start', expect.objectContaining({
+      reason: 'adopt',
     }));
   });
 });

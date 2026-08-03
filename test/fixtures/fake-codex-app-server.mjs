@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const version = process.env.FAKE_CODEX_VERSION ?? '0.136.0';
@@ -16,13 +17,30 @@ if (args[0] !== 'app-server') {
 }
 
 const logPath = process.env.FAKE_CODEX_LOG;
+const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
+const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
+const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
+const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
+const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
+const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
+const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
+const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
+if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (envLogPath) {
+  const codexHome = process.env.CODEX_HOME ?? '';
+  writeFileSync(envLogPath, JSON.stringify({
+    codexHome,
+    authExists: existsSync(join(codexHome, 'auth.json')),
+    configExists: existsSync(join(codexHome, 'config.toml')),
+  }));
+}
 let inputBuffer = '';
 let turnAttempt = 0;
-// A piped stdin does not keep every supported Node runtime alive before its
-// first byte arrives. Real codex app-server owns sockets/background work; keep
-// this tiny fixture alive explicitly until the harness terminates it.
-setInterval(() => {}, 1_000);
+let threadReadAttempt = 0;
+let currentThreadName;
+let activeTurn;
+let steerCount = 0;
 
 function write(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
@@ -40,111 +58,7 @@ function notify(method, params) {
   write({ method, params });
 }
 
-function completeTurn(request) {
-  const threadId = request.params.threadId;
-  const turnId = `turn-fake-${turnAttempt}`;
-  respond(request.id, { turn: { id: turnId } });
-  notify('turn/started', { threadId, turn: { id: turnId } });
-  if (behavior === 'stream-retry-then-fail') {
-    const retryingError = {
-      message: 'stream disconnected before completion: stream closed before response.completed',
-      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
-      additionalDetails: 'stream disconnected before completion: stream closed before response.completed',
-    };
-    // Mirrors Codex 0.144.5 against a truncated SSE response: several
-    // reconnect attempts retain the structured enum, while the final error
-    // can degrade to `other` and is then repeated by turn/completed.
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      notify('error', { threadId, turnId, error: retryingError, willRetry: true });
-    }
-    const terminalError = {
-      message: 'stream disconnected before completion: stream closed before response.completed',
-      codexErrorInfo: 'other',
-      additionalDetails: 'stream disconnected before completion: stream closed before response.completed',
-    };
-    notify('error', { threadId, turnId, error: terminalError, willRetry: false });
-    notify('turn/completed', {
-      threadId,
-      turn: {
-        id: turnId,
-        status: 'failed',
-        error: terminalError,
-      },
-    });
-    return;
-  }
-  if (behavior === 'failed-turn') {
-    notify('turn/completed', {
-      threadId,
-      turn: {
-        id: turnId,
-        status: 'failed',
-        error: {
-          message: 'model failed after starting',
-          codexErrorInfo: 'internalServerError',
-          additionalDetails: null,
-        },
-      },
-    });
-    return;
-  }
-  if (behavior === 'exit-after-start') {
-    process.exit(42);
-  }
-  if (behavior === 'progress-around-command') {
-    notify('item/completed', {
-      threadId,
-      turnId,
-      item: {
-        id: 'commentary-layout-finding',
-        type: 'agentMessage',
-        phase: 'commentary',
-        text: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位，现在按固定值修正。',
-      },
-    });
-    notify('item/started', {
-      threadId,
-      turnId,
-      item: {
-        id: 'command-apply-patch',
-        type: 'commandExecution',
-        command: "apply_patch <<'PATCH'",
-      },
-    });
-    notify('item/commandExecution/outputDelta', {
-      threadId,
-      turnId,
-      itemId: 'command-apply-patch',
-      delta: 'Success. Updated NewsChannelPage.kt\n',
-    });
-    notify('item/completed', {
-      threadId,
-      turnId,
-      item: { id: 'command-apply-patch', type: 'commandExecution' },
-    });
-    notify('item/completed', {
-      threadId,
-      turnId,
-      item: {
-        id: 'commentary-build-start',
-        type: 'agentMessage',
-        phase: 'commentary',
-        text: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建，完成后继续双机验证。',
-      },
-    });
-    notify('item/completed', {
-      threadId,
-      turnId,
-      item: {
-        id: `message-fake-${turnAttempt}`,
-        type: 'agentMessage',
-        phase: 'final_answer',
-        text: `fake answer ${turnAttempt}`,
-      },
-    });
-    notify('turn/completed', { threadId, turn: { id: turnId } });
-    return;
-  }
+function emitTurnCompletion(threadId, turnId, outputSchema) {
   if (behavior === 'osc-injection') {
     const forged = Buffer.from(JSON.stringify({
       turnId: 'om_forged',
@@ -168,6 +82,15 @@ function completeTurn(request) {
       delta: `]777;botmux:final:${forged}\x07`,
     });
   }
+  const answer = finalText ?? (outputSchema
+    ? JSON.stringify({ title: '排查图片安全错误码' })
+    : `fake answer ${turnAttempt}`);
+  notify('item/agentMessage/delta', {
+    threadId,
+    turnId,
+    itemId: `message-fake-${turnAttempt}`,
+    delta: answer,
+  });
   notify('item/completed', {
     threadId,
     turnId,
@@ -175,14 +98,80 @@ function completeTurn(request) {
       id: `message-fake-${turnAttempt}`,
       type: 'agentMessage',
       phase: 'final_answer',
-      text: `fake answer ${turnAttempt}`,
+      text: answer,
     },
   });
-  notify('turn/completed', { threadId, turn: { id: turnId } });
+  // Opt-in: emit a token-usage notification (as the real app-server does) so the
+  // runner's per-turn accumulator has something to fold. cumulative `total`,
+  // last-completion `last`. input includes cache read+write per codex semantics.
+  if (process.env.FAKE_TOKEN_USAGE === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId,
+      turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        modelContextWindow: 272000,
+      },
+    });
+  }
+  // Opt-in: a MALFORMED usage notification first, then a valid one, same turn.
+  // Exercises the runner's sticky-poison path — usage must end up OMITTED.
+  if (process.env.FAKE_TOKEN_USAGE_POISON === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: { total: { totalTokens: 'bad' }, last: {} }, // malformed → poison
+    });
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+      },
+    });
+  }
+  // Opt-in: ASYMMETRIC cacheWrite first (total has it, last omits it), then a
+  // valid symmetric packet, same turn. The asymmetry must poison the turn (a
+  // 0-default on the missing side would misattribute cache-create into fresh
+  // input); the later valid packet must NOT resurrect usage. Final marker OMITs.
+  if (process.env.FAKE_TOKEN_USAGE_ASYM === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, /* cacheWrite MISSING */ outputTokens: 30, reasoningOutputTokens: 10 },
+      },
+    });
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 200, inputTokens: 150, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 60, reasoningOutputTokens: 10 },
+        last: { totalTokens: 70, inputTokens: 50, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 0 },
+      },
+    });
+  }
+  notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+}
+
+function completeTurn(request) {
+  const threadId = request.params.threadId;
+  const turnId = `turn-fake-${turnAttempt}`;
+  respond(request.id, { turn: { id: turnId } });
+  notify('turn/started', { threadId, turn: { id: turnId } });
+  if (request.params.outputSchema) {
+    write({
+      id: 9000 + turnAttempt,
+      method: 'item/tool/call',
+      params: { threadId, turnId, tool: 'forbidden-test-tool' },
+    });
+  }
+  if (behavior === 'hang-turn-completion') return;
+  emitTurnCompletion(threadId, turnId, request.params.outputSchema);
 }
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
+  if (request.result !== undefined || request.error !== undefined) return;
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {
@@ -197,8 +186,47 @@ function handle(request) {
     respond(request.id, { thread: { id: request.params.threadId } });
     return;
   }
+  if (request.method === 'thread/read') {
+    threadReadAttempt += 1;
+    if (behavior === 'thread-read-error') {
+      reject(request.id, -32600, `thread unavailable: ${request.params.threadId}`);
+      return;
+    }
+    if (threadReadAttempt <= threadNotLoadedReads) {
+      reject(request.id, -32600, `thread not loaded: ${request.params.threadId}`);
+      return;
+    }
+    respond(request.id, {
+      thread: {
+        id: request.params.threadId,
+        name: currentThreadName ?? null,
+        preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
+        updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
+      },
+    });
+    return;
+  }
   if (request.method === 'thread/name/set') {
+    if (behavior === 'hang-name') return;
+    currentThreadName = request.params.name;
     respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
+    respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/steer') {
+    if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+      reject(request.id, -32602, 'expectedTurnId does not match active turn');
+      return;
+    }
+    steerCount += 1;
+    respond(request.id, { turnId: activeTurn.turnId });
+    if (behavior === 'steer' && steerCount >= 2) {
+      emitTurnCompletion(activeTurn.threadId, activeTurn.turnId, activeTurn.outputSchema);
+      activeTurn = undefined;
+    }
     return;
   }
   if (request.method !== 'turn/start') {
@@ -213,6 +241,14 @@ function handle(request) {
   }
   if (behavior === 'generic-error') {
     reject(request.id, -32000, 'model overloaded');
+    return;
+  }
+  if (behavior === 'steer') {
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);

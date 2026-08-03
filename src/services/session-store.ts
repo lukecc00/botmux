@@ -1,8 +1,9 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 
@@ -42,6 +43,36 @@ function ensureDir(): void {
   }
 }
 
+// A short-lived /repo bug recreated chat-scope sessions with the chat routing
+// anchor (`oc_...`) copied into rootMessageId and omitted scope. That shape is
+// impossible for a real thread: Lark message ids are `om_...`. Repair only this
+// narrow signature so ordinary legacy records without scope keep their
+// documented thread fallback. The original trace message cannot be recovered,
+// but chat routing does not use rootMessageId.
+export function repairMissingChatScope(session: unknown): boolean {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) return false;
+  const record = session as Record<string, unknown>;
+  if (
+    record.scope === undefined
+    && typeof record.chatId === 'string'
+    && record.chatId.startsWith('oc_')
+    && typeof record.rootMessageId === 'string'
+    && record.rootMessageId === record.chatId
+  ) {
+    record.scope = 'chat';
+    return true;
+  }
+  return false;
+}
+
+function repairMissingChatScopes(): number {
+  let repaired = 0;
+  for (const session of sessions.values()) {
+    if (repairMissingChatScope(session)) repaired += 1;
+  }
+  return repaired;
+}
+
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
@@ -51,11 +82,24 @@ function load(): void {
     try {
       const data = JSON.parse(readFileSync(fp, 'utf-8'));
       sessions = new Map(Object.entries(data));
-      logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
     } catch (err) {
       logger.error(`Failed to load sessions: ${err}`);
       sessions = new Map();
+      loaded = true;
+      return;
     }
+    const repaired = repairMissingChatScopes();
+    if (repaired > 0) {
+      try {
+        save();
+        logger.info(`Repaired ${repaired} scope-less chat session(s) in ${fp}`);
+      } catch (err) {
+        // Loading succeeded, so keep the in-memory sessions available even if
+        // this best-effort migration cannot be persisted yet (ENOSPC/EACCES).
+        logger.error(`Failed to persist repaired chat session scopes: ${err}`);
+      }
+    }
+    logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
   } else if (currentAppId) {
     // Per-bot file doesn't exist — migrate matching sessions from legacy sessions.json
     const legacyFp = join(config.session.dataDir, 'sessions.json');
@@ -69,8 +113,12 @@ function load(): void {
           }
         }
         if (sessions.size > 0) {
+          const repaired = repairMissingChatScopes();
           save();
           logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
+          if (repaired > 0) {
+            logger.info(`Repaired ${repaired} scope-less chat session(s) during migration`);
+          }
         }
       } catch (err) {
         logger.error(`Failed to migrate sessions from legacy file: ${err}`);
@@ -113,13 +161,20 @@ function save(): void {
   renameSync(tmpFp, fp);
 }
 
-export function createSession(chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session {
+export function createSession(
+  chatId: string,
+  rootMessageId: string,
+  title: string,
+  chatType?: 'group' | 'p2p',
+  scope?: 'thread' | 'chat',
+): Session {
   load();
   const session: Session = {
     sessionId: randomUUID(),
     chatId,
     chatType,
     rootMessageId,
+    scope,
     title,
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -133,6 +188,37 @@ export function createSession(chatId: string, rootMessageId: string, title: stri
 export function getSession(sessionId: string): Session | undefined {
   load();
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
+}
+
+const bridgeMarkerCleanupFences = new Map<string, Promise<void>>();
+
+export function registerSessionBridgeSendMarkerCleanupFence(
+  sessionId: string,
+  fence: Promise<void>,
+): void {
+  bridgeMarkerCleanupFences.set(sessionId, fence);
+  void fence.then(
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+  );
+}
+
+/**
+ * Return a row only when it belongs to this process's currently-initialised
+ * bot store. Mutating daemon endpoints must use this instead of getSession(),
+ * whose cross-file fallback is intentionally read-only discovery.
+ */
+export function getOwnedSession(sessionId: string): Session | undefined {
+  load();
+  return sessions.get(sessionId);
 }
 
 /**
@@ -160,13 +246,46 @@ function findInOtherFiles(sessionId: string): Session | undefined {
   return undefined;
 }
 
-export function closeSession(sessionId: string): void {
+export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
+  try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+}
+
+export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+  const fence = bridgeMarkerCleanupFences.get(sessionId);
+  if (fence) {
+    void fence.then(
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+    );
+    return;
+  }
+  cleanupSessionBridgeSendMarkersNow(sessionId);
+}
+
+export function closeSession(
+  sessionId: string,
+  opts: { cleanupBridgeMarkers?: boolean } = {},
+): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
+    if (session.larkAppId && session.dashboardAttachments?.length) {
+      try {
+        cleanupMaterializedDashboardImages(session.larkAppId, session.dashboardAttachments);
+        session.dashboardAttachments = undefined;
+        session.queuedAttachments = undefined;
+      } catch (error: any) {
+        logger.warn(`Failed to clean Dashboard images for session ${sessionId}: ${error?.message ?? error}`);
+      }
+    }
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();
+    // turn-sends was originally a transient bridge-dedup file cleaned by a
+    // live worker's close handler. Message previews now make its bounded tail
+    // user-visible, so workerless/forced closes must apply the same cleanup;
+    // otherwise closed sessions retain private reply text indefinitely.
+    if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

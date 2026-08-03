@@ -98,9 +98,23 @@ describe('worker.ts startup-commands wiring', () => {
       .toBeGreaterThan(src.indexOf('const willReattachPersistent ='));
   });
 
-  it('defers the args-baked initial prompt when startup commands are present', () => {
-    // buildArgs gets undefined (not baked) and the init handler queues it instead.
-    expect(src).toContain('initialPrompt: deferInitialPrompt ? undefined : (cfg.prompt || undefined)');
-    expect(src).toContain('!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt');
+  it('defers args-baked initial prompts for startup commands and adapter argv byte limits', () => {
+    // buildArgs gets undefined (not baked) and the init handler queues it instead;
+    // adapter-level preparation may also rewrite long prompts to safe argv tokens.
+    expect(src).toContain('cliAdapter.prepareInitialPromptArg?.({');
+    expect(src).toContain('promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;');
+    expect(src).toContain('resolveInitialPromptDelivery({');
+    expect(src).toContain('initialPrompt: preparedInitialPrompt,');
+    expect(src).toContain('shouldDeferInitialPromptForArgLimit({');
+    expect(src).toContain('maxInitialPromptArgBytes: cliAdapter.maxInitialPromptArgBytes,');
+    expect(src).toContain('lastSpawnDeferInitialPrompt = deferInitialPrompt;');
+    expect(src).toContain('const deferInitialPrompt = lastSpawnDeferInitialPrompt;');
+    expect(src).toContain('shouldQueueInitialPrompt({');
+    expect(src).toContain('passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,');
+    expect(src).toContain('deferInitialPrompt,');
+    expect(src).toContain('content: lastSpawnQueuedInitialPrompt ?? msg.prompt,');
+    expect(src).toContain('logicalContent: lastSpawnQueuedInitialPromptLogicalContent');
+    expect(src).toContain('args.unshift(...piInitialPromptAdditionalArgs);');
+    expect(src).toContain('Object.assign(childEnv, piInitialPromptEnv);');
   });
 });

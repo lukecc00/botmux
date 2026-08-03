@@ -134,3 +134,49 @@ print(row[0] or 0)
   if (proc.status !== 0) return 0;
   return Number.parseInt(proc.stdout.trim(), 10) || 0;
 }
+
+export function hermesSessionExists(sessionId: string | undefined, dbPath = HERMES_STATE_DB): boolean | undefined {
+  const sid = sessionId?.trim();
+  if (!sid || !existsSync(dbPath)) return undefined;
+  // Three-state, deliberately conservative (the CliAdapter contract only lets us
+  // force a fresh session when we can PROVE the target is absent):
+  //   1       -> session provably exists  -> true
+  //   0       -> session provably absent  -> false
+  //   unknown -> can't tell (unrecognized schema / query error) -> undefined
+  //
+  // Hermes resume is authoritative on `sessions.id` (SessionDB.get_session in
+  // hermes-agent 0.18.x). An orphan row in `messages` whose session_id is not
+  // in `sessions` is NOT resumable, so once a `sessions` table is present we
+  // trust it alone and never let a stray message vote "exists". The `messages`
+  // fallback is only for older schemas that predate the `sessions` table. If we
+  // recognize neither table (unknown/future schema) we return unknown rather
+  // than "absent", so the worker keeps the resume attempt instead of silently
+  // dropping context to a fresh start.
+  const script = `
+import sqlite3
+conn = sqlite3.connect(${JSON.stringify(dbPath)})
+sid = ${JSON.stringify(sid)}
+
+def has_table(name):
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)).fetchone()
+    return row is not None
+
+if has_table('sessions'):
+    row = conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)).fetchone()
+    print('1' if row is not None else '0')
+    raise SystemExit(0)
+
+if has_table('messages'):
+    row = conn.execute("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+    print('1' if row is not None else '0')
+    raise SystemExit(0)
+
+print('unknown')
+`;
+  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
+  if (proc.status !== 0) return undefined;
+  const out = proc.stdout.trim();
+  if (out === '1') return true;
+  if (out === '0') return false;
+  return undefined;
+}

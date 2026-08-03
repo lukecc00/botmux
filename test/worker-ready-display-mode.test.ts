@@ -9,6 +9,7 @@
  *   1. POST path + displayMode='screenshot' → worker.send called
  *   2. POST path + displayMode='hidden' → worker.send NOT called
  *   3. PATCH path + displayMode='screenshot' → worker.send called (symmetry)
+ *   4. silent recovery + displayMode='screenshot' → worker.send called without card IO
  *
  * Run:  pnpm vitest run test/worker-ready-display-mode.test.ts
  */
@@ -62,6 +63,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -82,7 +86,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
-  composeRowFromActive: vi.fn(),
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: undefined })),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -129,6 +133,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -197,6 +202,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
     });
   });
 
+  it('persists the exact shared Herdr target reported by the worker', () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'persistent_backend_target',
+      target: {
+        backendType: 'herdr',
+        sessionName: 'work',
+        agentName: 'botmux-sid-read',
+      },
+    });
+
+    expect(ds.session.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'work',
+      agentName: 'botmux-sid-read',
+    });
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
@@ -220,6 +247,73 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(logs).not.toContain('view_cap');
   });
 
+  it('treats port=0 as ready without Web Terminal and keeps screen/screenshot state flowing', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      session: { ...makeDs().session, backendType: 'zmx' },
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 0, token: 'unused', viewToken: 'unused-view' });
+    await flush();
+
+    expect(ds.workerReady).toBe(true);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.workerViewToken).toBeNull();
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sessionReplyMock.mock.calls[0][1]).readUrl).toBe('');
+
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'plain zmx history',
+      status: 'idle',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_zmx_history',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('plain zmx history');
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.currentImageKey).toBe('img_zmx_history');
+  });
+
+  it('ignores every message from a replaced worker generation', async () => {
+    const staleWorker = makeFakeWorker();
+    const currentWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: currentWorker,
+      workerReady: false,
+      workerPort: null,
+      lastScreenContent: 'current generation',
+      lastScreenStatus: 'working',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    staleWorker.emit('message', { type: 'ready', port: 9999, token: 'stale-token' });
+    staleWorker.emit('message', {
+      type: 'screen_update',
+      content: 'stale generation',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.workerReady).toBe(false);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.lastScreenContent).toBe('current generation');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
   it('doc-native session never posts a streaming card to the virtual doc: chat id', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({
@@ -240,6 +334,34 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await flush();
 
     expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('doc-native session never posts a TUI prompt card to the virtual doc: chat id', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      chatId: 'doc:doc_token_123',
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        chatId: 'doc:doc_token_123',
+        rootMessageId: 'doc:doc_token_123',
+      },
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Approve command?',
+      options: [{ text: 'Yes', selected: false }],
+      multiSelect: false,
+      turnId: 'turn-doc',
+    });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBeUndefined();
   });
 
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {
@@ -310,6 +432,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
     );
+  });
+
+  it('silent recovery restores screenshot mode without touching the streaming card', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      displayMode: 'screenshot',
+      suppressRecoveryCard: true,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'set_display_mode',
+      mode: 'screenshot',
+    });
   });
 
   it('re-applies readiness when cli_session_id races a restored-card PATCH', async () => {
@@ -526,9 +670,11 @@ describe('Worker ready: set_display_mode re-sync', () => {
     const ds = makeDs({
       worker: fakeWorker,
       pendingRawInput: '/goal ship the onboarding flow',
+      pendingRawTurnId: 'om_goal_turn',
       pendingFollowUpInput: {
         userPrompt: '另外帮我顺手看下 CI',
         cliInput: '<user_message>另外帮我顺手看下 CI</user_message>',
+        turnId: 'om_followup_turn',
       },
     } as Partial<DaemonSession>);
 
@@ -542,9 +688,12 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith({
       type: 'raw_input',
       content: '/goal ship the onboarding flow',
+      turnId: 'om_goal_turn',
       followUpContent: '<user_message>另外帮我顺手看下 CI</user_message>',
+      followUpTurnId: 'om_followup_turn',
     });
     expect(ds.pendingRawInput).toBeUndefined();
+    expect(ds.pendingRawTurnId).toBeUndefined();
     expect(ds.pendingFollowUpInput).toBeUndefined();
 
     fakeWorker.send.mockClear();

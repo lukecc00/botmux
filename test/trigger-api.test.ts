@@ -5,7 +5,7 @@ vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
-import { dispatchTriggerRequest } from '../src/dashboard/trigger-api.js';
+import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
 
 function request(): TriggerRequest {
   return {
@@ -34,6 +34,22 @@ describe('trigger request contract', () => {
     const v = validateTriggerRequest(bad);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts a custom or suppressed topic message and rejects malformed presentation', () => {
+    const custom = request();
+    custom.presentation = { topicMessage: 'Build failed' };
+    expect(validateTriggerRequest(custom).ok).toBe(true);
+
+    const silent = request();
+    silent.presentation = { topicMessage: null };
+    expect(validateTriggerRequest(silent).ok).toBe(true);
+
+    for (const topicMessage of ['', 'x'.repeat(201), 42]) {
+      const bad = request() as any;
+      bad.presentation = { topicMessage };
+      expect(validateTriggerRequest(bad).ok).toBe(false);
+    }
   });
 
   it('allows wait-mode turn triggers without a chatId or sessionId', () => {
@@ -68,12 +84,46 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('target_required');
   });
 
+  it('accepts a boolean suppressFinalOutput option and rejects non-boolean', () => {
+    const on = request();
+    on.options = { ...on.options, suppressFinalOutput: true };
+    expect(validateTriggerRequest(on).ok).toBe(true);
+
+    const bad = request() as any;
+    bad.options = { ...bad.options, suppressFinalOutput: 'yes' };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
   it('rejects wait-mode timeout outside the bounded range', () => {
     const req = request();
     req.options = { waitForFinalOutput: true, timeoutMs: 999 };
     const v = validateTriggerRequest(req);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts per-turn model + reasoningEffort overrides', () => {
+    const req = request();
+    req.options = { model: 'gpt-5.6-terra', reasoningEffort: 'high' };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  it('rejects an invalid reasoningEffort value', () => {
+    const req = request();
+    (req.options as any) = { reasoningEffort: 'ultra' };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('rejects a non-string / over-long model', () => {
+    for (const model of [42, 'x'.repeat(201)]) {
+      const req = request();
+      (req.options as any) = { model };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 
   it('builds a prompt that labels event data as untrusted', () => {
@@ -100,6 +150,26 @@ describe('trigger request contract', () => {
   it('omits the task block when no instruction is set (back-compat)', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt.startsWith('External event received')).toBe(true);
+  });
+
+  it('async/wait modes emit a response-mode block that suppresses preamble/meta-commentary', () => {
+    const req = request();
+    (req as any).instruction = 'Introduce yourself.';
+    (req.options as any) = { asyncReturnSessionId: true };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('Output ONLY the final answer');
+    // guards the specific leak riff observed: model narrating the routing header
+    expect(prompt.toLowerCase()).toContain('routing header');
+    expect(prompt).toContain('Do not call botmux send');
+  });
+
+  it('no response-mode block without wait/async options (plain webhook delivery)', () => {
+    const req = request();
+    (req as any).instruction = 'Do a thing.';
+    (req.options as any) = {};
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).not.toContain('<botmux_http_response_mode');
   });
 
   it('renders vc_meeting events compactly with rawText outside the JSON body', () => {
@@ -164,5 +234,54 @@ describe('dispatchTriggerRequest', () => {
     const res = await dispatchTriggerRequest(workflowReq('app1'), { proxyToDaemon });
     expect(res.status).toBe(502);
     expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_offline', error: 'connect ECONNREFUSED' });
+  });
+});
+
+// P1-3: the daemon's four-state trigger-result returns ok:true for terminal
+// failed/not_found. The legacy webhook async consumer (queryTriggerResult →
+// audit) derives outcome from `ok`, so this adapter must translate those two
+// terminal-miss states back to ok:false, while leaving completed/running as-is.
+describe('queryTriggerResult — legacy ok translation for webhook consumers', () => {
+  const proxyReturning = (body: unknown, status = 200) =>
+    vi.fn(async () => ({ status, text: async () => JSON.stringify(body) }) as unknown as Response);
+
+  it('failed(ok:true) is translated to ok:false + status 404, state preserved', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'failed', errorCode: 'no_output' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.body.state).toBe('failed');
+    expect(res.body.errorCode).toBe('no_output');
+  });
+
+  it('not_found(ok:true) is translated to ok:false + status 404', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'not_found', errorCode: 'session_not_found' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.body.state).toBe('not_found');
+  });
+
+  it('completed(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'completed', output: { content: 'X' } }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body.output?.content).toBe('X');
+  });
+
+  it('running(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'running' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe('running');
+  });
+
+  it('bad_request precise-miss (already ok:false, non-200) is passed through unchanged', async () => {
+    const proxyToDaemon = proxyReturning({ ok: false, errorCode: 'bad_request' }, 400);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(400);
   });
 });

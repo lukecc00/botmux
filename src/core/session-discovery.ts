@@ -98,6 +98,34 @@ export function isBareShellComm(comm: string | undefined): boolean {
   return BARE_SHELL_COMMS.has(comm.startsWith('.') ? comm.slice(1) : comm);
 }
 
+/**
+ * Let a managed launch wrapper finish its final `exec <cli>` before deciding
+ * that the pane is stuck at an interactive shell.
+ *
+ * A tmux pane can legitimately report the wrapper shell for a few milliseconds
+ * after spawn. Treating that single sample as terminal permanently blocks the
+ * session even though the CLI starts immediately afterward. Non-shell samples
+ * return without delay; only a shell-shaped sample consumes the bounded grace
+ * period.
+ */
+export async function settleLaunchComm(
+  read: () => string | undefined,
+  opts: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<string | undefined> {
+  let comm = read();
+  if (!isBareShellComm(comm)) return comm;
+
+  const timeoutMs = Math.max(0, opts.timeoutMs ?? 2_000);
+  const pollMs = Math.max(1, opts.pollMs ?? 100);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+    comm = read();
+    if (!isBareShellComm(comm)) return comm;
+  }
+  return comm;
+}
+
 /** Classify a confirmed bare-shell launch for diagnostics: 'trampoline' when the
  *  observed leaf shell differs from the shell botmux launched with — the
  *  signature of an rcfile that `exec`-trampolines into another shell (e.g.
@@ -337,7 +365,7 @@ function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
-): { pid: number; cliId: CliId } | undefined {
+): { pid: number; cliId: CliId; matchedByComm: boolean } | undefined {
   // BFS through the process tree
   let current = [rootPid];
 
@@ -347,8 +375,9 @@ function findCliProcess(
     for (const pid of current) {
       const comm = readComm(pid);
       if (comm) {
+        const commCliId = cliIdForComm(comm, filterCliId);
         const cliId = cliIdFromCommArgv(comm, readCmdline(pid), filterCliId);
-        if (cliId) return { pid, cliId };
+        if (cliId) return { pid, cliId, matchedByComm: commCliId === cliId };
       }
       next.push(...getChildPids(pid));
     }
@@ -357,6 +386,35 @@ function findCliProcess(
   }
 
   return undefined;
+}
+
+/** Verify a specific pid is still a matching CLI within the pane process tree.
+ * Unlike findCliProcess, this does not stop at an argv-matched launcher. */
+function hasCliProcess(
+  rootPid: number,
+  expectedPid: number,
+  maxDepth: number,
+  filterCliId?: CliId,
+): boolean {
+  let frontier = [rootPid];
+  const seen = new Set<number>();
+
+  for (let depth = 0; depth <= maxDepth && frontier.length > 0; depth++) {
+    const next: number[] = [];
+    for (const pid of frontier) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      if (pid === expectedPid) {
+        const comm = readComm(pid);
+        return comm !== undefined
+          && cliIdFromCommArgv(comm, readCmdline(pid), filterCliId) !== undefined;
+      }
+      next.push(...getChildPids(pid));
+    }
+    frontier = next;
+  }
+
+  return false;
 }
 
 /**
@@ -579,9 +637,51 @@ function extractHerdrAgents(raw: any): any[] {
   return Array.isArray(agents) ? agents : [];
 }
 
+function extractHerdrPanes(raw: any): any[] {
+  const panes = raw?.result?.panes;
+  return Array.isArray(panes) ? panes : [];
+}
+
+function herdrPaneCliProcess(
+  raw: any,
+  filterCliId?: CliId,
+  expectedPid?: number,
+): { pid: number; cliId: CliId; cwd?: string } | undefined {
+  const info = raw?.result?.process_info;
+  const processes = Array.isArray(info?.foreground_processes) ? info.foreground_processes : [];
+  for (const proc of processes) {
+    const argv = Array.isArray(proc?.argv) ? proc.argv.filter((v: unknown): v is string => typeof v === 'string') : [];
+    // Herdr 0.7.5 process-info may expose only `argv0` for a foreground
+    // launcher (`name:"node", argv0:"pi"`). Treat it as argv evidence so
+    // adopt revalidation agrees with agent-list discovery instead of falsely
+    // reporting a live Pi pane as exited.
+    const argv0 = typeof proc?.argv0 === 'string' ? proc.argv0 : undefined;
+    const effectiveArgv = argv.length > 0 ? argv : argv0 ? [argv0] : [];
+    const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, effectiveArgv, filterCliId);
+    const pid = Number(proc?.pid);
+    if (cliId && Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid)) {
+      return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
+    }
+  }
+  return undefined;
+}
+
 function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
   const name = typeof agent?.agent === 'string' ? basename(agent.agent) : '';
   return name ? cliIdForComm(name, filterCliId) : undefined;
+}
+
+const HERDR_SESSION_UUID_RE = /(?:^|_)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i;
+
+/** Herdr integrations expose the authoritative resumed CLI session in
+ * `agent_session`. Pi does not keep its JSONL fd open, so pid/lsof discovery
+ * cannot recover this path on macOS; use Herdr's own binding instead. */
+function herdrAgentSessionId(agent: any): string | undefined {
+  const value = typeof agent?.agent_session?.value === 'string'
+    ? agent.agent_session.value
+    : undefined;
+  if (!value) return undefined;
+  return HERDR_SESSION_UUID_RE.exec(value)?.[1];
 }
 
 function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
@@ -594,6 +694,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
   for (const session of sessions) {
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
+    const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
       const cliId = herdrAgentCliId(agent, filterCliId);
       if (!cliId) continue;
@@ -601,9 +702,28 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const cwd = typeof agent?.cwd === 'string' ? agent.cwd : undefined;
       const paneId = typeof agent?.pane_id === 'string' ? agent.pane_id : undefined;
       const terminalId = typeof agent?.terminal_id === 'string' ? agent.terminal_id : undefined;
-      const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
+      const agentName = typeof agent?.name === 'string' && agent.name
+        ? agent.name
+        : typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
-      const claudeMeta = cliId === 'claude-code' ? findUniqueClaudeSessionByCwd(cwd) : undefined;
+      // `agent list` identifies the CLI kind but does not expose its pid. Probe
+      // the pane as well: structured adopt bridges (Pi/Codex/TraeX/...) need the
+      // real pid to bind the exact transcript. Without it the terminal can show
+      // `working`, yet no final reply is emitted because the worker has no
+      // session id or pid from which to resolve the JSONL.
+      const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+      const process = herdrPaneCliProcess(rawInfo, cliId);
+      const cliPid = process?.pid;
+      let sessionId = herdrAgentSessionId(agent);
+      if (!sessionId && cliPid) {
+        if (cliId === 'traex') sessionId = findTraexRolloutByPid(cliPid)?.cliSessionId;
+        else if (cliId === 'codex') sessionId = findCodexRolloutByPid(cliPid)?.cliSessionId;
+        else if (cliId === 'coco') sessionId = findCocoSessionByPid(cliPid)?.sessionId;
+      }
+      const claudeMeta = cliId === 'claude-code'
+        ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
+        : undefined;
+      discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -611,10 +731,48 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
         herdrPaneId: paneId,
         herdrAgentName: agentName,
         herdrTerminalId: terminalId,
+        cliPid,
         cliId,
-        sessionId: claudeMeta?.sessionId,
+        sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
-        startedAt: claudeMeta?.startedAt,
+        startedAt: claudeMeta?.startedAt ?? (cliPid ? readProcessStartTime(cliPid) : undefined),
+        paneCols: 200,
+        paneRows: 50,
+      });
+    }
+
+    // TraeX can be a real foreground CLI while Herdr still reports the pane as
+    // agent_status=unknown (its hook integration has not emitted state yet).
+    // Supplement agent-list discovery from pane process-info so such live CLIs
+    // remain adoptable; plain shell panes naturally fail cliId detection.
+    const rawPanes = herdrJson(['--session', sessionName, 'pane', 'list']);
+    for (const pane of extractHerdrPanes(rawPanes)) {
+      const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
+      if (!paneId || discoveredPaneIds.has(paneId)) continue;
+      const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+      const process = herdrPaneCliProcess(rawInfo, filterCliId);
+      if (!process) continue;
+      const cwd = process.cwd
+        ?? (typeof pane?.foreground_cwd === 'string' ? pane.foreground_cwd : undefined)
+        ?? (typeof pane?.cwd === 'string' ? pane.cwd : undefined);
+      if (!cwd) continue;
+      let sessionId: string | undefined;
+      if (process.cliId === 'traex') sessionId = findTraexRolloutByPid(process.pid)?.cliSessionId;
+      else if (process.cliId === 'codex') sessionId = findCodexRolloutByPid(process.pid)?.cliSessionId;
+      else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
+      const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
+      results.push({
+        source: 'herdr',
+        herdrSessionName: sessionName,
+        herdrTarget: paneId,
+        herdrPaneId: paneId,
+        herdrAgentName: process.cliId,
+        herdrTerminalId: typeof pane?.terminal_id === 'string' ? pane.terminal_id : undefined,
+        cliPid: process.pid,
+        cliId: process.cliId,
+        sessionId: sessionId ?? claudeMeta?.sessionId,
+        cwd,
+        startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
         paneCols: 200,
         paneRows: 50,
       });
@@ -640,8 +798,177 @@ export function adoptTargetKey(target: AdoptableSession): string {
   return `tmux:${target.tmuxTarget}:${target.cliPid}`;
 }
 
+/** Remove Herdr agents that already have an active Botmux owner. Orphaned
+ * managed agents remain adoptable, but two live workers must never share one
+ * pane. Matching uses the persisted host + managed agent identity. */
+export function excludeOwnedHerdrAdoptTargets(
+  candidates: readonly AdoptableSession[],
+  ownedTargets: readonly { sessionName: string; agentName: string }[],
+): AdoptableSession[] {
+  const owned = new Set(ownedTargets.map(target => `${target.sessionName}\0${target.agentName}`));
+  return candidates.filter(candidate => {
+    if (candidate.source !== 'herdr' || !candidate.herdrSessionName || !candidate.herdrAgentName) return true;
+    return !owned.has(`${candidate.herdrSessionName}\0${candidate.herdrAgentName}`);
+  });
+}
+
+
+/**
+ * 把单个 tmux pane 解析成一条可 adopt 的会话，解析不出来就返回 undefined。
+ *
+ * 这是 `discoverAdoptableSessions` 每 pane 循环体的原样抽取，目的是让「扫全部
+ * pane」和「只解析某一个 pane」共用同一份判定逻辑 —— 包括 `bmx-*` 跳过、
+ * `filterCliId` 过滤、codex launcher 跟随。两条路径必须永远同构，否则快路径会
+ * 绕开 CLI 过滤，成为把 bot 切到别的 agent 实现的口子。
+ */
+function resolveAdoptableSessionForPane(
+  tmuxTarget: string,
+  panePid: number,
+  filterCliId?: CliId,
+): AdoptableSession | undefined {
+  // 2. Filter out bmx-* sessions
+  const sessionName = tmuxTarget.split(':')[0];
+  if (sessionName?.startsWith('bmx-')) return undefined;
+
+  // 3. Recursively search process tree for known CLI binaries (up to 3 levels)
+  const match = findCliProcess(panePid, 3, filterCliId);
+  if (!match) return undefined;
+
+  // 3b. Filter by CLI type if requested
+  if (filterCliId && match.cliId !== filterCliId) return undefined;
+
+  // If the match came from an argv scan on a COMM_ARGV_LAUNCHER
+  // (node/ttadk/aiden/python… — matchedByComm=false), the matched pid is
+  // the LAUNCHER, not the CLI. The real CLI is a descendant that writes the
+  // session state / owns the transcript (e.g. claude keys
+  // ~/.claude/sessions/<pid>.json to the child, not the wrapper), so
+  // reading meta off the launcher pid misses it and leaves sessionId
+  // undefined → no bridgeJsonlPath → adopted claude's replies never reach
+  // Lark. findLaunchedCliPid does a comm-only BFS from the launcher's
+  // children to find the actual CLI binary. When none exists yet (or this
+  // process legitimately IS the CLI running under a launcher comm, e.g. a
+  // node-based CLI with no renamed process title), fall back to match.pid.
+  //
+  // matchedByComm=true means comm already named the CLI (`claude`/`codex`/…)
+  // — that process IS the selected CLI and may legitimately have another
+  // instance of the same CLI deeper in its tree, so never follow it.
+  const cliPid = !match.matchedByComm
+    ? (findLaunchedCliPid(match.pid, match.cliId) ?? match.pid)
+    : match.pid;
+
+  // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
+  const cwd = readCwd(cliPid);
+  if (!cwd) return undefined;
+
+  // 5. Try to read CLI session metadata
+  let sessionId: string | undefined;
+  let startedAt: number | undefined;
+  if (match.cliId === 'claude-code') {
+    const meta = readClaudeSessionMeta(cliPid);
+    if (meta) {
+      sessionId = meta.sessionId;
+      startedAt = meta.startedAt;
+    }
+  } else if (match.cliId === 'codex') {
+    // Codex has no per-pid state file — bind via the native process's open
+    // rollout fd. Missing is acceptable: the worker keeps polling cliPid
+    // and attaches when the first post-adopt turn creates/opens the file.
+    const rollout = findCodexRolloutByPid(cliPid);
+    if (rollout) sessionId = rollout.cliSessionId;
+  } else if (match.cliId === 'coco') {
+    // CoCo: probe /proc/<pid>/fd for an open file under the session dir
+    // (session.log / traces.jsonl). events.jsonl itself is opened-written-
+    // closed per event so it's not reliable on its own. Worker-side
+    // re-probes too, so undefined here is acceptable.
+    const cocoSession = findCocoSessionByPid(cliPid);
+    if (cocoSession) sessionId = cocoSession.sessionId;
+  } else if (match.cliId === 'traex') {
+    // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
+    // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
+    // pid as a fallback, so undefined here is acceptable.
+    const rollout = findTraexRolloutByPid(cliPid);
+    if (rollout) sessionId = rollout.cliSessionId;
+  }
+
+  // 5b. Fall back to the CLI process's own start time for uptime. Without
+  // this only Claude (which has a session JSON with startedAt) shows a real
+  // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+  if (startedAt === undefined) {
+    startedAt = readProcessStartTime(cliPid);
+  }
+
+  // 6. Get pane dimensions
+  const dims = getPaneDimensions(tmuxTarget);
+  if (!dims) return undefined;
+
+  return {
+    source: 'tmux',
+    tmuxTarget,
+    panePid,
+    cliPid,
+    cliId: match.cliId,
+    sessionId,
+    cwd,
+    startedAt,
+    paneCols: dims.cols,
+    paneRows: dims.rows,
+  };
+}
 
 // ─── Public API ──────────────────────────────────────────────────────────────
+
+/**
+ * 只解析指定的那一个 tmux pane，不扫全机。
+ *
+ * 用在「用户已经从 /adopt 卡片里选好了目标」这种场景：卡片 option 里带着 tmux
+ * 地址，没必要为了拿到 cwd / 尺寸 / sessionId 再把所有 pane 重扫一遍。全量扫描
+ * 要对每个 pane 走进程树、且树里每个节点都拉一次全量 `ps`，pane 一多就是数秒级
+ * 同步阻塞（本机 31 个 pane 实测 5.4s）；而飞书卡片回调只有 3s 预算，超了用户就
+ * 会看到「目标回调服务超时未响应」。
+ *
+ * `filterCliId` 语义与 `discoverAdoptableSessions` 完全一致，调用方必须原样传入
+ * 同一个值 —— 卡片 option 是用户可控输入，丢掉过滤等于允许把 bot 切到别的 CLI。
+ *
+ * ⚠️ `tmux display -t` 是**模糊解析**，且失败时不报错。实测（tmux 3.6a）：
+ *   请求 `nonexist:0.0` → exit 0，stdout 只有分隔符、pane_pid 为空串
+ *   请求 `claude:99.0`（window 索引不存在）→ exit 0，解析到 `claude:2.3`
+ *   请求 `claude:1.99`（pane 索引不存在）→ exit 0，解析到 `claude:1.1`
+ *   请求 `clau:1.3`（会话名前缀）→ exit 0，解析到 `claude:1.3`
+ * 所以既不能靠 exit code 判死活，也不能相信「拿到一个正数 pid」就等于命中了
+ * 请求的那个 pane。这里让同一条 display 连 canonical 地址一起回显，再要求它与
+ * 请求的 target **严格相等**：一次同时挡掉「空 pid」和「静默命中别的 pane」。
+ * 格式串与 `discoverAdoptableSessions` 的 list-panes 完全一致，两边可直接比较。
+ */
+export function discoverAdoptableSessionByTarget(
+  tmuxTarget: string,
+  filterCliId?: CliId,
+): AdoptableSession | undefined {
+  let canonicalTarget: string;
+  let panePid: number;
+  try {
+    const out = execSync(
+      `tmux display -t ${shellescape(tmuxTarget)} -p '#{session_name}:#{window_index}.#{pane_index} #{pane_pid}'`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
+    ).trim();
+    // 必须按**最后**一个空格切：会话名本身可能含空格（如「AD 智投星:0.0 651511」）。
+    // 与 discoverAdoptableSessions 解析 list-panes 的规则一致。
+    const spaceIdx = out.lastIndexOf(' ');
+    if (spaceIdx === -1) return undefined;
+    canonicalTarget = out.slice(0, spaceIdx);
+    panePid = Number(out.slice(spaceIdx + 1));
+  } catch {
+    // pane 已经不在了（或 tmux server 没起来）——交给调用方回落全量扫描。
+    return undefined;
+  }
+  // tmux 解析到了别的 pane（前缀命中 / 索引不存在时回落到活动 pane）→ 当作没找到。
+  if (canonicalTarget !== tmuxTarget) return undefined;
+  // 死目标下 pane_pid 是空串，`Number('') === 0` 且 `isNaN(0) === false`——必须显式
+  // 挡掉 0 与负数，否则 findCliProcess(0, ...) 会从 pid 0 开始遍历整棵进程树，
+  // 每个节点再 fork 一次全量 `ps`，实测 >45s 同步冻结（比它要优化掉的 5.4s 更糟，
+  // 且直接冻住 daemon 事件循环、波及所有 bot）。
+  if (!Number.isInteger(panePid) || panePid <= 0) return undefined;
+  return resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId);
+}
 
 /**
  * Scan all tmux panes for running CLI processes that can be adopted by Botmux.
@@ -681,75 +1008,9 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       const panePid = Number(line.slice(spaceIdx + 1));
       if (isNaN(panePid)) continue;
 
-      // 2. Filter out bmx-* sessions
-      const sessionName = tmuxTarget.split(':')[0];
-      if (sessionName?.startsWith('bmx-')) continue;
-
-      // 3. Recursively search process tree for known CLI binaries (up to 3 levels)
-      const match = findCliProcess(panePid, 3, filterCliId);
-      if (!match) continue;
-
-      // 3b. Filter by CLI type if requested
-      if (filterCliId && match.cliId !== filterCliId) continue;
-
-      // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
-      const cwd = readCwd(match.pid);
-      if (!cwd) continue;
-
-      // 5. Try to read CLI session metadata
-      let sessionId: string | undefined;
-      let startedAt: number | undefined;
-      if (match.cliId === 'claude-code') {
-        const meta = readClaudeSessionMeta(match.pid);
-        if (meta) {
-          sessionId = meta.sessionId;
-          startedAt = meta.startedAt;
-        }
-      } else if (match.cliId === 'codex') {
-        // Codex has no per-pid state file — bind via the open rollout fd in
-        // /proc. Worker-side has the same probe as a fallback so this is
-        // best-effort: we resolve here so the daemon-side adopt UI shows
-        // an accurate "currently in session X" hint.
-        const rollout = findCodexRolloutByPid(match.pid);
-        if (rollout) sessionId = rollout.cliSessionId;
-      } else if (match.cliId === 'coco') {
-        // CoCo: probe /proc/<pid>/fd for an open file under the session dir
-        // (session.log / traces.jsonl). events.jsonl itself is opened-written-
-        // closed per event so it's not reliable on its own. Worker-side
-        // re-probes too, so undefined here is acceptable.
-        const cocoSession = findCocoSessionByPid(match.pid);
-        if (cocoSession) sessionId = cocoSession.sessionId;
-      } else if (match.cliId === 'traex') {
-        // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
-        // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
-        // pid as a fallback, so undefined here is acceptable.
-        const rollout = findTraexRolloutByPid(match.pid);
-        if (rollout) sessionId = rollout.cliSessionId;
-      }
-
-      // 5b. Fall back to the CLI process's own start time for uptime. Without
-      // this only Claude (which has a session JSON with startedAt) shows a real
-      // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
-      if (startedAt === undefined) {
-        startedAt = readProcessStartTime(match.pid);
-      }
-
-      // 6. Get pane dimensions
-      const dims = getPaneDimensions(tmuxTarget);
-      if (!dims) continue;
-
-      results.push({
-        source: 'tmux',
-        tmuxTarget,
-        panePid,
-        cliPid: match.pid,
-        cliId: match.cliId,
-        sessionId,
-        cwd,
-        startedAt,
-        paneCols: dims.cols,
-        paneRows: dims.rows,
-      });
+      // 2-6 与单 pane 快路径共用同一份判定，见 resolveAdoptableSessionForPane。
+      const session = resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId);
+      if (session) results.push(session);
     }
   }
 
@@ -775,24 +1036,50 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
     ).trim();
     panePid = Number(out);
-    if (isNaN(panePid)) return false;
+    // 死/歧义目标下 `tmux display` 打印空 stdout 并以 exit 0 返回（不进 catch），
+    // 于是 `Number('') === 0` 且 `isNaN(0) === false`——必须显式挡掉 0 与负数，否则
+    // hasCliProcess(0, expectedPid, 6) 会从 pid 0 开始 BFS 整棵进程树、每个节点再
+    // fork 一次全量 `ps`（实测 >20s 同步冻结），并且一旦 expectedPid 恰好还活在机器
+    // 上任意位置就误报 alive。这条路径由 daemon 重启时对持久化 adopt 目标的校验触发
+    // （session-manager.ts 的 restore），目标 pane 可能已在两次重启间消失。
+    // 与 discoverAdoptableSessionByTarget 的守卫同源。
+    if (!Number.isInteger(panePid) || panePid <= 0) return false;
   } catch {
     return false;
   }
 
-  // Search the process tree for the expected CLI PID
-  const match = findCliProcess(panePid, 3, filterCliId);
-  return match !== undefined && match.pid === expectedPid;
+  // Search for the expected PID itself. A Codex Node launcher can match by
+  // argv before the native Codex child, so validating only the first generic
+  // match would reject the native pid returned by discovery.
+  return hasCliProcess(panePid, expectedPid, 6, filterCliId);
 }
 
 
 export type AdoptValidationResult = 'alive' | 'missing' | 'unknown';
 
-export function validateHerdrAdoptTarget(sessionName: string | undefined, paneId: string | undefined): AdoptValidationResult {
+export function validateHerdrAdoptTarget(
+  sessionName: string | undefined,
+  paneId: string | undefined,
+  expectedPid?: number,
+  expectedCliId?: CliId,
+): AdoptValidationResult {
   if (!sessionName || !paneId) return 'missing';
   const rawAgents = tryHerdrJson(['--session', sessionName, 'agent', 'list']);
   if (!rawAgents.ok) return 'unknown';
-  return extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId) ? 'alive' : 'missing';
+  const listed = extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId);
+  // A matching pane id proves only that the pane still exists. Herdr can reuse
+  // that pane for another process after the originally discovered CLI exits,
+  // so PID/CLI-constrained adoption must re-check the foreground process too.
+  if (listed && !expectedPid && !expectedCliId) return 'alive';
+
+  // Validate constrained listed panes, plus hook-less/unknown panes (notably
+  // TraeX before its first lifecycle hook), against the live foreground process.
+  const rawInfo = tryHerdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+  if (!rawInfo.ok) return 'unknown';
+  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId, expectedPid);
+  if (!process) return 'missing';
+  if (expectedPid && process.pid !== expectedPid) return 'missing';
+  return 'alive';
 }
 
 export function validateAdoptTarget(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): boolean {
@@ -800,7 +1087,12 @@ export function validateAdoptTarget(target: AdoptableSession | NonNullable<impor
 }
 
 export function validateAdoptTargetState(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): AdoptValidationResult {
-  if (target.source === 'herdr') return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget);
+  if (target.source === 'herdr') {
+    const pid = 'originalCliPid' in target
+      ? target.originalCliPid
+      : ('cliPid' in target ? target.cliPid : undefined);
+    return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget, pid, target.cliId);
+  }
   const pid = 'originalCliPid' in target
     ? target.originalCliPid
     : ('cliPid' in target ? target.cliPid : undefined);

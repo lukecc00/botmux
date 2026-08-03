@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   automateOpenPlatformSetup,
+  BOT_BASELINE_APP_EVENTS,
+  BOT_BASELINE_CALLBACKS,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
   buildSafeSettingPayload,
@@ -248,6 +250,111 @@ describe('prepareFeishuWebSession', () => {
     if (process.platform !== 'win32') {
       expect(statSync(sessionFile).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it('emits a structured scan confirmation only after Feishu reports the exact QR as scanned', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-scan-confirmation-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    const confirmations: number[] = [];
+    let pollingCount = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'qr-token' } } },
+          { headers: { 'x-flow-key': 'flow-key' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        pollingCount += 1;
+        if (pollingCount === 1) {
+          return Response.json({
+            code: 0,
+            data: { next_step: null, step_info: { status: 2 } },
+          });
+        }
+        return Response.json({
+          code: 0,
+          data: {
+            next_step: 'enter_app',
+            step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/cross-login' },
+          },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/cross-login') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=secret-cookie-value; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+      onQrScanConfirmed: ({ confirmedAt }) => confirmations.push(confirmedAt),
+    });
+
+    expect(result.ok && result.source).toBe('qr_login');
+    expect(confirmations).toHaveLength(1);
+    expect(Number.isInteger(confirmations[0])).toBe(true);
+  });
+
+  it('does not fabricate a scan confirmation when Feishu jumps directly to enter_app', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-no-scan-confirmation-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    const onQrScanConfirmed = vi.fn();
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'qr-token' } } },
+          { headers: { 'x-flow-key': 'flow-key' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        return Response.json({
+          code: 0,
+          data: {
+            next_step: 'enter_app',
+            step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/cross-login' },
+          },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/cross-login') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=secret-cookie-value; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+      onQrScanConfirmed,
+    });
+
+    expect(result.ok && result.source).toBe('qr_login');
+    expect(onQrScanConfirmed).not.toHaveBeenCalled();
   });
 
   it('forces a fresh QR login for onboarding even when a valid cache exists', async () => {
@@ -612,6 +719,49 @@ describe('automateOpenPlatformSetup', () => {
     expect(readStoredCookiesFromSessionFile(sessionFile)?.find(c => c.name === 'session')?.value).toBe('fresh-cookie');
   });
 
+  it('classifies an exact app access denial as an owner-session mismatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-owner-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_owner"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 10003, msg: '无权限访问' }, { status: 403 });
+      }
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_owner',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'owner_session_mismatch' });
+  });
+
+  it('does not classify a non-403 code 10003 response as an owner-session mismatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-owner-status-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_owner"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) return Response.json({ code: 10003, msg: 'other business error' });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_owner',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+  });
+
   it('returns login failure so setup can fall back to manual steps without aborting', async () => {
     const fetchImpl = (async () => {
       throw new Error('login down');
@@ -837,7 +987,11 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
   });
 
-  function subscriptionFetchImpl(sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+  function subscriptionFetchImpl(
+    sub: ReturnType<typeof openPlatformSubscriptionMock>,
+    calls: string[],
+    versionId: string | null = 'v1',
+  ) {
     return (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       calls.push(href);
@@ -846,22 +1000,74 @@ describe('automateOpenPlatformSetup', () => {
       if (href.includes('/scope/all/')) {
         return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
       }
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      if (href.includes('/app_version/create/')) {
+        return Response.json({ code: 0, data: versionId ? { versionId } : {} });
+      }
       return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
   }
 
-  async function runSetupWithMock(sessionDirPrefix: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+  async function runSetupWithMock(
+    sessionDirPrefix: string,
+    sub: ReturnType<typeof openPlatformSubscriptionMock>,
+    calls: string[],
+    options: { requireVerifiedEvents?: boolean; versionId?: string | null } = {},
+  ) {
     const dir = mkdtempSync(join(tmpdir(), sessionDirPrefix));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
     return automateOpenPlatformSetup({
       appId: 'cli_x',
       sessionFilePath: sessionFile,
-      fetchImpl: subscriptionFetchImpl(sub, calls),
+      fetchImpl: subscriptionFetchImpl(sub, calls, options.versionId === undefined ? 'v1' : options.versionId),
       scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      requireVerifiedEvents: options.requireVerifiedEvents,
     });
   }
+
+  it('returns an exact event and version ack from the same managed session', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-', sub, calls, {
+      requireVerifiedEvents: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      eventMode: 4,
+      verifiedEventCount: BOT_BASELINE_APP_EVENTS.length + BOT_BASELINE_CALLBACKS.length,
+      versionId: 'v1',
+    });
+  });
+
+  it('fails managed activation when one baseline event is still missing after same-session readback', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      rejectEventNames: ['im.chat.member.bot.added_v1'],
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-missing-', sub, calls, {
+      requireVerifiedEvents: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'event_verification_failed',
+    });
+  });
+
+  it('fails managed activation when the published version cannot be proven', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-version-', sub, calls, {
+      requireVerifiedEvents: true,
+      versionId: null,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'version_verification_failed',
+    });
+  });
 
   it('subscribes baseline app events incrementally and the card callback via /callback endpoints', async () => {
     const sub = openPlatformSubscriptionMock('cli_x');
@@ -893,10 +1099,11 @@ describe('automateOpenPlatformSetup', () => {
           'im.message.receive_v1',
           'im.chat.member.bot.added_v1',
           'im.chat.member.bot.deleted_v1',
-          'drive.file.comment_add_v1',
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
           'im.message.reaction.deleted_v1',
+          'im.chat.member.user.added_v1',
+          'im.chat.member.user.deleted_v1',
           'vc.bot.meeting_invited_v1',
           'vc.bot.meeting_activity_v1',
           'vc.bot.meeting_ended_v1',
@@ -924,8 +1131,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 7 + VC app 3 + VC user 1 = 批量 1 次 + 单个 11 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(12);
+    // 批量失败后逐个重试过:baseline 6 + 可选 user 事件 2 + VC app 3 + VC user 1 = 批量 1 次 + 单个 12 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(13);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });
@@ -983,7 +1190,7 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
     if (result.ok) {
       expect(result.missingVcEvents).toEqual(vcEvents);
-      expect(result.subscribedEventCount).toBe(8); // 7 baseline 事件 + 1 回调
+      expect(result.subscribedEventCount).toBe(9); // 6 baseline 事件 + 2 可选 user 事件 + 1 回调
       expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
       // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
       expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');
@@ -992,7 +1199,7 @@ describe('automateOpenPlatformSetup', () => {
 
   it('fails closed and blocks the listener gate when event mode readback stays webhook despite full subscriptions', async () => {
     // event/switch 返回成功(mock 默认 code 0)但回读 eventMode 仍是 1:
-    // 订阅名齐、count=12、missingVcEvents=[],唯一异常是接收方式。
+    // 订阅名齐、count=11、missingVcEvents=[],唯一异常是接收方式。
     const sub = openPlatformSubscriptionMock('cli_x', {
       initial: {
         eventMode: 1,
@@ -1000,7 +1207,6 @@ describe('automateOpenPlatformSetup', () => {
           'im.message.receive_v1',
           'im.chat.member.bot.added_v1',
           'im.chat.member.bot.deleted_v1',
-          'drive.file.comment_add_v1',
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
           'im.message.reaction.deleted_v1',
@@ -1021,7 +1227,7 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('事件接收模式');
       expect(result.eventModeReady).toBe(false);
       expect(result.missingVcEvents).toEqual([]);
-      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=12/missingVc=[] 会放行)
+      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=11/missingVc=[] 会放行)
       expect(vcListenerEventGateError(result)).toContain('长连接');
     }
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);

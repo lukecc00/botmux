@@ -4,7 +4,7 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
 // Callback set by daemon to execute a scheduled task
 let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
@@ -273,24 +273,77 @@ export function parseNaturalSchedule(input: string): ParseNLResult | null {
   return { parsed: zh.parsed, prompt, name };
 }
 
-/**
- * Detect a leading "new topic" delivery keyword in a /schedule prompt and strip
- * it.  Lets users write `/schedule 每日9:00 新话题 帮我看AI新闻` so every fire
- * opens a brand-new topic in the chat.  Returns the resolved delivery mode plus
- * the prompt with the keyword removed.  When no keyword is present (or nothing
- * follows it) the prompt is returned unchanged with deliver='origin'.
- */
-export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
-  // Match a leading new-topic phrase: optional 每次/每回/每天/每日, then any run of
-  // 开/起/另/一/个/新/的/space fillers that MUST contain 新, immediately followed
-  // by 话题. `新` is mandatory so we don't match a normal prompt like
-  // "总结这个话题…" or "新闻话题…". Covers 新话题 / 新开话题 / 开新话题 /
-  // 每次开新话题 / 每次开一个新话题 / 新开一个话题 等变体。
+function extractExecutionPositionModifier(prompt: string): {
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  prompt: string;
+} {
+  const topLevelZh = prompt.match(/^\s*(?:群消息顶层|群顶层|顶层)(?:执行|运行)?[\s,，、:：。-]+(.+)$/s);
+  if (topLevelZh && topLevelZh[1].trim()) return { executionPosition: 'top-level', prompt: topLevelZh[1].trim() };
+  const topLevelEn = prompt.match(/^\s*(?:group\s+)?top[\s-]?level[\s,:：-]+(.+)$/is);
+  if (topLevelEn && topLevelEn[1].trim()) return { executionPosition: 'top-level', prompt: topLevelEn[1].trim() };
+
   const zh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*[开起另一个新的\s]*新[开起另一个新的\s]*话题[\s,，、:：。-]*(.+)$/s);
-  if (zh && zh[1].trim()) return { deliver: 'new-topic', prompt: zh[1].trim() };
+  if (zh && zh[1].trim()) return { executionPosition: 'new-topic', prompt: zh[1].trim() };
   const en = prompt.match(/^\s*(?:every\s+run\s+in\s+a\s+)?new[\s-]?topic[\s,:：-]+(.+)$/is);
-  if (en && en[1].trim()) return { deliver: 'new-topic', prompt: en[1].trim() };
-  return { deliver: 'origin', prompt };
+  if (en && en[1].trim()) return { executionPosition: 'new-topic', prompt: en[1].trim() };
+  return { prompt };
+}
+
+/** Backward-compatible parser; `deliver:new-topic` means a routing modifier
+ * was present. New callers should also read extractScheduleModifiers.position. */
+export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
+  const parsed = extractExecutionPositionModifier(prompt);
+  return parsed.executionPosition
+    ? { deliver: 'new-topic', prompt: parsed.prompt }
+    : { deliver: 'origin', prompt };
+}
+
+/**
+ * Detect a leading "silent" keyword in a /schedule prompt and strip it.  Lets
+ * users write `/schedule 每30分钟 静默 检查服务，挂了才报警` so fires post no
+ * "🕐 task started" banner and the model decides whether to `botmux send`.
+ * The keyword must be followed by whitespace/punctuation — a prompt that
+ * merely *starts with* 静默 as part of a longer word (静默模式…) is left
+ * untouched only when nothing separates it, so document the spaced form.
+ */
+export function extractSilentMode(prompt: string): { silent: boolean; prompt: string } {
+  const zh = prompt.match(/^\s*(?:静默|悄悄)(?:执行|运行|地)?[\s,，、:：。-]+(.+)$/s);
+  if (zh && zh[1].trim()) return { silent: true, prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*silent(?:ly)?[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { silent: true, prompt: en[1].trim() };
+  return { silent: false, prompt };
+}
+
+/**
+ * Extract both /schedule prompt modifiers regardless of their order.
+ * `deliver:new-topic` remains a compatibility token indicating that a position
+ * modifier was present. `executionPosition` carries the unambiguous modern
+ * value: group top level or a fresh topic on every run.
+ */
+export function extractScheduleModifiers(prompt: string): {
+  deliver: 'origin' | 'new-topic';
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  silent: boolean;
+  prompt: string;
+} {
+  let deliver: 'origin' | 'new-topic' = 'origin';
+  let executionPosition: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'> | undefined;
+  let silent = false;
+  let rest = prompt;
+  // Two keywords max — loop twice so either order is handled.
+  for (let i = 0; i < 2; i++) {
+    const d = extractExecutionPositionModifier(rest);
+    if (d.executionPosition) {
+      deliver = 'new-topic';
+      executionPosition = d.executionPosition;
+      rest = d.prompt;
+      continue;
+    }
+    const s = extractSilentMode(rest);
+    if (s.silent) { silent = true; rest = s.prompt; continue; }
+    break;
+  }
+  return { deliver, ...(executionPosition ? { executionPosition } : {}), silent, prompt: rest };
 }
 
 // ─── next-run computation ───────────────────────────────────────────────────
@@ -515,6 +568,8 @@ export function addTask(params: {
   chatId: string;
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
@@ -523,9 +578,21 @@ export function addTask(params: {
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): ScheduledTask {
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
+  const executionPosition: ScheduleExecutionPosition = params.executionPosition
+    ?? (params.deliver === 'new-topic'
+      ? 'new-topic'
+      : params.scope === 'chat'
+        ? 'top-level'
+        : params.rootMessageId ? 'topic' : 'top-level');
+  if (executionPosition === 'topic' && !params.rootMessageId) {
+    throw new Error('topic_root_required');
+  }
+  const topicTitle = normalizeTopicTitle(params.topicTitle);
+  const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
     name: params.name,
     schedule: params.schedule,
@@ -534,7 +601,9 @@ export function addTask(params: {
     workingDir: params.workingDir,
     chatId: params.chatId,
     rootMessageId: params.rootMessageId,
-    scope: params.scope,
+    scope,
+    executionPosition,
+    topicTitle,
     chatType: params.chatType,
     larkAppId: params.larkAppId,
     creatorChatId: params.creatorChatId,
@@ -542,10 +611,32 @@ export function addTask(params: {
     creatorLarkAppId: params.creatorLarkAppId,
     nextRunAt,
     repeat: params.repeat,
-    deliver: params.deliver ?? 'origin',
+    // Delivery shape is now expressed by scope/rootMessageId. Persist only the
+    // local-vs-chat distinction; schedule-store also normalizes legacy values.
+    deliver: params.deliver === 'local' ? 'local' : 'origin',
+    silent: params.silent,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+export function normalizeTopicTitle(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const chars = Array.from(trimmed);
+  if (chars.length > 200) throw new Error('topic_title_too_long');
+  return trimmed;
+}
+
+export function resolveTaskExecutionPosition(
+  task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
+): ScheduleExecutionPosition {
+  if (task.executionPosition === 'top-level' || task.executionPosition === 'topic' || task.executionPosition === 'new-topic') {
+    return task.executionPosition === 'topic' && !task.rootMessageId ? 'top-level' : task.executionPosition;
+  }
+  if (task.deliver === 'new-topic') return 'new-topic';
+  if (task.scope === 'chat') return 'top-level';
+  return task.rootMessageId ? 'topic' : 'top-level';
 }
 
 export function removeTask(id: string): boolean {
@@ -655,22 +746,120 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
 }
 
 /**
- * Toggle a task's delivery mode between 'origin' and 'new-topic' and persist.
- * Only these two modes participate: 'new-topic' flips to 'origin', anything else
- * treated as origin flips to 'new-topic'. The 'local' (log-only, no delivery)
- * mode is REFUSED — toggling it would silently turn a "don't post" task into an
- * in-chat new-topic poster; 'local' is a CLI-only choice. Emits a
- * `schedule.updated` event so the dashboard reflects the change immediately.
+ * Cycle a task's execution position: retained topic → group top level → fresh
+ * topic per run → retained topic (or group top level when no root is retained).
+ * Silent tasks skip the fresh-topic state because that state needs a visible
+ * seed message. The `deliver` response remains for cached clients.
  */
-export function toggleDelivery(id: string): { ok: boolean; error?: string; deliver?: 'origin' | 'new-topic' } {
+export function toggleDelivery(id: string): {
+  ok: boolean;
+  error?: string;
+  deliver?: 'origin' | 'new-topic';
+  executionPosition?: ScheduleExecutionPosition;
+} {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
-  const next: 'origin' | 'new-topic' = task.deliver === 'new-topic' ? 'origin' : 'new-topic';
-  scheduleStore.updateTask(id, { deliver: next });
+  const current = resolveTaskExecutionPosition(task);
+  let executionPosition: ScheduleExecutionPosition;
+  if (current === 'topic') executionPosition = 'top-level';
+  else if (current === 'top-level') executionPosition = 'new-topic';
+  else executionPosition = task.rootMessageId ? 'topic' : 'top-level';
+  if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
+  const scope: 'chat' | 'thread' = executionPosition === 'topic' ? 'thread' : 'chat';
+  scheduleStore.updateTask(id, { scope, executionPosition });
+  const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch: { deliver: next } },
+    body: { id, patch: { scope, executionPosition } },
   });
-  return { ok: true, deliver: next };
+  return { ok: true, deliver, executionPosition };
+}
+
+/**
+ * Update editable fields of a scheduled task (name, prompt, schedule, silent,
+ * execution position and retained topic root).
+ * Re-parses the schedule expression and recomputes nextRunAt when the schedule
+ * string changes. A legacy `deliver` input is accepted and normalized to
+ * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
+ * explicit fresh-topic position for cached clients.
+ * Emits a `schedule.updated` event so the dashboard reflects changes live.
+ */
+export function updateTask(
+  id: string,
+  updates: {
+    name?: string;
+    prompt?: string;
+    schedule?: string;
+    deliver?: 'origin' | 'new-topic';
+    silent?: boolean;
+    executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
+    topicTitle?: string;
+  },
+): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+
+  const patch: Record<string, unknown> = {};
+  if (updates.name !== undefined) patch.name = updates.name;
+  if (updates.prompt !== undefined) patch.prompt = updates.prompt;
+  if (updates.silent !== undefined) patch.silent = updates.silent === true ? true : undefined;
+
+  const legacyPosition = updates.deliver === 'new-topic'
+    ? 'new-topic'
+    : undefined;
+  const executionPosition = updates.executionPosition ?? legacyPosition;
+  const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
+  if (executionPosition === 'topic' && !nextRootMessageId) {
+    return { ok: false, error: 'topic_root_required' };
+  }
+  if (updates.topicTitle !== undefined) {
+    try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+  }
+  if (updates.rootMessageId !== undefined) patch.rootMessageId = updates.rootMessageId;
+  if (executionPosition !== undefined) {
+    patch.scope = executionPosition === 'topic' ? 'thread' : 'chat';
+    patch.executionPosition = executionPosition;
+    patch.deliver = 'origin';
+  } else if (updates.deliver !== undefined) {
+    patch.deliver = 'origin';
+  }
+
+  // Re-parse + recompute next run when the schedule expression changes.
+  if (updates.schedule !== undefined && updates.schedule !== task.schedule) {
+    let parsed: ParsedSchedule;
+    try {
+      parsed = parseSchedule(updates.schedule);
+    } catch (err) {
+      return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    patch.schedule = updates.schedule;
+    patch.parsed = parsed;
+    const next = computeNextRun(parsed);
+    patch.nextRunAt = next ?? undefined;
+  }
+
+  scheduleStore.updateTask(id, patch);
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch },
+  });
+  return { ok: true };
+}
+
+/**
+ * Delete a scheduled task. Emits a `schedule.deleted` event so the dashboard
+ * drops the row immediately without waiting for the next poll.
+ */
+export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  scheduleStore.removeTask(id);
+  dashboardEventBus.publish({
+    type: 'schedule.deleted',
+    body: { id },
+  });
+  return { ok: true };
 }

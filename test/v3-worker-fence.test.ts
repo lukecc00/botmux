@@ -11,7 +11,40 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const procScanControl = vi.hoisted(() => ({
+  enabled: false,
+  pid: 42_424,
+  environReads: 0,
+}));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    readdirSync: (...args: any[]) => {
+      if (procScanControl.enabled && args[0] === '/proc') return [String(procScanControl.pid)];
+      return (actual.readdirSync as any)(...args);
+    },
+    lstatSync: (...args: any[]) => {
+      if (procScanControl.enabled && args[0] === `/proc/${procScanControl.pid}`) {
+        return { uid: process.getuid?.() };
+      }
+      return (actual.lstatSync as any)(...args);
+    },
+    readFileSync: (...args: any[]) => {
+      if (procScanControl.enabled && args[0] === `/proc/${procScanControl.pid}/cmdline`) {
+        return Buffer.from('node\0/usr/bin/unrelated-service\0');
+      }
+      if (procScanControl.enabled && args[0] === `/proc/${procScanControl.pid}/environ`) {
+        procScanControl.environReads += 1;
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      }
+      return (actual.readFileSync as any)(...args);
+    },
+  };
+});
 
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import {
@@ -173,25 +206,19 @@ describe('v3 attempt worker fence', () => {
     },
   );
 
-  it.runIf(process.platform === 'linux')(
-    'ignores a proven non-worker when its environ is unreadable',
-    () => {
-      const procRoot = join(root, 'proc');
-      const procDir = join(procRoot, '4242');
-      mkdirSync(join(procDir, 'environ'), { recursive: true });
-      writeFileSync(join(procDir, 'cmdline'), '/usr/lib/systemd/systemd\0--user\0');
-
-      expect(discoverV3AttemptWorker(attemptDir, procRoot)).toEqual({ status: 'none' });
-
-      // Once the command line is a worker, the same unreadable binding must
-      // remain fail-closed instead of being treated as an empty attempt.
-      writeFileSync(join(procDir, 'cmdline'), '/usr/bin/node\0/app/worker.js\0');
-      expect(discoverV3AttemptWorker(attemptDir, procRoot)).toMatchObject({
-        status: 'ambiguous',
-        unverifiablePids: [4242],
-      });
-    },
-  );
+  it('ignores a non-worker Linux process without reading its inaccessible environment', () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    procScanControl.enabled = true;
+    procScanControl.environReads = 0;
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+    try {
+      expect(discoverV3AttemptWorker(attemptDir)).toEqual({ status: 'none' });
+      expect(procScanControl.environReads).toBe(0);
+    } finally {
+      procScanControl.enabled = false;
+      if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+  });
 
   it.runIf(process.platform === 'linux')('fails closed when exact discovery is ambiguous', async () => {
     await spawnDiscoverableWorker();

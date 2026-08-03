@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 
 describe('desktop dashboard compat validation', () => {
+  it('accepts the current runtime compat manifest', async () => {
+    const { buildCompatManifest } = await import('../../src/dashboard/compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
+    const fetch = vi.fn().mockResolvedValue(response(200, buildCompatManifest({
+      runtimeVersion: '3.6.0',
+      machineId: null,
+    })));
+
+    await expect(validateDashboardCompat('http://127.0.0.1:7891/', { fetch }))
+      .resolves.toEqual({ ok: true });
+  });
+
   it('accepts the supported desktop compat manifest', async () => {
     const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue(response(200, {
@@ -29,10 +41,10 @@ describe('desktop dashboard compat validation', () => {
       routes: ['#/'],
     }));
 
-    await expect(validateDashboardCompat('https://m-test.botmux.bytedance.net/?t=secret-token#/sessions', { fetch }))
+    await expect(validateDashboardCompat('https://m-test.botmux.example.test/?t=secret-token#/sessions', { fetch }))
       .resolves.toEqual({ ok: true });
     expect(fetch).toHaveBeenCalledWith(
-      'https://m-test.botmux.bytedance.net/__desktop/compat?t=secret-token',
+      'https://m-test.botmux.example.test/__desktop/compat?t=secret-token',
       expect.any(Object),
     );
   });
@@ -92,7 +104,7 @@ describe('desktop dashboard compat validation', () => {
       schemaVersion: 1,
       product: 'botmux',
       runtimeVersion: '3.0.0',
-      dashboardProtocolVersion: 2,
+      dashboardProtocolVersion: 3,
       desktopShell: { supported: true },
       features: ['desktop-shell'],
       routes: ['#/'],

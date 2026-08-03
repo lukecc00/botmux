@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
@@ -43,10 +44,7 @@ interface PluginSkillContribution {
 interface PluginMcpContribution {
   name?: string;
   transport?: string;
-  command?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
+  privateRef?: string;
 }
 
 interface PluginCliCommand {
@@ -172,16 +170,16 @@ async function postServiceAction(pluginId: string, action: PluginServiceAction):
   return normalizePluginManagementPayload(await res.json());
 }
 
-function Tags(props: { values?: readonly string[] }): JSX.Element {
+function Tags(props: { values?: readonly string[] }): React.JSX.Element {
   if (!props.values?.length) return <span className="plugin-muted">-</span>;
   return <>{props.values.map(value => <span className="plugin-chip" key={value}>{value}</span>)}</>;
 }
 
-function InlineCode(props: { children: ReactNode }): JSX.Element {
+function InlineCode(props: { children: ReactNode }): React.JSX.Element {
   return <code className="plugin-inline-code">{props.children}</code>;
 }
 
-function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> }): JSX.Element {
+function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> }): React.JSX.Element {
   if (props.rows.length === 0) return <div className="plugin-empty-state">暂无内容</div>;
   return (
     <div className="plugin-info-table">
@@ -195,7 +193,7 @@ function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> })
   );
 }
 
-function PanelHeading(props: { title: string; description: string }): JSX.Element {
+function PanelHeading(props: { title: string; description: string }): React.JSX.Element {
   return (
     <div className="plugin-tab-panel-head">
       <h3>{props.title}</h3>
@@ -204,7 +202,7 @@ function PanelHeading(props: { title: string; description: string }): JSX.Elemen
   );
 }
 
-function EmptyPanel(props: { children: ReactNode }): JSX.Element {
+function EmptyPanel(props: { children: ReactNode }): React.JSX.Element {
   return <div className="plugin-empty-state">{props.children}</div>;
 }
 
@@ -241,7 +239,7 @@ function serviceStatusClass(report?: PluginServiceReport): string {
   return 'plugin-status-muted';
 }
 
-function ServiceAccessLink(props: { url?: string; health?: boolean }): JSX.Element {
+function ServiceAccessLink(props: { url?: string; health?: boolean }): React.JSX.Element {
   if (!props.url) return <span className="plugin-muted">{props.health ? '无健康检查' : '暂无访问地址'}</span>;
   return (
     <a
@@ -255,7 +253,7 @@ function ServiceAccessLink(props: { url?: string; health?: boolean }): JSX.Eleme
   );
 }
 
-function ServiceDetails(props: { plugin: ManagedPlugin }): JSX.Element {
+function ServiceDetails(props: { plugin: ManagedPlugin }): React.JSX.Element {
   const { plugin } = props;
   if (!plugin.service) return <EmptyPanel>这个插件没有需要单独启动的后台进程。</EmptyPanel>;
   const report = plugin.serviceReport;
@@ -283,7 +281,7 @@ function ServiceActions(props: {
   plugin: ManagedPlugin;
   busy: boolean;
   onAction(action: PluginServiceAction): void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const { plugin } = props;
   if (!plugin.service) return null;
   const report = plugin.serviceReport;
@@ -318,7 +316,7 @@ function ServiceActions(props: {
   );
 }
 
-function DashboardActions(props: { plugin: ManagedPlugin }): JSX.Element | null {
+function DashboardActions(props: { plugin: ManagedPlugin }): React.JSX.Element | null {
   const entries = props.plugin.dashboard ?? [];
   if (entries.length === 0) return null;
   return (
@@ -338,7 +336,7 @@ function PluginActionArea(props: {
   plugin: ManagedPlugin;
   busy: boolean;
   onServiceAction(action: PluginServiceAction): void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const hasService = Boolean(props.plugin.service);
   const hasDashboard = (props.plugin.dashboard?.length ?? 0) > 0;
   if (!hasService && !hasDashboard) return null;
@@ -356,7 +354,7 @@ function PluginActionArea(props: {
   );
 }
 
-function TabPanel(props: { id: string; active: boolean; children: ReactNode }): JSX.Element {
+function TabPanel(props: { id: string; active: boolean; children: ReactNode }): React.JSX.Element {
   return (
     <section
       className={`plugin-tab-panel${props.active ? ' is-active' : ''}`}
@@ -368,7 +366,7 @@ function TabPanel(props: { id: string; active: boolean; children: ReactNode }): 
   );
 }
 
-function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const skills = props.plugin.contributions?.skills ?? [];
   const rows = skills.map(skill => ({
     label: skill.name || skill.path || 'skill',
@@ -382,22 +380,15 @@ function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Ele
   );
 }
 
-function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const plugin = props.plugin;
   const server = plugin.contributions?.mcp;
   const serverRows: Array<{ label: string; content: ReactNode }> = server ? [{
     label: server.name || 'mcp',
     content: (
       <div className="plugin-info-stack">
-        <div>
-          <span>{server.transport === 'streamable-http' ? '服务地址' : '启动命令'}</span>
-          <InlineCode>{server.transport === 'streamable-http' ? server.url || '-' : server.command?.join(' ') || '-'}</InlineCode>
-        </div>
         <div><span>传输</span><Tags values={[server.transport || 'stdio']} /></div>
-        <div><span>环境变量</span><Tags values={Object.keys(server.env ?? {})} /></div>
-        {Object.keys(server.headers ?? {}).length > 0
-          ? <div><span>请求头</span><Tags values={Object.keys(server.headers ?? {})} /></div>
-          : null}
+        <div><span>运行配置</span><Tags values={['受保护，由 Gateway 按会话加载']} /></div>
       </div>
     ),
   }] : [];
@@ -439,7 +430,7 @@ function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Elemen
   );
 }
 
-function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const cli = props.plugin.contributions?.cli;
   const rows: Array<{ label: string; content: ReactNode }> = [
     ...(cli?.entry ? [{ label: '入口文件', content: <InlineCode>{cli.entry}</InlineCode> }] : []),
@@ -456,7 +447,7 @@ function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Elemen
   );
 }
 
-function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const rows = (props.plugin.dashboard ?? []).map(entry => ({
     label: entry.id,
     content: (
@@ -474,7 +465,7 @@ function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.
   );
 }
 
-function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   return (
     <TabPanel id="service" active={props.active}>
       <PanelHeading title="Service" description="插件后台服务的声明、当前状态和访问地址。启动、停止、重启在上方操作区处理。" />
@@ -483,7 +474,7 @@ function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.El
   );
 }
 
-function PluginTabs(props: { plugin: ManagedPlugin }): JSX.Element {
+function PluginTabs(props: { plugin: ManagedPlugin }): React.JSX.Element {
   const commands = props.plugin.contributions?.cli?.commands ?? [];
   const tabs = useMemo(() => [
     { id: 'skills', label: 'Skills', count: props.plugin.skillsCount ?? 0, hint: '会话加载' },
@@ -547,7 +538,7 @@ function PluginEnableRow(props: {
   checked: boolean;
   busy: boolean;
   onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <label className="toggle-row plugin-enable-row">
       <span className="plugin-enable-copy">
@@ -573,7 +564,7 @@ function PluginGlobalSetting(props: {
   pendingToggles: PendingToggles;
   busy: boolean;
   onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const enabled = pluginEnabledInScope(props.plugin, 'global', props.pendingToggles);
   return (
     <label className="toggle-row plugin-global-setting">
@@ -602,7 +593,7 @@ function PluginBotSettings(props: {
   pendingToggles: PendingToggles;
   busy: boolean;
   onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { plugin, bots, pendingToggles } = props;
   const enabledBotCount = bots.filter(bot => pluginEnabledInScope(plugin, bot.id, pendingToggles)).length;
   return (
@@ -642,7 +633,7 @@ function PluginCapabilitySummary(props: {
   globalEnabled: boolean;
   enabledBotCount: number;
   botCount: number;
-}): JSX.Element {
+}): React.JSX.Element {
   const commands = props.plugin.contributions?.cli?.commands ?? [];
   const capabilities = [
     { label: 'Skills', count: props.plugin.skillsCount ?? 0 },
@@ -672,7 +663,7 @@ function PluginCapabilitySummary(props: {
   );
 }
 
-function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): JSX.Element {
+function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -717,7 +708,7 @@ function PluginCard(props: {
   onToggle(scope: string, enabled: boolean): void;
   onPin(pinned: boolean): void;
   onServiceAction(action: PluginServiceAction): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { plugin } = props;
   const [expanded, setExpanded] = useState(false);
   const title = plugin.displayName || plugin.id;
@@ -821,7 +812,7 @@ function updateSet<T>(source: ReadonlySet<T>, value: T, present: boolean): Set<T
   return next;
 }
 
-function PluginManagementPage(): JSX.Element {
+function PluginManagementPage(): React.JSX.Element {
   const [payload, setPayload] = useState<PluginManagementPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -958,7 +949,7 @@ function pluginDashboardApi(pluginId: string) {
   };
 }
 
-function PluginDashboardRoute(props: { hash: string }): JSX.Element {
+function PluginDashboardRoute(props: { hash: string }): React.JSX.Element {
   const [entry, setEntry] = useState<DashboardPluginEntry | null>(null);
   const [Component, setComponent] = useState<PluginDashboardComponent | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1014,7 +1005,7 @@ function PluginDashboardRoute(props: { hash: string }): JSX.Element {
   );
 }
 
-function PluginRoutePage(): JSX.Element {
+function PluginRoutePage(): React.JSX.Element {
   const hash = location.hash || '#/plugins';
   if (hash === '#/plugins' || hash.startsWith('#/plugins?')) return <PluginManagementPage />;
   return <PluginDashboardRoute hash={hash} />;

@@ -140,6 +140,58 @@ describe('local-cli-opener', () => {
     expect(adapterFactory).not.toHaveBeenCalled();
   });
 
+  it('attach mode opens the exact managed agent inside a shared Herdr session', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'herdr',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'work',
+          agentName: 'botmux-abcdef12',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "herdr --session 'work' agent attach 'botmux-abcdef12'",
+    });
+  });
+
+  it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
+    vi.stubEnv('ZMX_SESSION', 'outer');
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'managed-zmx-target',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
+      expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
+      expect(result.command).toContain('/dist/cli.js');
+      expect(result.command).toContain("__zmx-attach-managed 'managed-zmx-target' 'abcdef123456'");
+      expect(result.command).not.toContain('bmx-abcdef12');
+      expect(result.command).not.toContain('grep ');
+      expect(result.command).not.toContain('exec zmx attach');
+    }
+    expect(adapterFactory).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
     const result = buildLocalCliOpenCommand(ds({
       adoptedFrom: { source: 'herdr', herdrSessionName: 'dev', herdrTerminalId: 'terminal_1', cwd: '/repo' },

@@ -17,16 +17,33 @@ function getLocalIp(): string {
   return 'localhost';
 }
 
-const configuredWebExternalHost = process.env.WEB_EXTERNAL_HOST;
+function nonBlankHost(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
+/** A wildcard bind (0.0.0.0 / :: / '') isn't a reachable address, so a link must
+ *  resolve it to a concrete IP; a specific host is advertised verbatim. */
+export function isWildcardBindHost(host: string): boolean {
+  return host === '0.0.0.0' || host === '::' || host === '';
+}
+
+const configuredWebExternalHost = nonBlankHost(process.env.WEB_EXTERNAL_HOST);
 const configuredDashboardExternalHost =
-  process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
+  nonBlankHost(process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST) ?? configuredWebExternalHost;
+const configuredDashboardBindHost = nonBlankHost(process.env.BOTMUX_DASHBOARD_HOST);
 
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();
 }
 
 export function getDashboardExternalHost(): string {
-  return configuredDashboardExternalHost ?? getLocalIp();
+  // Explicit external host → the actual (non-wildcard) listen host → LAN IP.
+  // A 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP nothing listens on.
+  if (configuredDashboardExternalHost) return configuredDashboardExternalHost;
+  if (configuredDashboardBindHost && !isWildcardBindHost(configuredDashboardBindHost)) {
+    return configuredDashboardBindHost;
+  }
+  return getLocalIp();
 }
 
 /**
@@ -225,27 +242,21 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
-  screenAnalyzer: {
-    enabled: (process.env.SCREEN_ANALYZER_ENABLED ?? '').toLowerCase() === 'true',
-    baseUrl: process.env.SCREEN_ANALYZER_BASE_URL ?? '',
-    apiKey: process.env.SCREEN_ANALYZER_API_KEY ?? '',
-    model: process.env.SCREEN_ANALYZER_MODEL ?? '',
-    /** Snapshot polling interval in ms */
-    intervalMs: Number(process.env.SCREEN_ANALYZER_INTERVAL_MS) || 2_000,
-    /** Consecutive unchanged snapshots required before calling AI */
-    stableCount: Number(process.env.SCREEN_ANALYZER_STABLE_COUNT) || 6,
-    /** Max characters to send from snapshot */
-    snapshotMaxChars: Number(process.env.SCREEN_ANALYZER_SNAPSHOT_MAX_CHARS) || 8_000,
-    /** Extra headers for the API request (JSON string, e.g. '{"X-Custom":"value"}') */
-    extraHeaders: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_HEADERS ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, string>,
-    /** Extra body params for the API request (JSON string, e.g. '{"thinking":{"type":"disabled"}}') */
-    extraBody: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_BODY ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, unknown>,
+  stuckDetector: {
+    /**
+     * Lightweight, AI-free fallback that warns the user when a written input
+     * has not produced a completed turn within `timeoutMs`. Currently targets
+     * the Codex PreToolUse hook-review blocking state (level 1 hooks browser
+     * and level 2 per-hook review). Generic [Y/n]/permission/Press-to-continue
+     * prompts are intentionally NOT handled — they cannot be safely inferred
+     * from a regex and belong in a follow-up. Enabled by default because it
+     * has no external dependencies and only fires when the worker confirms the
+     * turn is genuinely stalled AND the snapshot matches a known hook screen.
+     */
+    enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
+    /** Milliseconds after a write before the detector checks whether the turn
+     *  is still unresolved. */
+    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
   },
   worktreeSlugAI: {
     /**
@@ -275,6 +286,30 @@ export const config = {
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
   get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
+  // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
+  // so a Settings change enables/disables RPC input mode for new codex-family
+  // sessions without a daemon restart. The daemon ORs this with each bot's own
+  // `codexRpcInput` flag when building the worker init message.
+  // Default OFF (absent ⇒ disabled): the hybrid RPC pane lifecycle (resume
+  // respawn + ready-gate) must be live-verified before the fleet default flips
+  // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
+  // sets this global explicitly.
+  get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Live getter (like codexRpcInputDefault): re-reads the experimental global
+  // toggle that gates the "no visible output" anti-resend guidance in the botmux
+  // routing hints, so a Settings change takes effect on the next session without
+  // a daemon restart. Default OFF (absent ⇒ disabled): the guidance mainly helps
+  // when Claude Code (≥2.1.212) drives a non-Claude backend model that misreads a
+  // thinking-only nudge as a send failure; it is harmless but unnecessary for the
+  // common all-Claude setup, so operators opt in explicitly.
+  get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
+  // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
+  // effect on the next session without a daemon restart (existing panes keep their
+  // argv — argv can't be hot-swapped). Default ON (absent ⇒ true): only an explicit
+  // stored `false` disables it. The daemon ANDs this with each bot's
+  // `!disableCliBypass` before handing it to the adapter (see worker init).
+  get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

@@ -1,4 +1,5 @@
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
@@ -9,12 +10,12 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
+import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
+import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
-import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 import type { DaemonSession } from './types.js';
-import { sessionKey } from './types.js';
+import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
 
@@ -56,6 +57,19 @@ export function buildExternalEventVisibleText(req: TriggerRequest, larkAppId?: s
   return t('trigger.external_event_clean', undefined, larkAppId ? localeForBot(larkAppId) : undefined);
 }
 
+/** Feishu topic seed for a new external-event session. `null` is an explicit
+ * connector-owner choice to run without the otherwise required notice. */
+export function buildExternalEventTopicMessage(req: TriggerRequest, larkAppId?: string): string | null {
+  const configured = req.presentation?.topicMessage;
+  if (configured === null) return null;
+  if (typeof configured === 'string' && configured.trim()) return configured.trim();
+  return t(
+    'trigger.external_event',
+    { source: req.envelope.sourceName },
+    larkAppId ? localeForBot(larkAppId) : undefined,
+  );
+}
+
 /** Connector-owner directives are trusted application context. Keep them
  * separate from the full legacy wrapper, which also contains untrusted event
  * bytes and therefore must never be promoted wholesale to developer context. */
@@ -73,7 +87,10 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
-      'Return the final answer as plain assistant text. Do not call botmux send, do not post to Feishu/Lark.',
+      'Your entire reply is returned verbatim to a program as the task result — not shown in a chat.',
+      'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
+      'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
+      'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
       '</botmux_http_response_mode>',
     );
   }
@@ -178,12 +195,18 @@ function waitForSessionFinalOutput(
 }
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  const createdAt = Date.now();
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {
     status: 'pending',
-    createdAt: Date.now(),
+    createdAt,
   });
   ds.latestAsyncTriggerId = triggerId;
+  // Durably record the pending trigger so a poller can still resolve this
+  // session after a daemon restart (the in-memory Map above does not survive
+  // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
+  // write only forfeits restart recovery.
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId);
 }
 
 function buildAsyncQueuedResponse(
@@ -223,7 +246,7 @@ async function validateRootMessageTarget(
   return { ok: true, chatId };
 }
 
-async function buildExistingSessionContent(
+function buildExistingSessionContent(
   ds: DaemonSession,
   prompt: string,
   larkAppId: string,
@@ -234,7 +257,6 @@ async function buildExistingSessionContent(
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
-  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
     cliId: ds.session.cliId ?? botCfg.cliId,
@@ -243,7 +265,6 @@ async function buildExistingSessionContent(
     larkAppId,
     chatId,
     whiteboardId: ds.session.whiteboardId,
-    topicGroupMemoryBlock,
     codexAppText,
     codexAppApplicationContext,
     // Only data enters untrusted structured context; connector-owner task and
@@ -261,9 +282,13 @@ export async function triggerSessionTurn(
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
+    const currentWorkerGeneration = Math.max(
+      target.workerGeneration ?? 0,
+      target.session.workerGeneration ?? 0,
+    );
     const workerGeneration = willFork
-      ? (target.workerGeneration ?? 0) + 1
-      : (target.workerGeneration ?? 1);
+      ? currentWorkerGeneration + 1
+      : Math.max(currentWorkerGeneration, 1);
     const prepared = internal.beforeDispatch({ sessionId: target.session.sessionId, workerGeneration });
     if (!prepared) return undefined;
     if (!Number.isSafeInteger(prepared.dispatchAttempt) || prepared.dispatchAttempt < 1) {
@@ -283,6 +308,33 @@ export async function triggerSessionTurn(
       if (oldest !== undefined) target.suppressedFinalOutputTurns.delete(oldest);
     }
   };
+  // Loud external triggers (no stableTurnId / no durable ledger) whose connector
+  // opted into suppressFinalOutput. Unlike the durable path above this only drops
+  // the trailing final_output — the streaming card / start notice still show. The
+  // trigger turn id is stamped onto the fork so the worker echoes it back on
+  // final_output and the daemon gate (worker-pool managedFinalOutputSuppressed)
+  // matches it. A normal user turn queued on the same session keeps its own id.
+  // wait/async modes are excluded explicitly, not merely by statement order:
+  // their whole contract is to RETURN the final output, and the daemon resolves
+  // `pendingWaitPromises` inside deliverFinalOutput — i.e. AFTER this gate — so
+  // arming there would starve the HTTP caller until its timeout. The generic
+  // /api/trigger endpoint accepts caller-supplied options without the webhook
+  // route's filtering, so the guard belongs here rather than upstream.
+  const suppressLoudFinal = !stableTurnId
+    && !req.options?.waitForFinalOutput
+    && !req.options?.asyncReturnSessionId
+    && req.options?.suppressFinalOutput === true;
+  const loudTurnId = suppressLoudFinal ? triggerId : undefined;
+  const armLoudFinalSuppression = (target: DaemonSession): void => {
+    if (!suppressLoudFinal) return;
+    armTriggerFinalSuppression(target, triggerId);
+    // The synthetic turn id must not cost this turn its chat-scope fold-back
+    // anchor — see inheritTriggerReplyAnchor.
+    inheritTriggerReplyAnchor(target, triggerId);
+  };
+  const disarmLoudFinalSuppression = (target: DaemonSession): void => {
+    if (suppressLoudFinal) disarmTriggerFinalSuppression(target, triggerId);
+  };
   const rememberInput = (
     target: DaemonSession,
     original: string,
@@ -299,8 +351,34 @@ export async function triggerSessionTurn(
     return { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'only turn triggers are implemented in this daemon route' };
   }
 
+  // apiOnly (core-only) fail-closed: a bot with no Feishu transport must never
+  // be steered into a real chat. Enforce the request SHAPE, not just the boot
+  // hint — otherwise a caller could pass a real chatId/rootMessageId (or omit a
+  // response mode) and re-enter the Feishu delivery path. Require an explicit
+  // HTTP response mode; reject real chat/root targets; a supplied sessionId may
+  // only re-address this bot's own existing HTTP virtual session.
+  if (getBot(larkAppId).config.apiOnly === true) {
+    if (!req.options?.waitForFinalOutput && !req.options?.asyncReturnSessionId) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot requires an HTTP response mode (waitForFinalOutput or asyncReturnSessionId)' };
+    }
+    if (req.target.rootMessageId) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot cannot target a Feishu rootMessageId' };
+    }
+    const targetChatId = typeof req.target.chatId === 'string' ? req.target.chatId.trim() : '';
+    if (targetChatId && !isHttpVirtualSession(targetChatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot cannot target a real Feishu chatId' };
+    }
+    if (req.target.sessionId) {
+      const bound = activeBySessionId(deps.activeSessions, req.target.sessionId);
+      if (bound && !isHttpVirtualSession(bound.chatId)) {
+        return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot may only resume its own HTTP virtual session' };
+      }
+    }
+  }
+
   const dryRun = !!req.options?.dryRun;
   const prompt = buildUntrustedEventPrompt(req, triggerId);
+  const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
@@ -332,9 +410,9 @@ export async function triggerSessionTurn(
     }
   }
 
-  const isHttpVirtualSession = chatId.startsWith('http_wait_') || chatId.startsWith('http_async_');
+  const httpVirtual = isHttpVirtualSession(chatId);
   let inChat = true;
-  if (!isHttpVirtualSession) {
+  if (!httpVirtual) {
     inChat = await groupsStore.isInChat(larkAppId, chatId);
   }
   if (!inChat) {
@@ -345,8 +423,9 @@ export async function triggerSessionTurn(
   // session per top-level event, so an external event must NOT fold into the
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
-  const regularGroupMode: ChatReplyMode = isHttpVirtualSession ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
-  if (!ds && !req.target.sessionId && !rootMessageId && !isHttpVirtualSession && regularGroupMode !== 'new-topic') {
+  const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
+      && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
 
@@ -362,7 +441,7 @@ export async function triggerSessionTurn(
   }
 
   if (ds?.worker && !ds.worker.killed) {
-    const content = await buildExistingSessionContent(
+    const content = buildExistingSessionContent(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
@@ -408,9 +487,12 @@ export async function triggerSessionTurn(
 
     const dispatchAttempt = prepareStableDispatch(ds, false);
     armFinalOutputSuppression(ds, dispatchAttempt);
-    sendWorkerInput(ds, content, stableTurnId ? triggerId : undefined, {
+    armLoudFinalSuppression(ds);
+    if (!sendWorkerInput(ds, content, stableTurnId ? triggerId : loudTurnId, {
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    });
+    })) {
+      disarmLoudFinalSuppression(ds);
+    }
     return {
       ok: true,
       triggerId,
@@ -425,7 +507,7 @@ export async function triggerSessionTurn(
   // through to createSession for chat-scope sessions, which is unsafe for a
   // durable meeting receiver whose projection pins one receiverSessionId.
   if (ds) {
-    const content = await buildExistingSessionContent(
+    const content = buildExistingSessionContent(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
@@ -475,6 +557,7 @@ export async function triggerSessionTurn(
 
     const dispatchAttempt = prepareStableDispatch(ds, true);
     armFinalOutputSuppression(ds, dispatchAttempt);
+    armLoudFinalSuppression(ds);
     forkWorker(ds, content, {
       resume: ds.hasHistory,
       turnId: triggerId,
@@ -495,16 +578,16 @@ export async function triggerSessionTurn(
   }
 
   const bot = getBot(larkAppId);
-  const chatMode: ChatMode = isHttpVirtualSession
+  const chatMode: ChatMode = httpVirtual
     ? 'group'
     : await getChatMode(larkAppId, chatId, { forceRefresh: true });
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
-    && !isHttpVirtualSession
+    && !httpVirtual
     && externalEventOpensOwnTopic(chatMode, regularGroupMode);
-  if (shouldOpenOwnTopic) {
-    anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
+  if (shouldOpenOwnTopic && topicMessage !== null) {
+    anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';
   }
 
@@ -512,9 +595,25 @@ export async function triggerSessionTurn(
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = scope;
+  if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;
+  // Per-turn model / reasoning-effort override — scoped to codex-family bots
+  // (the documented B-mode target) and to a freshly-created trigger session.
+  // Gating on cliId keeps the contract honest and bounded: it never silently
+  // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+  // worker never reaches here. reasoningEffort is codex-only regardless (other
+  // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
+  const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
+  if (isCodexFamily) {
+    if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+      session.model = req.options.model.trim();
+    }
+    if (req.options?.reasoningEffort) {
+      session.reasoningEffort = req.options.reasoningEffort;
+    }
+  }
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);
@@ -541,7 +640,7 @@ export async function triggerSessionTurn(
   // asyncReturnSessionId）与虚拟会话是程序化「请求-应答」调用，每次一个 worktree 既反直觉又会
   // 泄漏（无回收），一律在基目录直接跑、不建 worktree。commitRepoSelection 会自己 buildNewTopicPrompt /
   // ensureSessionWhiteboard，故此分支跳过上面那套（省一次 getAvailableBots 通讯录往返）。
-  const useAutoWt = !isHttpVirtualSession
+  const useAutoWt = !httpVirtual
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && !stableTurnId
@@ -555,7 +654,30 @@ export async function triggerSessionTurn(
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
-    deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    // Stamp the trigger turn id so commitRepoSelection's deferred fork carries it
+    // and the armed final_output suppression can match this turn.
+    // Known, intentional degradation: if a HUMAN message folds into this pending
+    // turn during the worktree-build window, the router (daemon.ts, "else if
+    // (ds.pendingTurnId)") rewrites pendingTurnId to that human's message id
+    // (same caller) or clears it (mixed caller — webhook never sets pendingSender,
+    // so this is the effective branch). The deferred fork then carries a different
+    // id (or none) than the armed `trg_` key, so suppression no longer matches and
+    // the final_output is delivered. That is the safe direction: a turn a human
+    // actively contributed to should surface its answer, and we never wrongly
+    // suppress a normal turn. The suppression is best-effort for this narrow race,
+    // not a hard guarantee — consistent with the 256/TTL best-effort bound.
+    if (loudTurnId) newDs.pendingTurnId = loudTurnId;
+    armLoudFinalSuppression(newDs);
+    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+      disarmLoudFinalSuppression(newDs);
+      await closeSession(session.sessionId);
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: 'session route is reserved by an active persisted session',
+      };
+    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
@@ -574,7 +696,13 @@ export async function triggerSessionTurn(
   }
 
   ensureSessionWhiteboard(newDs);
-  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
+  // Skip the Feishu roster probe (getAvailableBots → listChatBotMembers →
+  // /is_in_chat) for no-transport sessions: an apiOnly bot or an HTTP virtual
+  // chat has no real Lark chat to enumerate, and probing a synthetic id only
+  // adds a failing network round-trip + latency. No peer bots → empty roster.
+  const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
+    ? await getAvailableBots(larkAppId, chatId)
+    : [];
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -582,7 +710,7 @@ export async function triggerSessionTurn(
     bot.config.cliPathOverride,
     undefined,
     undefined,
-    await getAvailableBots(larkAppId, chatId),
+    availableBots,
     undefined,
     { name: bot.botName, openId: bot.botOpenId },
     localeForBot(larkAppId),
@@ -591,7 +719,6 @@ export async function triggerSessionTurn(
       larkAppId,
       chatId,
       whiteboardId: newDs.session.whiteboardId,
-      topicGroupMemoryBlock,
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,
@@ -600,7 +727,15 @@ export async function triggerSessionTurn(
   // Register right before the fork branches (no await between here and forkWorker)
   // so a concurrent inbound message can't observe this session worker-less and
   // race a duplicate re-fork — the set-and-fork atomicity the original path had.
-  deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+  if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+    await closeSession(session.sessionId);
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'session was closed while the trigger was being prepared',
+    };
+  }
   rememberInput(newDs, prompt, promptInput);
 
   if (req.options?.waitForFinalOutput) {
@@ -647,6 +782,10 @@ export async function triggerSessionTurn(
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
+  }
+  else if (loudTurnId) {
+    armLoudFinalSuppression(newDs);
+    forkWorker(newDs, promptInput, loudTurnId);
   }
   else forkWorker(newDs, promptInput);
 

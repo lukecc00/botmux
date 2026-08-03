@@ -1,11 +1,13 @@
 // Sessions page shared helpers: pure display helpers and small API utilities.
 import {
+  botDisplayName,
   chatDisplayTitle,
   t,
   ui,
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { sessionTerminalHref } from './session-terminal.js';
+import { copyText } from './clipboard.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -14,6 +16,89 @@ export function tokenCount(value: unknown): number | null {
 export function formatTokenCount(value: unknown): string {
   const n = tokenCount(value);
   return n === null ? '-' : n.toLocaleString('en-US');
+}
+
+export interface SessionExchangePreview {
+  userText: string;
+  userFullText: string;
+  botText: string;
+  botFullText: string;
+}
+
+function compactPreviewText(value: unknown, limit: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Length-bound while preserving newlines — feeds the overlay, which renders
+ * Markdown. The single-line card summary keeps using compactPreviewText(). */
+function compactMultilinePreview(value: unknown, limit: number): string {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Latest user/bot exchange for a session card. A bot preview is shown only
+ * when it is newer than the latest user input; otherwise the card communicates
+ * the still-waiting state with the user line alone. */
+export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
+  const userFullText = compactMultilinePreview(
+    row.previewUserFullText
+      ?? row.previewUserText
+      ?? '',
+    4_000,
+  );
+  const botFullText = row.previewBotState === 'replied'
+    ? compactMultilinePreview(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    : '';
+  return {
+    userText: compactPreviewText(userFullText, 120),
+    userFullText,
+    botText: compactPreviewText(botFullText, 220),
+    botFullText,
+  };
+}
+
+/** Reducer backing the session-card preview overlay's open/focus state. The
+ * component drives its `useReducer` with these exact actions (not a parallel
+ * mirror), so this unit-tests the real transitions — in particular the
+ * Escape→refocus race: Escape closes the overlay AND returns focus to the
+ * trigger, whose `focus` action would otherwise reopen it in the same event, so
+ * `escape-refocus` arms a one-shot `suppressFocusOpen` that the immediately
+ * following `focus` consumes instead of opening. */
+export interface PreviewOverlayState {
+  open: boolean;
+  /** One-shot: the next trigger `focus` must NOT open (set by escape-refocus). */
+  suppressFocusOpen: boolean;
+}
+
+export type PreviewOverlayAction = 'open' | 'close' | 'focus' | 'escape-refocus' | 'toggle';
+
+export const previewOverlayInitialState: PreviewOverlayState = { open: false, suppressFocusOpen: false };
+
+export function previewOverlayReducer(state: PreviewOverlayState, action: PreviewOverlayAction): PreviewOverlayState {
+  switch (action) {
+    case 'open':
+      return { open: true, suppressFocusOpen: false };
+    case 'close':
+      return { open: false, suppressFocusOpen: false };
+    case 'toggle':
+      return { open: !state.open, suppressFocusOpen: false };
+    case 'focus':
+      // Consume the one-shot: a refocus armed by Escape does NOT reopen.
+      if (state.suppressFocusOpen) return { open: state.open, suppressFocusOpen: false };
+      return { open: true, suppressFocusOpen: false };
+    case 'escape-refocus':
+      return { open: false, suppressFocusOpen: true };
+    default:
+      return state;
+  }
 }
 
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
@@ -80,11 +165,29 @@ function sessionChatKindLabel(s: any): string {
   return s?.chatType === 'p2p' ? t('sessions.directChat') : t('sessions.groupChat');
 }
 
+/** 单聊（p2p）会话的展示名：`单聊 · 用户名 - bot名`。
+  * 用户名取 chatDisplayName（缺失回退 chatId）；bot 名取 botDisplayName
+  * （与表格 bot 列同源）。群聊/未知聊天不走这里。 */
+export function sessionDirectChatText(s: any): string {
+  const kind = t('sessions.directChat');
+  const name = String(s?.chatDisplayName ?? '').trim()
+    || String(s?.chatId ?? '').trim()
+    || t('sessions.chatUnknown');
+  const bot = botDisplayName(s);
+  return `${kind} · ${name} - ${bot}`;
+}
+
 export function sessionLocationText(s: any): string {
   const chatId = String(s?.chatId ?? '').trim();
+  if (s?.chatType === 'p2p') return sessionDirectChatText(s);
   const name = chatDisplayTitle(s);
-  if (name) return `${sessionChatKindLabel(s)} · ${name}`;
-  if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}`;
+  // 单聊(p2p)：同一个人对不同 bot 的私聊标题都是「单聊 · 申晗」，无法区分是哪个
+  // bot。附上 bot 名做后缀（单聊 · 申晗 · <bot名>），让筛选选项/定位可辨别。
+  const botSuffix = s?.chatType === 'p2p'
+    ? (() => { const b = String(s?.botName ?? '').trim(); return b ? ` · ${b}` : ''; })()
+    : '';
+  if (name) return `${sessionChatKindLabel(s)} · ${name}${botSuffix}`;
+  if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}${botSuffix}`;
   return t('sessions.chatUnknown');
 }
 
@@ -239,6 +342,7 @@ export const ICON = {
   history: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.2 7.8a4.8 4.8 0 1 0 1.4-3.4"/><path d="M3.2 3.1v3.2h3.2"/><path d="M8 5.4v3l2.1 1.2"/></svg>',
   restart: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.7 6.5A4.8 4.8 0 1 0 13 9"/><path d="M12.7 3.3v3.2H9.5"/></svg>',
   feishu: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 5.2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v3.3a2 2 0 0 1-2 2H7.1L4.3 13v-2.5H5"/><path d="M9.1 3.2h3.7v3.7"/><path d="M12.8 3.2 8.5 7.5"/></svg>',
+  copy: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7.5" height="7.5" rx="1.4"/><path d="M10.5 5.5V4.1a1.4 1.4 0 0 0-1.4-1.4H4.1a1.4 1.4 0 0 0-1.4 1.4v5a1.4 1.4 0 0 0 1.4 1.4h1.4"/></svg>',
 };
 
 export function lockActionLabel(s: any): string {
@@ -264,6 +368,33 @@ export async function openWriteLink(s: any, btn?: HTMLButtonElement): Promise<vo
   } catch (e) {
     tab?.close();
     alert(`${t('sessions.writeLinkFail')}: ${e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Fetch the session's real spawn command (bin + argv + cwd + env) and copy it to
+// the clipboard, for pasting into the debug terminal to reproduce an issue. The
+// command carries credentials so the endpoint is management-token-gated (mirrors
+// write-link); only writable views expose this action.
+export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise<void> {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/spawn-command`);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body?.ok === false || !body?.command) {
+      if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
+      return;
+    }
+    if (await copyText(body.command, t('sessions.copyCommand'))) {
+      if (btn) {
+        const prev = btn.textContent;
+        btn.textContent = t('sessions.copyCommandDone');
+        setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
+      }
+    }
+  } catch (e) {
+    alert(`${t('sessions.copyCommandFail')}: ${e}`);
   } finally {
     if (btn) btn.disabled = false;
   }

@@ -58,3 +58,82 @@ export async function updateBotReadIsolation(
   logger.info(`[read-isolation:${larkAppId}] readIsolation → ${enabled}`);
   return { ok: true, readIsolation: enabled };
 }
+
+/** The three-tier sandbox path lists a bot may declare (highest-precedence
+ *  layer of the FsPolicy). Empty/absent tiers fall back to deny-by-default. */
+export interface SandboxPathTiers {
+  readWrite?: string[];
+  readOnly?: string[];
+  deny?: string[];
+}
+
+/** Current configured sandboxPaths for a bot (undefined = none set). */
+export function getBotSandboxPaths(larkAppId: string): SandboxPathTiers | undefined {
+  try { return getBot(larkAppId).config.sandboxPaths; } catch { return undefined; }
+}
+
+/** Trim + drop empties + dedupe one tier's path list. Returns undefined for an
+ *  empty result so an all-empty tiers object collapses to "no sandboxPaths". */
+function normalizeTier(list: unknown): string[] | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const p = raw.trim();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out.length ? out : undefined;
+}
+
+/** Normalize a three-tier sandboxPaths object for storage: per-tier trim/dedup,
+ *  then CROSS-TIER dedup resolving a path listed in >1 tier to the MORE
+ *  RESTRICTIVE tier (deny > readOnly > readWrite) — matching fs-policy's
+ *  mergeFsRules same-source tie-break, so what's stored matches what the sandbox
+ *  (and the dashboard UI/tester) resolve. Returns `{}` when every tier is empty
+ *  (caller treats that as "clear the field"). Pure — unit-tested directly. */
+export function normalizeSandboxPaths(tiers: SandboxPathTiers): SandboxPathTiers {
+  const rw = normalizeTier(tiers.readWrite);
+  const ro = normalizeTier(tiers.readOnly);
+  const deny = normalizeTier(tiers.deny);
+  const normPath = (p: string) => p.replace(/\/+$/, '') || '/';
+  const denySet = new Set((deny ?? []).map(normPath));
+  const roSet = new Set((ro ?? []).map(normPath));
+  const keptRw = (rw ?? []).filter(p => !denySet.has(normPath(p)) && !roSet.has(normPath(p)));
+  const keptRo = (ro ?? []).filter(p => !denySet.has(normPath(p)));
+  const out: SandboxPathTiers = {};
+  if (keptRw.length) out.readWrite = keptRw;
+  if (keptRo.length) out.readOnly = keptRo;
+  if (deny) out.deny = deny;
+  return out;
+}
+
+/** Per-bot sandboxPaths (readWrite/readOnly/deny) persistence. Same contract as
+ *  {@link updateBotSandbox}: atomic bots.json write + in-memory sync, so the next
+ *  session spawn reads `botCfg.sandboxPaths` without a daemon restart. Passing an
+ *  all-empty tiers object CLEARS the field (bots.json stays clean → pure
+ *  deny-by-default baseline). */
+export async function updateBotSandboxPaths(
+  larkAppId: string,
+  tiers: SandboxPathTiers,
+): Promise<{ ok: true; sandboxPaths?: SandboxPathTiers } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const normalized = normalizeSandboxPaths(tiers);
+  const isEmpty = !normalized.readWrite && !normalized.readOnly && !normalized.deny;
+
+  const r = await rmwBotEntry<SandboxPathTiers | undefined>(larkAppId, (entry) => {
+    if (isEmpty) delete entry.sandboxPaths;   // clear → preserves deny-by-default baseline
+    else entry.sandboxPaths = normalized;
+    return { write: true, result: isEmpty ? undefined : normalized };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  if (isEmpty) delete bot.config.sandboxPaths;
+  else bot.config.sandboxPaths = normalized;
+  logger.info(`[sandbox:${larkAppId}] sandboxPaths → rw=${normalized.readWrite?.length ?? 0} ro=${normalized.readOnly?.length ?? 0} deny=${normalized.deny?.length ?? 0}`);
+  return { ok: true, sandboxPaths: isEmpty ? undefined : normalized };
+}

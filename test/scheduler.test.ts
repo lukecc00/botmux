@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, planCronRealign } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, extractSilentMode, extractScheduleModifiers, planCronRealign } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -227,6 +227,12 @@ describe('extractDeliveryMode (新话题 keyword)', () => {
     expect(extractDeliveryMode('new topic - run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
   });
 
+  it('accepts the new group-top-level wording while keeping the compatibility token', () => {
+    expect(extractDeliveryMode('群消息顶层 执行日报')).toEqual({ deliver: 'new-topic', prompt: '执行日报' });
+    expect(extractDeliveryMode('群顶层运行：检查服务')).toEqual({ deliver: 'new-topic', prompt: '检查服务' });
+    expect(extractDeliveryMode('top-level: run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
+  });
+
   it('leaves normal prompt as origin, unchanged', () => {
     expect(extractDeliveryMode('帮我看AI新闻')).toEqual({ deliver: 'origin', prompt: '帮我看AI新闻' });
   });
@@ -237,6 +243,77 @@ describe('extractDeliveryMode (新话题 keyword)', () => {
 
   it('keyword with nothing after it stays origin (degenerate)', () => {
     expect(extractDeliveryMode('新话题')).toEqual({ deliver: 'origin', prompt: '新话题' });
+  });
+});
+
+describe('extractSilentMode (静默 keyword)', () => {
+  it('strips leading 静默 and resolves silent', () => {
+    expect(extractSilentMode('静默 检查服务状态，挂了才报警')).toEqual({ silent: true, prompt: '检查服务状态，挂了才报警' });
+  });
+
+  it('accepts 静默执行 / 静默运行 variants', () => {
+    expect(extractSilentMode('静默执行 检查构建')).toEqual({ silent: true, prompt: '检查构建' });
+    expect(extractSilentMode('静默运行：ping 服务')).toEqual({ silent: true, prompt: 'ping 服务' });
+  });
+
+  it('accepts 悄悄 variant and punctuation separators', () => {
+    expect(extractSilentMode('悄悄，看看磁盘水位')).toEqual({ silent: true, prompt: '看看磁盘水位' });
+  });
+
+  it('accepts english silent / silently', () => {
+    expect(extractSilentMode('silent: check the service')).toEqual({ silent: true, prompt: 'check the service' });
+    expect(extractSilentMode('silently - poll CI status')).toEqual({ silent: true, prompt: 'poll CI status' });
+  });
+
+  it('does NOT match 静默 glued into a longer phrase without separator', () => {
+    expect(extractSilentMode('静默模式下测试应用')).toEqual({ silent: false, prompt: '静默模式下测试应用' });
+  });
+
+  it('does not treat mid-sentence 静默 as the keyword', () => {
+    expect(extractSilentMode('检查服务是否静默失败')).toEqual({ silent: false, prompt: '检查服务是否静默失败' });
+  });
+
+  it('keyword with nothing after it stays non-silent (degenerate)', () => {
+    expect(extractSilentMode('静默')).toEqual({ silent: false, prompt: '静默' });
+  });
+});
+
+describe('extractScheduleModifiers (combined keywords)', () => {
+  it('plain prompt: no modifiers', () => {
+    expect(extractScheduleModifiers('帮我看AI新闻')).toEqual({ deliver: 'origin', silent: false, prompt: '帮我看AI新闻' });
+  });
+
+  it('silent only', () => {
+    expect(extractScheduleModifiers('静默 检查服务')).toEqual({ deliver: 'origin', silent: true, prompt: '检查服务' });
+  });
+
+  it('new-topic only', () => {
+    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({
+      deliver: 'new-topic',
+      executionPosition: 'new-topic',
+      silent: false,
+      prompt: '生成日报',
+    });
+  });
+
+  it('both keywords, either order (conflict is rejected by callers)', () => {
+    const expected = {
+      deliver: 'new-topic' as const,
+      executionPosition: 'new-topic' as const,
+      silent: true,
+      prompt: '检查服务',
+    };
+    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual(expected);
+    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual(expected);
+  });
+
+  it('distinguishes group top-level from a fresh topic', () => {
+    expect(extractScheduleModifiers('群消息顶层 执行日报')).toEqual({
+      deliver: 'new-topic',
+      executionPosition: 'top-level',
+      silent: false,
+      prompt: '执行日报',
+    });
   });
 });
 
@@ -455,16 +532,30 @@ describe('One-shot Chinese patterns', () => {
     expect(Math.abs(runAt - expected)).toBeLessThan(5_000);
   });
 
-  it('明天X点 produces once schedule at local tomorrow', () => {
-    const result = parseNaturalSchedule('明天9:00 看下邮件');
-    expect(result).not.toBeNull();
-    expect(result!.parsed.kind).toBe('once');
-    const runAt = new Date(result!.parsed.runAt!);
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    expect(runAt.getDate()).toBe(tomorrow.getDate());
-    expect(runAt.getHours()).toBe(9);
-    expect(runAt.getMinutes()).toBe(0);
+  it('明天X点 produces once schedule at the pinned host-zone wall clock', () => {
+    // scheduleTimeZone() resolves env → global config → host. This test pins the
+    // ambient schedule zone to the JS runtime host zone and asserts the resulting
+    // wall clock under THAT explicit override — it is a consumer-behavior check,
+    // not the "no-config host fallback" (that path is covered by timezone.test.ts).
+    // Pinning also stops a machine whose ~/.botmux/config.json sets scheduleTimeZone
+    // (e.g. Asia/Shanghai on a non-+8 box) from making the wall clock disagree with
+    // getHours() and failing this spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const result = parseNaturalSchedule('明天9:00 看下邮件');
+      expect(result).not.toBeNull();
+      expect(result!.parsed.kind).toBe('once');
+      const runAt = new Date(result!.parsed.runAt!);
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      expect(runAt.getDate()).toBe(tomorrow.getDate());
+      expect(runAt.getHours()).toBe(9);
+      expect(runAt.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 
   it('明天X点 honors an explicit schedule timezone (host-independent wall clock)', () => {
@@ -571,17 +662,27 @@ describe('computeNextRun', () => {
     expect(next).toBeNull();
   });
 
-  it('cron: returns next wall-clock occurrence in the HOST-LOCAL timezone', () => {
-    // 0 9 * * * — daily at 09:00. computeNextRun now uses the host's local timezone
-    // (scheduleTimeZone()), matching how one-shot「明天9点」is parsed via setHours().
-    // Pre-fix it was hard-coded to Asia/Shanghai, so on any non-+8 host getHours()
-    // would NOT be 9. Host-independent assertion: both sides read the same local zone.
-    const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
-    expect(next).toBeTruthy();
-    const nextDate = new Date(next!);
-    expect(nextDate.getTime()).toBeGreaterThan(Date.now());
-    expect(nextDate.getHours()).toBe(9);
-    expect(nextDate.getMinutes()).toBe(0);
+  it('cron: next wall-clock occurrence under an explicit pinned schedule timezone', () => {
+    // 0 9 * * * — daily at 09:00. computeNextRun uses scheduleTimeZone() (env →
+    // config → host). Here we PIN BOTMUX_SCHEDULE_TIMEZONE to the JS runtime host
+    // zone and assert the wall clock under that explicit override (a consumer-
+    // behavior check; the no-config host fallback is covered by timezone.test.ts).
+    // Pinning also stops a machine-level config override (~/.botmux/config.json
+    // scheduleTimeZone) from making scheduleTimeZone() diverge from the getHours()
+    // runtime zone and failing this spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
+      expect(next).toBeTruthy();
+      const nextDate = new Date(next!);
+      expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+      expect(nextDate.getHours()).toBe(9);
+      expect(nextDate.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 });
 

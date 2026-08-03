@@ -1,8 +1,62 @@
 /**
+ * Session-identity markers Claude Code exports into every Bash child it runs
+ * (`CLAUDECODE` plus the `CLAUDE_CODE_*`/`CLAUDE_PID` family). Any process
+ * started from inside a Claude session inherits them, and outside that session
+ * they are always stale. The destructive one is CLAUDE_CODE_CHILD_SESSION: a
+ * claude CLI that sees it treats itself as a nested subagent session and
+ * silently turns OFF transcript persistence — which breaks `--resume`-based
+ * continuity (respawn after a tmux session dies, role switch) for every bot.
+ *
+ * The poisoning path mirrors SESSION_CLI_HOME_ENV_KEYS: pm2 persists the env
+ * of whichever process ran `botmux start/restart` (or raw `pm2 start`) into
+ * every managed app, so one self-upgrade issued from a bot session bakes the
+ * issuing session's markers into all daemons; the next time the shared tmux
+ * server is (re)born it forks from the poisoned daemon, seeds its global env
+ * with the markers, and every bot CLI on the machine stops saving transcripts.
+ *
+ * CLAUDE_EFFORT is deliberately absent: it is a behavior knob a user or
+ * per-bot env may legitimately set, not a session-identity marker.
+ */
+export const CLAUDE_SESSION_MARKER_ENV_KEYS = [
+  'CLAUDECODE',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_PID',
+] as const;
+
+/** Boundary-only companion to the markers. A CLAUDE_EFFORT inherited THROUGH
+ *  pm2 → daemon → worker is indistinguishable from the issuing Claude
+ *  session's own override and would silently pin that session's
+ *  behavior/cost/latency onto every bot, so the boundary scrub drops it. It
+ *  stays OUT of REDACTED_CHILD_ENV_KEYS / the pane unset / the server-global
+ *  scrub, which keeps the supported config channels working: per-bot `env`
+ *  (injected after redact on every backend, PTY included) and — on the
+ *  shell-wrapped backends (tmux/zellij) — the pane shell's own profile. The
+ *  ambient "export it in the shell that runs `botmux start`" channel is
+ *  deliberately sacrificed: at that boundary it cannot be told apart from
+ *  contamination. */
+const BOUNDARY_ONLY_CLAUDE_ENV_KEYS = ['CLAUDE_EFFORT'] as const;
+
+/** Delete inherited Claude session markers (CLAUDE_SESSION_MARKER_ENV_KEYS,
+ *  plus BOUNDARY_ONLY_CLAUDE_ENV_KEYS) from `env` in place. Called at the same
+ *  botmux-owned process boundaries as scrubSessionCliHomeEnv — pm2 invocation
+ *  env (cli.ts pm2Env), daemon boot (index-daemon.ts), worker boot (worker.ts)
+ *  — so a daemon (re)started from inside a Claude session never carries that
+ *  session's identity into anything it forks (workers, the shared tmux
+ *  server). */
+export function scrubClaudeSessionMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of CLAUDE_SESSION_MARKER_ENV_KEYS) delete env[key];
+  for (const key of BOUNDARY_ONLY_CLAUDE_ENV_KEYS) delete env[key];
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
- * loop), daemon-side GitHub API tokens, and claude-code's nesting marker. The
+ * loop), daemon-side GitHub API tokens, and claude-code's session markers
+ * (CLAUDE_SESSION_MARKER_ENV_KEYS). The
  * child resolves Lark via the namespaced `BOTMUX_LARK_APP_ID` or via bots.json
  * on disk (im/lark/client.ts); the worker keeps its own bare creds
  * (worker-pool.ts forkWorker) for lark-upload — only the *child* is redacted.
@@ -18,8 +72,62 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
-  'CLAUDECODE',
+  ...CLAUDE_SESSION_MARKER_ENV_KEYS,
+  // Parent-tmux client vars: when the daemon itself was started inside a tmux
+  // session, process.env carries TMUX (server socket path) + TMUX_PANE. Leaking
+  // these into a spawned CLI makes tmux-aware tools (codex integrates with tmux)
+  // try to talk to the daemon's PARENT tmux server — which does not exist inside
+  // the file sandbox (fresh /tmp tmpfs), so the connect() ENOENTs and the CLI
+  // aborts with "No such file or directory (os error 2)". The tmux/tmux-pipe
+  // backends already strip these for their OWN pane launch via tmuxEnv(), but the
+  // sandbox path injects childEnv straight into the pane's env(1), so strip at
+  // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
+  'TMUX',
+  'TMUX_PANE',
 ] as const;
+
+/**
+ * Session-level CLI data-root pointers: claude-family → CLAUDE_CONFIG_DIR,
+ * codex → CODEX_HOME. Botmux computes these PER SESSION (read isolation pins
+ * `<BOT_HOME>/claude|codex`; Seed/Relay pin their fork dirs via adapter
+ * spawnEnv), so a value INHERITED from the surrounding environment is always
+ * stale. The poisoning path: pm2 persists the env of whichever process ran
+ * `botmux start/restart` into every managed app (and into dump.pm2 for
+ * resurrect), so one self-upgrade issued from a bot session bakes that
+ * session's injected CLAUDE_CONFIG_DIR into ALL daemons and workers — and
+ * every non-isolated sibling bot then reads/writes that bot's home. Scrubbed
+ * at each process boundary botmux owns: the pm2 invocation env (cli.ts
+ * pm2Env), daemon boot (index-daemon.ts) and worker boot (worker.ts) — the
+ * boot scrubs cover envs pm2 resurrects from a stale dump. Scrubbing
+ * process.env (not just the spawned child's env) keeps worker-side resolvers
+ * that consult it dynamically — codex submit confirmation / resume fallback /
+ * transcript bridge (services/codex-paths.ts), slash-command discovery
+ * (core/command-discovery.ts) — consistent with the CLI child.
+ *
+ * Do NOT pin a "default" instead of deleting: CLAUDE_CONFIG_DIR=~/.claude is
+ * not a no-op — once the var is set, Claude Code reads its state file from
+ * $CLAUDE_CONFIG_DIR/.claude.json instead of ~/.claude.json, which lacks
+ * hasCompletedOnboarding → every non-isolated session reruns first-run
+ * onboarding (theme picker + login).
+ *
+ * GROK_HOME is deliberately ABSENT: botmux never injects it per session (grok
+ * has no per-bot isolation, and per-bot env rejects the key — see
+ * core/per-bot-env.ts), so it can never carry a sibling bot's home. Its
+ * contract is the opposite of per-session: process-level only, where worker
+ * and CLI child must resolve the SAME value (the worker installs ready-gate
+ * hooks and drains transcripts under it — see services/grok-paths.ts), so
+ * scrubbing it on any single side would split-brain that documented
+ * configuration channel.
+ */
+export const SESSION_CLI_HOME_ENV_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const;
+
+/** Delete inherited session-level CLI data-root pointers from `env` in place
+ *  (see SESSION_CLI_HOME_ENV_KEYS). Values a session actually needs are
+ *  computed and re-set AFTER this scrub (worker isolation pins / adapter
+ *  spawnEnv). */
+export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_CLI_HOME_ENV_KEYS) delete env[key];
+}
 
 /**
  * Botmux-managed, session/bot-scoped env keys that reach the CLI pane via the
@@ -50,12 +158,29 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // current session/thread. The worker refreshes them per pane/turn.
   'BOTMUX_SESSION_ID',
   'BOTMUX_CHAT_ID',
+  // Session-scoped plugin MCP relay. The worker owns the credential-bearing
+  // Gateway; the CLI and its native MCP launcher receive only this socket
+  // capability plus a fail-closed marker.
+  'BOTMUX_MCP_GATEWAY_SOCKET',
+  'BOTMUX_MCP_GATEWAY_REQUIRED',
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
+  // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
+  // channel). Custom CLI wrappers read it for per-user permission isolation.
+  'BOTMUX_OWNER_OPEN_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
+  // Resolved display footer for sandboxed `botmux send`; avoids reading the
+  // credential-bearing bots.json from inside the child.
+  'BOTMUX_BRAND_LABEL',
+  // Per-bot display preference for Context / Token usage
+  // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
+  // fallback cannot drift to the default when bots.json is unreadable.
+  'BOTMUX_USAGE_DISPLAY',
+  // Pi deferred long-first-prompt extension reads one exact per-session file.
+  'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
   // (whose daemon discovery dir is Seatbelt-denied) need it to reach the
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
@@ -80,7 +205,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly
  *  by buildBotmuxEnvAssignments (tmux/tmux-pipe/zellij backends) and
- *  prepareSandbox (bwrap); the pty backend inherits them via the full child env.
+ *  prepareDirectSandbox (bwrap --setenv); the pty backend inherits them via the
+ *  full child env.
  *  Deliberately NOT in BOTMUX_INJECTED_ENV_KEYS: that list drives tmuxEnv()
  *  stripping and scrubTmuxServerGlobalEnv() cleanup — adding proxy keys there
  *  would delete the user's own tmux server proxy config. */
@@ -106,7 +232,12 @@ const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   'LARK_APP_ID',
   'LARK_APP_SECRET',
-  'CLAUDECODE',
+  // Claude session markers are stale by definition in a server's GLOBAL env
+  // table (they can only have been seeded by whatever process booted the
+  // server), so unlike user-wide GitHub tokens they are safe to repair out of
+  // an already-running server — this is what heals a fleet whose tmux server
+  // was born from a poisoned daemon without waiting for the server to die.
+  ...CLAUDE_SESSION_MARKER_ENV_KEYS,
 ]);
 
 /**

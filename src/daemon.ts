@@ -2,8 +2,9 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -15,11 +16,26 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { repoPickerScanOptions } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
-import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
+import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
+import {
+  evaluateOverload,
+  formatOverloadAlert,
+  buildOverloadAlertCard,
+  buildOverloadRecoveredCard,
+  initialOverloadCardState,
+  INITIAL_OVERLOAD_STATE,
+  computeOverloadThresholds,
+  isOverloadAlertTarget,
+  type OverloadState,
+  type OverloadThresholds,
+} from './core/host-overload-alert.js';
+import { registerOverloadNonce } from './im/lark/overload-nonce.js';
+import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -28,10 +44,12 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
+  loadBotConfigAtIndex,
   loadBotConfigs,
+  isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
   getAllBots,
@@ -40,6 +58,9 @@ import {
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
   resolveVcMeetingConsumerProfiles,
+  setResolvedAllowedUsersRepublishHook,
+  setAllowedUsersResolveRetryHook,
+  vcMeetingAgentConfigActive,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -48,11 +69,15 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
+import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
+import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
+import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -60,20 +85,23 @@ import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLe
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
+import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
-import { withFileLock } from './utils/file-lock.js';
+import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
-import type { DaemonToWorker, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId } from './core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, larkTransportEnabled } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -88,7 +116,9 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
   forkWorker,
+  forkAdoptWorker,
   sendWorkerInput,
+  sendWorkerSessionInput,
   killWorker,
   reapOrphanWorkers,
   scheduleCardPatch,
@@ -97,15 +127,26 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
-  setActiveSessionSafe,
+  setActiveSessionIfActive,
+  rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
+  workerHasInitialized,
+  sessionSupportsWebTerminal,
+  readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
+  getDaemonStreamingCardUsageSnapshot,
+  isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
+import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import {
+  cancelSessionReadyAck,
+  waitForSessionReadyAck,
+} from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
@@ -140,38 +181,35 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
-import { loadTopicGroupMemoryBlockForSession } from './services/topic-group-memory-runtime.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
+import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, rememberTurnCaller, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './core/session-title.js';
+import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
+import { renderMessageListenerPrompt } from './services/message-listener.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
+import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
-import { hasActiveSessionWork, sessionRuntimeStatus } from './core/session-runtime-status.js';
-import {
-  buildFallbackCodexHandoffSummary,
-  buildFreshCodexHandoffPrompt,
-  buildFreshCodexHandoffTopic,
-  claimCodexStreamRecovery,
-  clearFreshCodexHandoffLineage,
-  CODEX_HANDOFF_TIMEOUT_MS,
-  CODEX_HANDOFF_SUMMARY_PROMPT,
-  omitOldCodexSessionIds,
-  selectCodexHandoffSummary,
-  shouldFreshHandoffCodex,
-  freshCodexHandoffCliId,
-} from './core/codex-handoff.js';
 import {
   getSessionPersistentBackendType,
+  killPersistentBackendTarget,
   killPersistentSession,
-  persistentSessionName,
+  probePersistentBackendTarget,
   probePersistentSession,
+  resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -247,6 +285,23 @@ import {
 } from './workflows/v3/daemon-ipc-body.js';
 import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js';
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
+import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import {
+  buildCodexCompletionCard,
+  buildCodexNotifierResultCard,
+  CODEX_NOTIFIER_PLUGIN_ID,
+  CodexNotifierEventStore,
+  CodexNotifierEventValidationError,
+  codexNotifierMessageUuid,
+  createCodexNotifierCardActionHandler,
+  materializeCodexNotifierOutboxEvent,
+  openCodexAppThread,
+  parseCodexNotifierEvent,
+  parseCodexNotifierPluginEvent,
+  parseCodexNotifierOutboxItem,
+  startCodexNotifierAdoptionSession,
+  type CodexTaskCompletedEvent,
+} from './features/codex-notifier/index.js';
 
 /** This daemon process's bot larkAppId (set in startDaemon).  Used to scope v3
  *  humanGate cold-attach + start to runs this bot owns (codex blocker #1). */
@@ -255,11 +310,30 @@ let selfV3BootInstanceId: string | undefined;
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+/**
+ * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
+ * the deferred allowedUsers resolve retry (a detached setTimeout that has no
+ * `desc` in scope) can patch `resolvedAllowedUsers` and republish coherently —
+ * and so the 30s heartbeat, which rewrites this same object, never clobbers a
+ * healed value back to stale. One daemon per bot, so a single ref is correct.
+ */
+let selfDaemonDescriptor: DaemonDescriptor | undefined;
+
+/**
+ * Patch the live descriptor's `resolvedAllowedUsers` (ou_ only) and rewrite it.
+ * Safe to call from the deferred resolve retry. Best-effort.
+ */
+function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): void {
+  const desc = selfDaemonDescriptor;
+  if (!desc || desc.larkAppId !== larkAppId) return;
+  desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
+  try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+}
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
-import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
+import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -271,7 +345,8 @@ import {
   announcePendingRepoSession,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
-  publishSessionRuntimeStatus,
+  publishSessionMessagePreviewPatch,
+  publishClosedSessionPatch,
   clearAgentAttention,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -327,7 +402,10 @@ import {
   type VcMeetingRuntimeSelectedAgent,
   type VcMeetingRuntimeSessionRecord,
 } from './services/vc-meeting-runtime-store.js';
-import { computeVcMeetingConsumerProfileHash } from './services/vc-meeting-profile-instructions.js';
+import {
+  computeVcMeetingConsumerProfileHash,
+  normalizeVcMeetingProfileInstructions,
+} from './services/vc-meeting-profile-instructions.js';
 import { bootstrapVcMeetingDefaultConsumerProfile } from './services/vc-meeting-consumer-profile-bootstrap.js';
 import {
   getVcMeetingPreparation,
@@ -402,6 +480,9 @@ import {
   verifyVcMeetingManagedOriginClaim,
 } from './services/vc-meeting-send-policy.js';
 import {
+  ensureVcMeetingListenerTopicRoot,
+} from './services/vc-meeting-listener-topic-store.js';
+import {
   finishVcMeetingManagedActionProvider,
   finishVcMeetingManagedApprovalCard,
   requestVcMeetingManagedImAction,
@@ -443,7 +524,7 @@ const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
 const VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS = 8_000;
 const VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS = 5_000;
-const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij'] as const;
+const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij', 'zmx'] as const;
 
 type VcMeetingDeliveryScope = {
   receiverSessionId: string;
@@ -533,7 +614,8 @@ function isVcMeetingBootRecoveryBlocked(request: VcMeetingDeliveryRequest): bool
 function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType): boolean {
   if (backendType === 'tmux') return TmuxBackend.isAvailable();
   if (backendType === 'herdr') return HerdrBackend.isAvailable();
-  return ZellijBackend.isAvailable();
+  if (backendType === 'zellij') return ZellijBackend.isAvailable();
+  return ZmxBackend.isAvailable();
 }
 
 let testOnlyVcMeetingBootBackingMissing:
@@ -552,17 +634,24 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     }
   }
   const liveBackend = ds ? getSessionPersistentBackendType(ds) : undefined;
-  const persistedBackend = liveBackend ?? sessionStore.getSession(sessionId)?.backendType;
+  const persistedSession = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedBackend = liveBackend ?? persistedSession?.backendType;
   if (persistedBackend === 'pty') return true;
   const backendTypes: readonly PersistentBackendType[] =
-    persistedBackend === 'tmux' || persistedBackend === 'herdr' || persistedBackend === 'zellij'
+    persistedBackend === 'tmux' || persistedBackend === 'herdr'
+      || persistedBackend === 'zellij' || persistedBackend === 'zmx'
       ? [persistedBackend]
       : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
   let allMissing = true;
   for (const backendType of backendTypes) {
-    const name = persistentSessionName(backendType, sessionId);
+    const target = resolvePersistentBackendTarget(
+      backendType,
+      sessionId,
+      persistedSession?.persistentBackendTarget,
+    );
+    const name = target.sessionName;
     if (destroy) {
-      try { killPersistentSession(backendType, name); }
+      try { killPersistentBackendTarget(target, sessionId); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -571,7 +660,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
       }
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-    try { probe = probePersistentSession(backendType, name); }
+    try { probe = probePersistentBackendTarget(target); }
     catch { probe = 'unknown'; }
     if (probe !== 'missing') {
       allMissing = false;
@@ -721,9 +810,17 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   killWorker: (ds: DaemonSession) => void;
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
+  resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string) => void;
-  probePersistent: (backendType: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
+  /** `sessionId` is mandatory: ZMX destruction is identity-verified and refuses
+   *  a name-only kill. `target` carries Herdr's agent-scoped addressing. */
+  killPersistent: (
+    backendType: PersistentBackendType,
+    sessionName: string,
+    sessionId: string,
+    target?: PersistentBackendTarget,
+  ) => void;
+  probePersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
 };
@@ -794,13 +891,19 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       : persistentScope === 'unknown'
         // An unavailable client binary cannot own/reach a live mux session on
         // this host. Excluding it avoids permanent unknown fences on machines
-        // that only install one of the three supported backends.
+        // that only install one of the supported persistent backends.
         ? VC_MEETING_PERSISTENT_BACKENDS.filter(deps.backendAvailable)
         : [persistentScope];
     let allMissing = true;
+    const persistedTarget = deps.resolvePersistentTarget?.(fence.receiverSessionId, ds);
     for (const backendType of backendTypes) {
-      const name = persistentSessionName(backendType, fence.receiverSessionId);
-      try { deps.killPersistent(backendType, name); }
+      const target = resolvePersistentBackendTarget(
+        backendType,
+        fence.receiverSessionId,
+        persistedTarget,
+      );
+      const name = target.sessionName;
+      try { deps.killPersistent(backendType, name, fence.receiverSessionId, target); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -808,7 +911,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         );
       }
       let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-      try { probe = deps.probePersistent(backendType, name); }
+      try { probe = deps.probePersistent(backendType, name, target); }
       catch { probe = 'unknown'; }
       if (probe !== 'missing') {
         allMissing = false;
@@ -995,10 +1098,16 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+    const target = resolvePersistentBackendTarget(
+      persistentScope,
+      fence.receiverSessionId,
+      ds.session.persistentBackendTarget,
+    );
     try {
       probe = deps.probePersistent(
         persistentScope,
-        persistentSessionName(persistentScope, fence.receiverSessionId),
+        target.sessionName,
+        target,
       );
     } catch { probe = 'unknown'; }
     if (probe === 'missing') {
@@ -1062,17 +1171,210 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
   resolveMissingPersistentScope(sessionId) {
     const persisted = sessionStore.getSession(sessionId);
     const backendType = persisted?.backendType;
-    if (backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij') {
+    if (backendType === 'tmux' || backendType === 'herdr'
+      || backendType === 'zellij' || backendType === 'zmx') {
       return backendType;
     }
     return backendType === 'pty' ? 'none' : 'unknown';
   },
+  resolvePersistentTarget(sessionId, ds) {
+    return ds?.session.persistentBackendTarget
+      ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;
+  },
   backendAvailable: vcMeetingPersistentBackendAvailable,
-  killPersistent: killPersistentSession,
-  probePersistent: probePersistentSession,
+  killPersistent: (backendType, sessionName, sessionId, target) => target
+    ? killPersistentBackendTarget(target, sessionId)
+    : killPersistentSession(backendType, sessionName, sessionId),
+  probePersistent: (backendType, sessionName, target) => target
+    ? probePersistentBackendTarget(target)
+    : probePersistentSession(backendType, sessionName),
   warn: message => logger.warn(message),
   error: message => logger.error(message),
 });
+
+/**
+ * Identity captured before a document-comment path crosses an async boundary.
+ * A DaemonSession object can outlive its routing ownership: close, relay, repo
+ * switch, or another creator may replace either the map occupant or its Session
+ * object while an awaited Lark lookup is in flight. Both identities and the
+ * original routing key therefore form one generation.
+ */
+interface RoutingGeneration {
+  key: string;
+  ds: DaemonSession;
+  session: Session;
+}
+
+function captureRoutingGeneration(ds: DaemonSession): RoutingGeneration {
+  return {
+    key: sessionKey(sessionAnchorId(ds), ds.larkAppId),
+    ds,
+    session: ds.session,
+  };
+}
+
+function isCurrentRoutingGeneration(generation: RoutingGeneration): boolean {
+  const { key, ds, session } = generation;
+  return session.status === 'active'
+    && ds.session === session
+    && sessionKey(sessionAnchorId(ds), ds.larkAppId) === key
+    && activeSessions.get(key) === ds;
+}
+
+function ensureCurrentRoutingGeneration(generation: RoutingGeneration, phase: string): void {
+  if (isCurrentRoutingGeneration(generation)) return;
+  throw new Error(`session routing generation changed during ${phase}`);
+}
+
+type DocSessionRollback = typeof rollbackRejectedSessionAndGetWinner;
+
+/** Register one freshly-created doc-native session without overwriting a
+ * concurrent winner. The rejected row is closed before the winner is returned,
+ * so its persisted record cannot survive as a ghost-active session. */
+async function registerDocSessionCandidate(
+  key: string,
+  candidate: DaemonSession,
+  rollback: DocSessionRollback = rollbackRejectedSessionAndGetWinner,
+): Promise<DaemonSession | null> {
+  if (setActiveSessionIfActive(activeSessions, key, candidate)) return candidate;
+  return await rollback(activeSessions, key, candidate) ?? null;
+}
+
+interface DocBindingPersistenceDeps {
+  dataDir?: string;
+  read?: typeof getDocSubscription;
+  write?: typeof putDocSubscription;
+}
+
+function sameDocBindingRoute(a: DocSubscription, b: DocSubscription): boolean {
+  return a.sessionAnchor === b.sessionAnchor
+    && a.sessionId === b.sessionId
+    && a.scope === b.scope
+    && a.chatId === b.chatId;
+}
+
+/**
+ * Move one subscription onto the authoritative route owned by `selected`.
+ *
+ * The store is re-read immediately before the synchronous write so cursor and
+ * metadata updates made from another event are retained. A newer explicit
+ * rebind is never overwritten: the only route change accepted since `sub` was
+ * read is the same selected route (the normal concurrent auto-create winner
+ * case). Mutating the caller's snapshot keeps the current comment turn on the
+ * same route as the persisted subscription.
+ */
+function persistDocBindingToSession(
+  sub: DocSubscription,
+  larkAppId: string,
+  selected: DaemonSession,
+  deps: DocBindingPersistenceDeps = {},
+): void {
+  const dataDir = deps.dataDir ?? config.session.dataDir;
+  const read = deps.read ?? getDocSubscription;
+  const write = deps.write ?? putDocSubscription;
+  const current = read(dataDir, larkAppId, sub.fileToken);
+  if (!current) {
+    throw new Error(`document subscription was removed during routing: ${sub.fileToken.slice(0, 12)}`);
+  }
+
+  const selectedRoute: Pick<DocSubscription, 'sessionAnchor' | 'sessionId' | 'scope' | 'chatId'> = {
+    sessionAnchor: sessionAnchorId(selected),
+    sessionId: selected.session.sessionId,
+    scope: selected.scope,
+    chatId: selected.chatId,
+  };
+  const currentTargetsSelected = current.sessionAnchor === selectedRoute.sessionAnchor
+    && current.sessionId === selectedRoute.sessionId
+    && current.scope === selectedRoute.scope
+    && current.chatId === selectedRoute.chatId;
+  if (!sameDocBindingRoute(current, sub) && !currentTargetsSelected) {
+    throw new Error(`document subscription was rebound during routing: ${sub.fileToken.slice(0, 12)}`);
+  }
+
+  const rebound: DocSubscription = { ...current, ...selectedRoute };
+  write(dataDir, larkAppId, rebound);
+  Object.assign(sub, rebound);
+}
+
+type PersistDocBinding = typeof persistDocBindingToSession;
+type RollbackDocCandidate = (sessionId: string) => Promise<unknown>;
+
+/** Persist the route selected by registration. A candidate that won the CAS
+ * is now daemon-owned, so a failed subscription write must close only that
+ * exact occupant. A rejected candidate must never close the concurrent
+ * winner whose route it received from registerDocSessionCandidate(). */
+async function persistSelectedDocBinding(
+  routingKey: string,
+  sub: DocSubscription,
+  larkAppId: string,
+  selected: DaemonSession,
+  candidate: DaemonSession,
+  persist: PersistDocBinding = persistDocBindingToSession,
+  rollback: RollbackDocCandidate = closeSessionHelper,
+): Promise<void> {
+  try {
+    persist(sub, larkAppId, selected);
+  } catch (err) {
+    if (selected === candidate && activeSessions.get(routingKey) === candidate) {
+      try {
+        await rollback(candidate.session.sessionId);
+      } catch (rollbackErr) {
+        logger.error(
+          `[doc-comment] failed to roll back auto-created session ` +
+          `${candidate.session.sessionId.slice(0, 8)} after binding error: ` +
+          `${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+        );
+      } finally {
+        // closeSessionHelper removes this synchronously in production. Keep a
+        // final identity guard for injected/test rollback failures so no newer
+        // route owner can be evicted.
+        if (activeSessions.get(routingKey) === candidate) activeSessions.delete(routingKey);
+        candidate.session.status = 'closed';
+        candidate.session.closedAt ??= new Date().toISOString();
+      }
+    }
+    throw err;
+  }
+}
+
+function ownsCurrentRoute(ds: DaemonSession, larkAppId: string): boolean {
+  return ds.larkAppId === larkAppId
+    && ds.session.status === 'active'
+    && activeSessions.get(sessionKey(sessionAnchorId(ds), larkAppId)) === ds;
+}
+
+/** Resolve a binding without ever handing a stale anchor's replacement the
+ * comment. If the subscribed session was relayed, find it by stable sessionId
+ * and lazily migrate the subscription to its new authoritative route. */
+function resolveBoundDocSession(
+  sub: DocSubscription,
+  larkAppId: string,
+  persist: PersistDocBinding = persistDocBindingToSession,
+): DaemonSession | undefined {
+  const direct = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
+  if (
+    direct
+    && ownsCurrentRoute(direct, larkAppId)
+    && (!sub.sessionId || direct.session.sessionId === sub.sessionId)
+  ) {
+    return direct;
+  }
+
+  if (!sub.sessionId) return undefined;
+  const relocated = [...new Set(activeSessions.values())].find(candidate =>
+    candidate.session.sessionId === sub.sessionId
+    && ownsCurrentRoute(candidate, larkAppId));
+  if (!relocated) return undefined;
+  persist(sub, larkAppId, relocated);
+  return relocated;
+}
+
+export const __testOnly_captureRoutingGeneration = captureRoutingGeneration;
+export const __testOnly_isCurrentRoutingGeneration = isCurrentRoutingGeneration;
+export const __testOnly_registerDocSessionCandidate = registerDocSessionCandidate;
+export const __testOnly_persistDocBindingToSession = persistDocBindingToSession;
+export const __testOnly_persistSelectedDocBinding = persistSelectedDocBinding;
+export const __testOnly_resolveBoundDocSession = resolveBoundDocSession;
 
 type VcMeetingDaemonSession = {
   larkAppId: string;
@@ -1166,6 +1468,10 @@ type VcMeetingDaemonSession = {
   // 避免 daemon 重启把半选状态变成真状态）。
   consumerPendingChoice?: { mode: 'agent'; agentAppId: string } | { mode: 'listenOnly' };
   consumerPendingIntervalMs?: number;
+  /** Authenticated operator context submitted with the current profile form.
+   * Staged only: activation freezes it into each newly joined member's trusted
+   * instruction snapshot, so it never mutates the reusable preset. */
+  consumerPendingActivationContext?: string;
   consumerInjectTimer?: ReturnType<typeof setInterval>;
   consumerInjectPromise?: Promise<VcMeetingConsumerInjectResult>;
   actorNamesByOpenId: Record<string, string>;
@@ -1383,6 +1689,8 @@ const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [15_000, 30_000, 60_000, 90_000] as 
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS = 10;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS = 3_600;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD = 'vc_meeting_custom_interval_seconds';
+const VC_MEETING_ACTIVATION_CONTEXT_FIELD = 'vc_meeting_activation_context';
+const VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS = 2_000;
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
 
@@ -1486,6 +1794,32 @@ function normalizeVcMeetingCustomSyncIntervalMs(value: unknown): { ok: true; int
 
 function vcMeetingCustomSyncIntervalFromCard(data: CardActionData): { ok: true; intervalMs?: number } | { ok: false; error: string } {
   return normalizeVcMeetingCustomSyncIntervalMs(data.action?.form_value?.[VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD]);
+}
+
+type VcMeetingActivationContextResult =
+  | { ok: true; context?: string }
+  | { ok: false; error: string };
+
+function normalizeVcMeetingActivationContext(value: unknown): VcMeetingActivationContextResult {
+  if (value === undefined || value === null) return { ok: true };
+  const text = (Array.isArray(value) ? String(value[0] ?? '') : String(value))
+    .replace(/\r\n?/g, '\n')
+    .trim();
+  if (!text) return { ok: true };
+  if (text.length > VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS) {
+    return { ok: false, error: `本次会议补充说明不能超过 ${VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS} 个字符` };
+  }
+  const normalized = normalizeVcMeetingProfileInstructions(text);
+  if (!normalized.ok) {
+    return { ok: false, error: `本次会议补充说明无效：${normalized.error}` };
+  }
+  return { ok: true, context: normalized.instructions };
+}
+
+function vcMeetingActivationContextFromCard(data: CardActionData): VcMeetingActivationContextResult {
+  return normalizeVcMeetingActivationContext(
+    data.action?.form_value?.[VC_MEETING_ACTIVATION_CONTEXT_FIELD],
+  );
 }
 
 function vcMeetingSessionFlushIntervalMs(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): number {
@@ -2226,19 +2560,99 @@ function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAlias
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
 }
 
-function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string } | null {
+function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
+  const run = ds.session.deferredScheduleRun;
+  if (!run) return undefined;
+  const binding = readDeferredTopicBinding(config.session.dataDir, ds.session.sessionId);
+  if (!binding
+    || binding.turnId !== run.turnId
+    || binding.chatId !== ds.chatId
+    || binding.larkAppId !== ds.larkAppId
+    || binding.routingAnchor !== run.routingAnchor) return undefined;
+  const nowIso = new Date().toISOString();
+  const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
+  const previous = aliases[binding.rootMessageId];
+  aliases[binding.rootMessageId] = {
+    createdAt: previous?.createdAt ?? binding.createdAt,
+    lastUsedAt: previous?.lastUsedAt ?? nowIso,
+  };
+  const changed = ds.session.rootMessageId !== binding.rootMessageId
+    || !ds.session.replyThreadAliases?.[binding.rootMessageId];
+  ds.session.rootMessageId = binding.rootMessageId;
+  ds.session.replyThreadAliases = aliases;
+  ds.replyThreadAliases = aliases;
+  if (changed) sessionStore.updateSession(ds.session);
+  return binding.rootMessageId;
+}
+
+const deferredScheduleSettleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleDeferredScheduleSettlement(
+  ds: DaemonSession,
+  context: { turnId: string; source: 'terminal' | 'idle' },
+): void {
+  const run = ds.session.deferredScheduleRun;
+  if (!run || run.turnId !== context.turnId) return;
+  const sessionId = ds.session.sessionId;
+  const prior = deferredScheduleSettleTimers.get(sessionId);
+  if (prior) clearTimeout(prior);
+  // Exact transcript terminal needs only a short filesystem visibility grace.
+  // Screen-only adapters use a longer confirmation and re-check that the same
+  // turn is still idle before reclaiming the hidden session.
+  const delayMs = context.source === 'terminal'
+    ? (ds.session.backendType === 'riff' ? 1_500 : 300)
+    : 1_500;
+  const timer = setTimeout(() => {
+    deferredScheduleSettleTimers.delete(sessionId);
+    void settleDeferredScheduleRun(ds, context, {
+      reconcile: reconcileDeferredTopicBinding,
+      closeSession: closeSessionHelper,
+    }).then((result) => {
+      if (result.action === 'materialized') {
+        logger.info(
+          `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
+        );
+        return;
+      }
+      if (result.action === 'closed') {
+        logger.info(
+          `[scheduler] Auto-closed silent deferred run with no botmux send `
+          + `session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
+        );
+      }
+    }).catch((err) => {
+      logger.warn(`[scheduler] Deferred run settlement failed session=${sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, delayMs);
+  deferredScheduleSettleTimers.set(sessionId, timer);
+}
+
+function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
-    if (sessionHasReplyThreadAlias(ds.session, rootId)) return { chatId: ds.chatId, sessionId: ds.session.sessionId };
+    const deferredRoot = reconcileDeferredTopicBinding(ds);
+    if (sessionHasReplyThreadAlias(ds.session, rootId) || deferredRoot === rootId) {
+      return { chatId: ds.chatId, sessionId: ds.session.sessionId, anchor: sessionAnchorId(ds) };
+    }
   }
   const diskSessions = sessionStore.listSessions();
   if (diskSessions.some(s => s.status === 'active' && s.larkAppId === larkAppId && s.scope !== 'chat' && s.rootMessageId === rootId)) {
     return null;
   }
-  const hit = diskSessions.find(s => s.status === 'active' && s.larkAppId === larkAppId && s.chatId === chatId && sessionHasReplyThreadAlias(s, rootId));
-  return hit ? { chatId: hit.chatId, sessionId: hit.sessionId } : null;
+  const hit = diskSessions.find(s => {
+    if (s.status !== 'active' || s.larkAppId !== larkAppId || s.chatId !== chatId || s.scope !== 'chat') return false;
+    if (sessionHasReplyThreadAlias(s, rootId)) return true;
+    if (!s.deferredScheduleRun) return false;
+    const binding = readDeferredTopicBinding(config.session.dataDir, s.sessionId);
+    return binding?.rootMessageId === rootId
+      && binding.turnId === s.deferredScheduleRun.turnId
+      && binding.routingAnchor === s.deferredScheduleRun.routingAnchor;
+  });
+  return hit
+    ? { chatId: hit.chatId, sessionId: hit.sessionId, anchor: storedSessionAnchorId(hit) }
+    : null;
 }
 
 function setDirectChatDisplayNameFromSender(
@@ -2249,6 +2663,39 @@ function setDirectChatDisplayNameFromSender(
   if (chatType !== 'p2p' || sender?.type !== 'user') return;
   const name = String(sender.name ?? '').trim();
   if (name) session.chatDisplayName = name;
+}
+
+const NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS = 800;
+
+/** 首条只有机器人 mention 时，尽力取群名作为原生会话标题兜底。 */
+async function resolveGroupChatNameForNativeTitle(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p' | undefined,
+  cliId: string,
+  rawContent: unknown,
+  mentions?: readonly { name: string }[],
+): Promise<string | undefined> {
+  if (
+    chatType !== 'group'
+    || cliId !== 'codex'
+    || extractBotmuxLarkNativeSessionTitlePrompt(rawContent, mentions)
+  ) {
+    return undefined;
+  }
+
+  let timer: number | undefined;
+  const timeout = new Promise<undefined>(resolve => {
+    timer = setTimeout(resolve, NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      getChatNameAndMode(larkAppId, chatId).then(info => info.name ?? undefined),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 // Cache last /repo scan results per chat for /repo <number> fallback.
 // Bounded: this is a transient picker cache keyed by chatId (unbounded over a
@@ -2462,6 +2909,24 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
+  // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat.
+  // Auxiliary worker UI is already suppressed at its source (worker-pool
+  // managedAuxUiSuppressed) and HTTP final_output is intercepted upstream in
+  // deliverFinalOutput, so this path is normally unreachable for such sessions;
+  // this is a defense-in-depth backstop. Return '' (NOT the synthetic anchor) —
+  // an empty message id reads as "nothing posted" to every caller that stores
+  // the result as a card id, so the falsy-guarded scheduleCardPatch/updateMessage
+  // never fire on a synthetic id. Returning `anchor` would be a latent bug: it
+  // would be stored as streamCardId and a later PATCH would dial Feishu.
+  const transportAllowed = larkTransportEnabled({
+    chatId: ds?.chatId ?? anchor,
+    apiOnly: getBot(appId).config.apiOnly,
+  });
+  if (!transportAllowed) {
+    logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
+    return '';
+  }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,
     scope: ds.scope,
@@ -2523,6 +2988,24 @@ async function sessionReply(
         return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
       }
     }
+    if (opts?.placement === 'chat') {
+      return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
+    }
+    if (opts?.placement === 'topic') {
+      const topicKey = opts.meetingTopicKey;
+      if (!topicKey || topicKey.targetChatId !== chatId) {
+        throw new Error('meeting topic placement is missing a matching durable topic key');
+      }
+      const root = await ensureVcMeetingListenerTopicRoot(
+        config.session.dataDir,
+        topicKey,
+        () => sendWithHookPolicy(chatId, content, msgType, opts.uuid),
+      );
+      if (root.created) {
+        return root.rootMessageId;
+      }
+      return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
+    }
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
@@ -2540,7 +3023,7 @@ async function sessionReply(
       const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
       if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, opts?.uuid);
       if (target.mode === 'quote') return replyWithHookPolicy(target.rootMessageId, content, msgType, false, opts?.uuid);
-      if (ds.session.rootMessageId) {
+      if (ds.session.rootMessageId && !ds.session.externalTriggerTopicless) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
           logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
@@ -2606,12 +3089,23 @@ export async function enforceMessageQuotaForCliInput(
   senderUnionId?: string,
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
+  botSender?: boolean,
+  opts?: { listenerAuthorized?: boolean },
 ): Promise<boolean> {
+  if (opts?.listenerAuthorized) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
   // chatType 同理：不传的话，p2pOpen 放行的私聊消息会在这道复查里被丢掉（同一个断点）。
-  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+  //
+  // botSender：这条消息的发送方是飞书盖章的 bot（sender_type ∈ app|bot，或 cross-ref
+  // 认识的自家 peer）。命中时必须与 dispatcher 的外层闸用**同一个谓词** evaluateBotTalk，
+  // 否则「团队拉群 + sender 没带 union_id」这条路径会外层放行、这里静默丢弃——比弹卡
+  // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
+  // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
+  const ev = botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
+    : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
@@ -2626,8 +3120,18 @@ export async function enforceMessageQuotaForCliInput(
 
   let quota;
   try {
-    const def = getBot(larkAppId).config.messageQuota?.defaultLimit;
-    quota = await consumeQuota(larkAppId, ev.quotaKey, def);
+    // oncall ∩ chatGrant 交集的额度决策**全部收口进 consumeQuota 的同一把锁**，杜绝跨 await
+    // 用陈旧 ev 决策：
+    //   • explicitGrantOverride（live 显式授权）→ 不兜 default（undefined）。
+    //   • expiredGrantCleanup（观察到过期 chatGrant）→ 透传给 consumeQuota，锁内以**当前 expiry**
+    //     为权威：当前 expiry<=now → 原子清「成员+quota+expiry」并回落 default；当前无/未来 expiry
+    //     → grant live（成员在→不兜 default 按现有/不限；成员已清→回落 default）。
+    //   • 其余 oncall（非成员）→ 兜 default。
+    // 传入的 def 是「拟回落值」；是否真用由 consumeQuota 锁内定夺（有 expiredGrant 时以 CAS 为准）。
+    const def = ev.reason === 'oncall' && !ev.explicitGrantOverride
+      ? getBot(larkAppId).config.messageQuota?.defaultLimit
+      : undefined;
+    quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
   } catch (err) {
     logger.warn(`[quota:${larkAppId}] consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
     abortCharge(larkAppId, messageId);
@@ -2707,8 +3211,13 @@ function getPidFile(): string {
 }
 
 /** Path to the wrapper bin directory — injected into worker PATH so CLIs
- *  can call `botmux send` / `botmux schedule` without a global npm install. */
-const BOTMUX_BIN_DIR = join(homedir(), '.botmux', 'bin');
+ *  can call `botmux send` / `botmux schedule` without a global npm install.
+ *  Single source of truth: resolveBotmuxWrapperBinDir (core-only → dedicated
+ *  `<SESSION_DATA_DIR>/bin`, never the shared `~/.botmux/bin`, so a same-HOME
+ *  fleet's wrapper/PATH is not clobbered and left unrestored on exit — codex P1).
+ *  Every consumer (worker-pool fork PATH, worker.ts child-env, tmux pane scripts)
+ *  MUST resolve the SAME dir. */
+const BOTMUX_BIN_DIR = resolveBotmuxWrapperBinDir(process.env);
 
 function writePidFile(): void {
   const dir = config.session.dataDir;
@@ -2716,12 +3225,18 @@ function writePidFile(): void {
     mkdirSync(dir, { recursive: true });
   }
   atomicWriteFileSync(getPidFile(), String(process.pid));
-  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir
-  const breadcrumb = join(homedir(), '.botmux', '.data-dir');
-  try {
-    mkdirSync(join(homedir(), '.botmux'), { recursive: true });
-    atomicWriteFileSync(breadcrumb, config.session.dataDir);
-  } catch { /* best effort */ }
+  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir.
+  // SKIP in core-only (codex P1): the global `~/.botmux/.data-dir` is a shared-HOME
+  // signpost for bare-shell CLIs; a core-only service must not rewrite it to point
+  // a same-HOME host operator at the core-only store. Core-only's own workers get
+  // the data dir via the frozen SESSION_DATA_DIR env, not this breadcrumb.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    const breadcrumb = join(homedir(), '.botmux', '.data-dir');
+    try {
+      mkdirSync(join(homedir(), '.botmux'), { recursive: true });
+      atomicWriteFileSync(breadcrumb, config.session.dataDir);
+    } catch { /* best effort */ }
+  }
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
   // regardless of whether the package was installed globally.  The wrapper
@@ -2805,6 +3320,176 @@ function removeDaemonDescriptor(larkAppId: string): void {
   }
 }
 
+/**
+ * Persistent last-known-good `raw entry → ou_` cache for allowedUsers. The
+ * read/write primitives live in utils/allowed-users-cache.ts so the runtime
+ * set/revoke paths (services layer) write through the same sidecar and it never
+ * diverges from the live allowlist. These thin wrappers bind the data dir.
+ */
+function readAllowedUsersCache(larkAppId: string): Record<string, string> {
+  return readAllowedUsersResolveCache(config.session.dataDir, larkAppId);
+}
+function writeAllowedUsersCache(
+  larkAppId: string,
+  map: Map<string, string>,
+  opts: { deleteEntries?: Iterable<string>; retainKeys?: Iterable<string> } = {},
+): void {
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, { map, ...opts });
+}
+
+/** Raw entries the resolver flagged as definitively gone (safe to prune from cache). */
+function definitiveEntriesOf(entryStatus?: Map<string, EntryResolveStatus>): string[] {
+  if (!entryStatus) return [];
+  const out: string[] = [];
+  for (const [entry, status] of entryStatus.entries()) {
+    if (status === 'definitive') out.push(entry);
+  }
+  return out;
+}
+
+function notifyAllowedUsersResolveFailure(
+  larkAppId: string,
+  notice: string,
+  recipients: string[],
+): void {
+  logger.error(`[${larkAppId}] ${notice}`);
+  const unique = [...new Set(recipients.filter(u => typeof u === 'string' && u.startsWith('ou_')))];
+  // Fail-safe recipient: on a cold start the resolve that would have produced
+  // the owner's open_id is the very thing that just failed, so `recipients` is
+  // empty and the owner would hear nothing. Fall back to the static ownerOpenId
+  // captured at setup — a raw ou_ that never needs resolving, so it survives
+  // the contact-API outage. Appended (not replacing) so a partial resolve still
+  // reaches every recovered owner too.
+  let staticOwner: string | undefined;
+  try {
+    staticOwner = getBot(larkAppId).config.ownerOpenId;
+  } catch { /* bot gone mid-flight — nothing to fall back to */ }
+  if (staticOwner && staticOwner.startsWith('ou_') && !unique.includes(staticOwner)) {
+    unique.push(staticOwner);
+  }
+  if (unique.length === 0) {
+    logger.error(
+      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM ` +
+      `(no resolved owner and no static ownerOpenId in bots.json); ` +
+      `check daemon logs and Feishu contact API, then restart this bot.`,
+    );
+    return;
+  }
+  // Fire-and-forget: the owner DM must NOT block daemon startup. sendUserMessage
+  // uses an untimed SDK path; awaiting it on the boot-critical path (before the
+  // WS listener starts) would stall the bot coming online during the very
+  // contact/network partition that triggered this notice. Bound each attempt
+  // with a deadline and detach.
+  void (async () => {
+    for (const openId of unique.slice(0, 5)) {
+      try {
+        await sendUserMessage(
+          larkAppId,
+          openId,
+          `⚠️ Botmux allowedUsers 解析告警\n\n${notice}`,
+          'text',
+          undefined,
+          { timeoutMs: 10_000 },
+        );
+      } catch (err: any) {
+        logger.warn(
+          `[${larkAppId}] failed to DM allowedUsers resolve notice to ${openId.slice(0, 12)}: ${err?.message ?? err}`,
+        );
+      }
+    }
+  })();
+}
+
+function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
+  if (attempt > 3) {
+    // Retries exhausted (startup + 3 retries all degraded). Don't just fall
+    // silent — the owner has been locked out for ~7.5 min and auto-recovery
+    // won't try again. Emit a terminal notice so they know to intervene. Only
+    // when the allowlist is still actually broken: a config change or a bot
+    // teardown mid-retry is not an exhaustion worth alarming on.
+    try {
+      const bot = getBot(larkAppId);
+      const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
+      const stillEmpty = (bot.resolvedAllowedUsers ?? []).length === 0;
+      if (stillConfigured && stillEmpty) {
+        notifyAllowedUsersResolveFailure(
+          larkAppId,
+          `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
+          `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
+          bot.resolvedAllowedUsers ?? [],
+        );
+      }
+    } catch { /* bot gone — nothing to report */ }
+    return;
+  }
+  const delayMs = attempt === 1 ? 30_000 : attempt === 2 ? 120_000 : 300_000;
+  const timer = setTimeout(() => {
+    void (async () => {
+      let bot: BotState;
+      try {
+        bot = getBot(larkAppId);
+      } catch {
+        return;
+      }
+      const configured = bot.config.allowedUsers ?? [];
+      if (configured.length === 0) return;
+      // Fingerprint the config we resolve against. A /revoke or `set allowedUsers`
+      // can land during the cross-network resolve await below; without this fence
+      // the stale retry result would clobber the newer runtime/cache/descriptor —
+      // reviving a just-revoked guest, or forking runtime from the persisted
+      // config until the next restart. If the config changed, drop this result
+      // (the mutation path already wrote through, and if it needs a retry it
+      // schedules its own).
+      const fingerprint = JSON.stringify(configured);
+      try {
+        const resolveResult = await resolveAllowedUsersWithMap(larkAppId, configured);
+        let liveBot: BotState;
+        try { liveBot = getBot(larkAppId); } catch { return; }
+        if (JSON.stringify(liveBot.config.allowedUsers ?? []) !== fingerprint) {
+          logger.info(
+            `[${larkAppId}] allowedUsers resolve retry #${attempt} discarded: config changed during resolve`,
+          );
+          return;
+        }
+        const applied = applyAllowedUsersResolve({
+          rawEntries: configured,
+          previousResolvedMap: readAllowedUsersCache(larkAppId),
+          resolveResult,
+        });
+        liveBot.resolvedAllowedUsers = applied.resolved;
+        liveBot.rawAllowedUserResolution = applied.map;
+        // Persist the recovered map + republish the descriptor so the dashboard
+        // (create-group creator picker) and the next boot both see the healed
+        // open_ids — otherwise a successful retry only heals in-memory state.
+        // Prune definitively-gone entries + keys no longer configured so a stale
+        // owner can't be revived later.
+        writeAllowedUsersCache(larkAppId, applied.map, {
+          deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+          retainKeys: configured,
+        });
+        republishResolvedAllowedUsers(larkAppId, applied.resolved);
+        if (!applied.failed) {
+          logger.info(
+            `[${larkAppId}] allowedUsers resolve retry succeeded: ${applied.resolved.join(', ') || '(empty — entries definitively gone)'}`,
+          );
+          return;
+        }
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} still degraded` +
+          `${applied.usedFallback ? ' (on cache)' : applied.resolved.length ? '' : ' (allowlist empty)'}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      } catch (err: any) {
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} threw: ${err?.message ?? err}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      }
+    })();
+  }, delayMs);
+  timer.unref?.();
+}
+
 // ─── Version tracking ────────────────────────────────────────────────────────
 
 function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
@@ -2872,6 +3557,8 @@ interface V3SavedWorkflowImInvocation {
   teamTrustUnionId?: string;
   /** Raw sender union_id may independently grant the configured teamMember leg. */
   memberUnionId?: string;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }
 
 const v3DistillationGenerationInFlight = new Map<string, Promise<void>>();
@@ -3097,6 +3784,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     initiatorOpenId,
     teamTrustUnionId,
     memberUnionId,
+    botSender,
   } = invocation;
   const command = parseV3SavedWorkflowCommand(content);
   if (!command) return false;
@@ -3150,6 +3838,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       teamTrustUnionId,
       memberUnionId,
       chatType,
+      botSender,
     ),
   });
   if (!policy.ok) {
@@ -3270,8 +3959,8 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
-    const readUrl = buildTerminalUrl(ds);
+  if (ds.streamCardId && workerHasInitialized(ds)) {
+    const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
     const prevMode = ds.displayMode ?? 'hidden';
@@ -3282,6 +3971,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
       isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
+      getDaemonStreamingCardUsageSnapshot(ds, dsBotCfg.cliId, { fresh: true }),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -3308,506 +3998,6 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   persistStreamCardState(ds);
 }
 
-function codexHandoffSourceNoticeUuid(requestId: string, anchor: string): string {
-  const digest = createHash('sha256')
-    .update(requestId)
-    .update('\0')
-    .update(anchor)
-    .digest('hex')
-    .slice(0, 40);
-  return `bmxh_${digest}`;
-}
-
-/** Consume a Codex-generated Handoff Summary in the current Lark topic while
- * replacing only the underlying Codex session. This deliberately does not
- * copy cliSessionId and calls forkWorker with resume=false. */
-async function migrateCodexHandoffToFreshSession(
-  source: DaemonSession,
-  summary: string,
-): Promise<boolean> {
-  const handoff = source.pendingCodexFreshHandoff;
-  if (!handoff) return false;
-  if (handoff.migrationInFlight) return true;
-  handoff.migrationInFlight = true;
-  let freshStarted = false;
-  try {
-    if (handoff.timeout) clearTimeout(handoff.timeout);
-    handoff.timeout = undefined;
-    handoff.phase = 'migrating';
-    handoff.selectedSummary ??= omitOldCodexSessionIds(
-      selectCodexHandoffSummary(summary, {
-        userGoal: handoff.interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-        title: source.session.title,
-        workingDir: source.workingDir ?? source.session.workingDir,
-      }),
-      [source.session.cliSessionId, source.session.sessionId],
-    );
-    const selectedSummary = handoff.selectedSummary;
-    // The Lark topic is part of the source conversation's identity, not
-    // resumable handoff state. Older botmux builds persisted the id of a newly
-    // created top-level message here; trusting that value after an upgrade
-    // would keep all recovered commentary/final cards in the wrong topic.
-    // Always canonicalise unfinished migrations back to the source anchor.
-    const persistedAnchor = handoff.newTopicAnchor;
-    const anchor = sessionAnchorId(source);
-    const sourceTopicNoticeSentAt = handoff.sourceTopicNoticeSentAt;
-    if (persistedAnchor && persistedAnchor !== anchor) {
-      logger.warn(
-        `[${tag(source)}] Rebinding legacy Codex handoff from topic `
-        + `${persistedAnchor.substring(0, 12)} to source topic ${anchor.substring(0, 12)}`,
-      );
-    }
-    handoff.newTopicAnchor = anchor;
-    source.session.codexFreshHandoff = {
-      requestId: handoff.requestId,
-      reason: handoff.reason,
-      requestedAt: new Date(handoff.requestedAt).toISOString(),
-      interruptedTurnId: handoff.interruptedTurnId,
-      interruptedUserGoal: handoff.interruptedUserGoal,
-      summaryTurnId: handoff.summaryTurnId,
-      phase: handoff.phase,
-      selectedSummary,
-      newTopicAnchor: handoff.newTopicAnchor,
-      newSessionId: handoff.newSessionId,
-      sourceTopicNoticeSentAt,
-    };
-    sessionStore.updateSession(source.session);
-    const locale = localeForBot(source.larkAppId);
-    // Keep the Lark conversation stable. The hard boundary we need is a fresh
-    // Codex native thread, not a new Lark topic: creating a top-level message
-    // here used to move every later commentary/final card out of the topic the
-    // user was reading. `newTopicAnchor` retains its historical persisted name
-    // for schema compatibility.
-    if (!sourceTopicNoticeSentAt) {
-      await sessionReply(
-        anchor,
-        buildFreshCodexHandoffTopic(selectedSummary, locale, handoff.reason),
-        'text',
-        source.larkAppId,
-        undefined,
-        { uuid: codexHandoffSourceNoticeUuid(handoff.requestId, anchor) },
-      );
-      handoff.sourceTopicNoticeSentAt = new Date().toISOString();
-      handoff.newTopicAnchor = anchor;
-      source.session.codexFreshHandoff.newTopicAnchor = anchor;
-      source.session.codexFreshHandoff.sourceTopicNoticeSentAt = handoff.sourceTopicNoticeSentAt;
-      sessionStore.updateSession(source.session);
-    }
-    const bot = getBot(source.larkAppId);
-    const promptText = buildFreshCodexHandoffPrompt(selectedSummary);
-    const freshCliId = freshCodexHandoffCliId(source.session.cliId, handoff.reason);
-    let session = handoff.newSessionId ? sessionStore.getSession(handoff.newSessionId) : undefined;
-    // A daemon may restart between an old build creating the target row under
-    // a new top-level message and closing the source. That exact referenced
-    // row is safe to repair in place before it starts: preserve its botmux id,
-    // but bind its delivery route to the source topic.
-    if (session
-      && persistedAnchor
-      && persistedAnchor !== anchor
-      && session.rootMessageId === persistedAnchor) {
-      session.rootMessageId = anchor;
-      session.chatId = source.chatId;
-      session.scope = 'thread';
-      sessionStore.updateSession(session);
-    }
-    if (!session) {
-      session = sessionStore.listSessions().find(candidate =>
-        candidate.status === 'active'
-        && candidate.sessionId !== source.session.sessionId
-        && candidate.larkAppId === source.larkAppId
-        && candidate.rootMessageId === anchor,
-      );
-      if (session) {
-        handoff.newSessionId = session.sessionId;
-        source.session.codexFreshHandoff.newSessionId = session.sessionId;
-        sessionStore.updateSession(source.session);
-      }
-    }
-    if (session && (session.rootMessageId !== anchor || session.sessionId === source.session.sessionId)) {
-      session = undefined;
-    }
-    if (!session || session.status === 'closed') {
-      session = sessionStore.createSession(
-        source.chatId,
-        anchor,
-        source.session.title || 'Handoff Summary',
-        source.chatType,
-      );
-      handoff.newSessionId = session.sessionId;
-      source.session.codexFreshHandoff.newSessionId = session.sessionId;
-      sessionStore.updateSession(source.session);
-    }
-    const existingFresh = [...activeSessions.values()].find(candidate =>
-      candidate.session.sessionId === session!.sessionId,
-    );
-    const now = Date.now();
-    session.larkAppId = source.larkAppId;
-    session.scope = 'thread';
-    session.ownerOpenId = source.session.ownerOpenId;
-    session.ownerUnionId = source.session.ownerUnionId;
-    session.creatorOpenId = source.session.creatorOpenId;
-    session.lastCallerOpenId = source.session.lastCallerOpenId;
-    session.workingDir = source.workingDir ?? source.session.workingDir;
-    // Freeze the same Codex launcher/model/surface, but never copy the native
-    // thread id. Context compaction stays on CLI Codex; app-server stream
-    // recovery starts a fresh codex-app thread instead of changing runtimes.
-    session.cliId = freshCliId;
-    session.cliPathOverride = source.session.cliPathOverride;
-    session.wrapperCli = source.session.wrapperCli;
-    session.model = source.session.model;
-    session.codexStreamRecoveryCount = source.session.codexStreamRecoveryCount;
-    session.agentFrozen = true;
-    session.lastMessageAt = new Date(now).toISOString();
-    // Hard no-lineage invariant. A newly-created handoff target never inherits
-    // any native/resume/adopt/remote-task identity from the source session.
-    if (!existingFresh) {
-      clearFreshCodexHandoffLineage(session);
-    }
-    sessionStore.updateSession(session);
-    messageQueue.ensureQueue(anchor);
-
-    const fresh: DaemonSession = existingFresh ?? {
-      session,
-      worker: null,
-      workerPort: null,
-      workerToken: null,
-      larkAppId: source.larkAppId,
-      chatId: source.chatId,
-      chatType: source.chatType,
-      scope: 'thread',
-      spawnedAt: Date.parse(session.createdAt) || now,
-      cliVersion: source.cliVersion,
-      lastMessageAt: now,
-      hasHistory: false,
-      workingDir: session.workingDir,
-      ownerOpenId: session.ownerOpenId,
-      currentTurnTitle: session.title,
-    };
-    fresh.session = session;
-    fresh.scope = 'thread';
-    fresh.chatId = source.chatId;
-    fresh.chatType = source.chatType;
-    fresh.workingDir = session.workingDir;
-    fresh.hasHistory = !!session.cliSessionId;
-    await setActiveSessionSafe(
-      activeSessions,
-      sessionKey(anchor, source.larkAppId),
-      fresh,
-      { suppressPreviousStopNotice: true },
-    );
-    ensureSessionWhiteboard(fresh);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(fresh);
-    const input = buildNewTopicCliInput(
-      promptText,
-      session.sessionId,
-      freshCliId,
-      session.cliPathOverride,
-      undefined,
-      undefined,
-      await getAvailableBots(source.larkAppId, source.chatId),
-      undefined,
-      { name: bot.botName, openId: bot.botOpenId },
-      locale,
-      undefined,
-      { larkAppId: source.larkAppId, chatId: source.chatId, whiteboardId: session.whiteboardId, topicGroupMemoryBlock },
-    );
-    input.userGoal = selectedSummary;
-    if (!fresh.worker && !session.cliSessionId) {
-      rememberLastCliInput(fresh, promptText, input);
-      forkWorker(fresh, input, { resume: false });
-    }
-    freshStarted = !!fresh.worker || !!session.cliSessionId;
-    if (!freshStarted) throw new Error('fresh Codex worker did not start');
-
-    // Same-topic setActiveSessionSafe already closed the source occupant before
-    // installing `fresh`. Older persisted migrations may still target a
-    // different anchor, so close a source that remains registered separately.
-    if ([...activeSessions.values()].some(candidate => candidate === source)) {
-      await closeSessionHelper(source.session.sessionId, {
-        suppressStopNotice: true,
-      });
-    } else if (sessionStore.getSession(source.session.sessionId)?.status !== 'closed') {
-      // Unit-level/direct callers can invoke this without registering the
-      // worker-pool map. Keep that source lifecycle correct without deleting
-      // the fresh same-anchor entry we just installed.
-      killWorker(source);
-      sessionStore.closeSession(source.session.sessionId);
-    }
-    // Commit only after the source is durably closed. If the daemon dies after
-    // the fresh worker fork but before this close, the persisted intent makes
-    // boot recovery reuse the same topic anchor instead of resuming the old
-    // native Codex id.
-    source.session.codexFreshHandoff = {
-      requestId: handoff.requestId,
-      reason: handoff.reason,
-      requestedAt: new Date(handoff.requestedAt).toISOString(),
-      interruptedTurnId: handoff.interruptedTurnId,
-      interruptedUserGoal: handoff.interruptedUserGoal,
-      summaryTurnId: handoff.summaryTurnId,
-      phase: 'completed',
-      completedAt: new Date().toISOString(),
-      selectedSummary: handoff.selectedSummary,
-      newTopicAnchor: handoff.newTopicAnchor,
-      newSessionId: handoff.newSessionId,
-      sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
-    };
-    source.pendingCodexFreshHandoff = undefined;
-    sessionStore.updateSession(source.session);
-    logger.info(
-      `[${tag(source)}] Codex handoff → fresh native session in topic ${anchor.substring(0, 12)} `
-      + `(new session=${session.sessionId.substring(0, 8)}, resume=false)`,
-    );
-    return true;
-  } catch (err) {
-    if (freshStarted) {
-      // The handoff target is already live/fresh; a source-close bookkeeping
-      // failure must never roll migration back or create another topic/session.
-      source.session.codexFreshHandoff = {
-        requestId: handoff.requestId,
-        reason: handoff.reason,
-        requestedAt: new Date(handoff.requestedAt).toISOString(),
-        interruptedTurnId: handoff.interruptedTurnId,
-        interruptedUserGoal: handoff.interruptedUserGoal,
-        summaryTurnId: handoff.summaryTurnId,
-        phase: 'completed',
-        completedAt: new Date().toISOString(),
-        selectedSummary: handoff.selectedSummary,
-        newTopicAnchor: handoff.newTopicAnchor,
-        newSessionId: handoff.newSessionId,
-        sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
-      };
-      source.pendingCodexFreshHandoff = undefined;
-      try { sessionStore.updateSession(source.session); } catch { /* best effort */ }
-      try {
-        killWorker(source);
-        if (activeSessions.get(activeSessionKey(source)) === source) {
-          activeSessions.delete(activeSessionKey(source));
-        }
-        sessionStore.closeSession(source.session.sessionId);
-      } catch { /* the new fresh session remains authoritative */ }
-      logger.error(`[${tag(source)}] Fresh Codex started but source close cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
-      return true;
-    }
-    // Preserve the durable intent + stable Lark uuid/anchor. A later timeout,
-    // CLI-exit recovery, or daemon restart retries the same migration without
-    // creating a second topic and without resuming the old native thread.
-    handoff.phase = 'migrating';
-    try {
-      source.session.codexFreshHandoff = {
-        requestId: handoff.requestId,
-        reason: handoff.reason,
-        requestedAt: new Date(handoff.requestedAt).toISOString(),
-        interruptedTurnId: handoff.interruptedTurnId,
-        interruptedUserGoal: handoff.interruptedUserGoal,
-        summaryTurnId: handoff.summaryTurnId,
-        phase: 'migrating',
-        selectedSummary: handoff.selectedSummary,
-        newTopicAnchor: handoff.newTopicAnchor,
-        newSessionId: handoff.newSessionId,
-        sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
-      };
-      sessionStore.updateSession(source.session);
-    } catch (persistErr) {
-      logger.error(`[${tag(source)}] Failed to persist Codex handoff retry state: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
-    }
-    logger.error(`[${tag(source)}] Codex fresh handoff failed: ${err instanceof Error ? err.message : String(err)}`);
-    handoff.retryCount = (handoff.retryCount ?? 0) + 1;
-    const retryMs = handoff.retryCount <= 3
-      ? ([5_000, 15_000, 30_000][handoff.retryCount - 1] ?? 30_000)
-      : 5 * 60_000;
-    handoff.timeout = setTimeout(() => {
-      if (source.pendingCodexFreshHandoff !== handoff) return;
-      void migrateCodexHandoffToFreshSession(source, handoff.selectedSummary ?? summary);
-    }, retryMs);
-    handoff.timeout.unref?.();
-    if (handoff.retryCount > 3 && !handoff.failureNotified) {
-      handoff.failureNotified = true;
-      void sessionReply(
-        sessionAnchorId(source),
-        localeForBot(source.larkAppId) === 'en'
-          ? 'Codex context handoff could not start the fresh session in this topic after several retries. The old Codex thread will not be resumed; botmux will keep retrying at a low frequency.'
-          : 'Codex 上下文交接多次重试后仍未能在当前话题启动全新会话。旧 Codex 会话不会被恢复；botmux 将继续低频自动重试。',
-        'text',
-        source.larkAppId,
-      ).catch(() => { /* already logged by migration path */ });
-    }
-    return false;
-  } finally {
-    handoff.migrationInFlight = false;
-  }
-}
-
-function persistCodexHandoff(source: DaemonSession): void {
-  const handoff = source.pendingCodexFreshHandoff;
-  if (!handoff) return;
-  try {
-    source.session.codexFreshHandoff = {
-      requestId: handoff.requestId,
-      reason: handoff.reason,
-      requestedAt: new Date(handoff.requestedAt).toISOString(),
-      interruptedTurnId: handoff.interruptedTurnId,
-      interruptedUserGoal: handoff.interruptedUserGoal,
-      summaryTurnId: handoff.summaryTurnId,
-      phase: handoff.phase,
-      selectedSummary: handoff.selectedSummary,
-      newTopicAnchor: handoff.newTopicAnchor,
-      newSessionId: handoff.newSessionId,
-      sourceTopicNoticeSentAt: handoff.sourceTopicNoticeSentAt,
-    };
-    sessionStore.updateSession(source.session);
-    publishSessionRuntimeStatus(source);
-  } catch (err) {
-    logger.error(`[${tag(source)}] Failed to persist Codex handoff intent; in-memory watchdog remains active: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
-function fallbackCodexHandoffSummary(source: DaemonSession): string {
-  const pending = source.pendingCodexFreshHandoff;
-  return buildFallbackCodexHandoffSummary({
-    userGoal: pending?.interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-    title: source.session.title,
-    workingDir: source.workingDir ?? source.session.workingDir,
-    reason: pending?.reason === 'stream_disconnected'
-      ? 'stream_disconnected'
-      : 'context_window_exceeded',
-  });
-}
-
-function armCodexHandoffWatchdog(
-  source: DaemonSession,
-  pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']>,
-): void {
-  if (pending.timeout) clearTimeout(pending.timeout);
-  pending.timeout = setTimeout(() => {
-    if (source.pendingCodexFreshHandoff !== pending) return;
-    logger.warn(`[${tag(source)}] Codex /compact handoff summary timed out; using bounded fallback`);
-    void migrateCodexHandoffToFreshSession(source, fallbackCodexHandoffSummary(source));
-  }, CODEX_HANDOFF_TIMEOUT_MS);
-  pending.timeout.unref?.();
-}
-
-async function beginAutomaticCodexContextHandoff(
-  source: DaemonSession,
-  interruptedTurnId: string,
-  interruptedUserGoal?: string,
-): Promise<void> {
-  if (source.pendingCodexFreshHandoff) {
-    logger.info(`[${tag(source)}] Codex context handoff already active; duplicate terminal ignored`);
-    return;
-  }
-  if (!source.worker || source.worker.killed) {
-    const fallback = buildFallbackCodexHandoffSummary({
-      userGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-      title: source.session.title,
-      workingDir: source.workingDir ?? source.session.workingDir,
-    });
-    // Arm the same migration gate even though there is no old worker left;
-    // migrateCodexHandoffToFreshSession owns the fresh-native-session invariant.
-    source.pendingCodexFreshHandoff = {
-      requestedAt: Date.now(),
-      requestId: randomUUID(),
-      reason: 'context_window_exceeded',
-      interruptedTurnId,
-      interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-      summaryTurnId: `codex-handoff-${randomUUID()}`,
-      phase: 'collecting',
-    };
-    persistCodexHandoff(source);
-    await migrateCodexHandoffToFreshSession(source, fallback);
-    return;
-  }
-
-  const pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']> = {
-    requestedAt: Date.now(),
-    requestId: randomUUID(),
-    reason: 'context_window_exceeded',
-    interruptedTurnId,
-    interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-    summaryTurnId: `codex-handoff-${randomUUID()}`,
-    phase: 'collecting',
-  };
-  source.pendingCodexFreshHandoff = pending;
-  persistCodexHandoff(source);
-  beginNewTurn(source, 'Codex Handoff Summary');
-  armCodexHandoffWatchdog(source, pending);
-  try {
-    source.worker.send({
-      type: 'raw_input',
-      content: '/compact',
-      followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
-      followUpTurnId: pending.summaryTurnId,
-      followUpAfterIdle: true,
-    } as DaemonToWorker);
-  } catch (err) {
-    logger.warn(`[${tag(source)}] Failed to send /compact handoff command; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
-    await migrateCodexHandoffToFreshSession(source, fallbackCodexHandoffSummary(source));
-    return;
-  }
-  markSessionActivity(source);
-  logger.info(`[${tag(source)}] Codex context exhausted → /compact handoff armed`);
-}
-
-/** A response-stream disconnect has no trustworthy old stream left from which
- * to request /compact + a summary. Persist a bounded workspace-oriented
- * handoff immediately, then reuse the same same-topic fresh-session migration as
- * context exhaustion. One migration is allowed per lineage; the count is
- * copied to the fresh session, so another disconnect stops instead of opening
- * an unbounded topic chain during a network outage. */
-async function beginAutomaticCodexStreamRecovery(
-  source: DaemonSession,
-  interruptedTurnId: string,
-  interruptedUserGoal?: string,
-): Promise<void> {
-  if (source.pendingCodexFreshHandoff) {
-    logger.info(`[${tag(source)}] Codex handoff already active; duplicate stream terminal ignored`);
-    return;
-  }
-  const recoveryClaim = claimCodexStreamRecovery(source.session.codexStreamRecoveryCount);
-  if (!recoveryClaim.allowed) {
-    const locale = localeForBot(source.larkAppId);
-    await sessionReply(
-      sessionAnchorId(source),
-      locale === 'en'
-        ? '❌ Codex response streaming disconnected again after the automatic fresh-session recovery. Botmux stopped to avoid an endless recovery loop. Workspace changes are preserved; please retry after the connection is stable.'
-        : '❌ 自动切换全新会话后，Codex 响应流再次断开。为避免无限恢复循环，botmux 已停止自动续跑。当前工作区修改均已保留，请在网络稳定后重试。',
-      'text',
-      source.larkAppId,
-      interruptedTurnId,
-    );
-    return;
-  }
-  source.session.codexStreamRecoveryCount = recoveryClaim.nextCount;
-  const pending: NonNullable<DaemonSession['pendingCodexFreshHandoff']> = {
-    requestedAt: Date.now(),
-    requestId: randomUUID(),
-    reason: 'stream_disconnected',
-    interruptedTurnId,
-    interruptedUserGoal: interruptedUserGoal ?? source.lastUserPrompt ?? source.session.lastUserPrompt,
-    summaryTurnId: `codex-stream-recovery-${randomUUID()}`,
-    phase: 'collecting',
-  };
-  source.pendingCodexFreshHandoff = pending;
-  persistCodexHandoff(source);
-  void sessionReply(
-    sessionAnchorId(source),
-    localeForBot(source.larkAppId) === 'en'
-      ? '⚠️ Codex response streaming disconnected before completion. Botmux is creating a brand-new Codex session in this topic to continue the task. The interrupted session will not be resumed; workspace changes are preserved.'
-      : '⚠️ Codex 响应流在完成前异常断开。botmux 正在当前话题内创建全新的 Codex 会话继续本轮任务；不会 resume 已中断的旧会话，当前工作区修改会保留。',
-    'text',
-    source.larkAppId,
-    interruptedTurnId,
-  ).catch(err => logger.warn(
-    `[${tag(source)}] Failed to notify stream recovery start: ${err instanceof Error ? err.message : String(err)}`,
-  ));
-  const fallback = buildFallbackCodexHandoffSummary({
-    userGoal: pending.interruptedUserGoal,
-    title: source.session.title,
-    workingDir: source.workingDir ?? source.session.workingDir,
-    reason: 'stream_disconnected',
-  });
-  await migrateCodexHandoffToFreshSession(source, fallback);
-}
-
 /**
  * `/watch-comment <doc>` 是会话型操作：即使命令族的 list/off/pending 可以无会话
  * 运行，真正开始监听时也要创建/复用当前话题 session 并立即预热 CLI。
@@ -3819,6 +4009,8 @@ function isSessionlessCommandInvocation(cmd: string, content: string): boolean {
 }
 
 async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription): Promise<void> {
+  const generation = captureRoutingGeneration(ds);
+  ensureCurrentRoutingGeneration(generation, 'prewarm:start');
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = localeForBot(ds.larkAppId);
@@ -3832,6 +4024,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   const title = `[Doc Watch] ${sub.fileToken.slice(0, 12)}`;
   const turnId = `doc-watch-${Date.now()}-${sub.fileToken.slice(0, 8)}`;
   const sender = sub.ownerOpenId ? await resolveSender(ds.larkAppId, sub.ownerOpenId, 'user') : undefined;
+  ensureCurrentRoutingGeneration(generation, 'prewarm:sender');
 
   beginNewTurn(ds, title);
   ds.lastMessageAt = Date.now();
@@ -3846,7 +4039,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
 
   if (ds.worker && !ds.worker.killed) {
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
     const { promptContent, cliInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -3854,7 +4046,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botCliPathOverride: botCfg.cliPathOverride,
       sender,
       mode: 'live',
-      topicGroupMemoryBlock,
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
@@ -3862,7 +4053,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
     const { promptContent, cliInput: wrappedInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -3871,7 +4061,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botIdentity: { name: bot.botName, openId: bot.botOpenId },
       sender,
       mode: 'refork',
-      topicGroupMemoryBlock,
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
@@ -4050,11 +4239,431 @@ const v3GateRunner = createV3GateRunner({
   },
 });
 
+// 每个 bot 的 EventHandlers，授权成功后重放消息时需要。
+// key = larkAppId，在 startLarkEventDispatcher 调用时写入。
+const botHandlers = new Map<string, EventHandlers>();
+
+const codexNotifierStores = new Map<string, CodexNotifierEventStore>();
+const codexNotifierDeliveries = new Map<string, Promise<{ status: 'accepted'; messageId: string }>>();
+const CODEX_NOTIFIER_INGRESS_MAX_BYTES = 128 * 1024;
+const CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS = 10_000;
+const CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS = 2_200;
+const CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS = 1_200;
+
+function remainingCodexNotifierDeadline(deadlineAt: number, capMs: number): number {
+  return Math.max(1, Math.min(capMs, deadlineAt - Date.now()));
+}
+
+function codexNotifierStore(larkAppId: string): CodexNotifierEventStore {
+  const existing = codexNotifierStores.get(larkAppId);
+  if (existing) return existing;
+  const suffix = createHash('sha256').update(larkAppId).digest('hex').slice(0, 16);
+  const store = new CodexNotifierEventStore(
+    join(config.session.dataDir, 'plugin-events', `codex-notifier-${suffix}.json`),
+  );
+  codexNotifierStores.set(larkAppId, store);
+  return store;
+}
+
+function codexNotifierIngressEnabled(larkAppId: string, legacyPlugin = false): boolean {
+  const global = readGlobalConfig();
+  if (global.codexNotifier !== undefined || !legacyPlugin) {
+    return global.codexNotifier?.enabled === true;
+  }
+  try {
+    return resolveEffectivePluginIds(getBot(larkAppId).config, global)
+      .includes(CODEX_NOTIFIER_PLUGIN_ID);
+  } catch {
+    return false;
+  }
+}
+
+/** 用 Codex 原生线程名补全通知标题；失败时保留插件事件里的安全兜底信息。 */
+async function enrichCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<CodexTaskCompletedEvent> {
+  if (event.title) return event;
+  try {
+    const { readCodexAppThreadMetadata } = await import('./services/codex-app-threads.js');
+    const metadata = await readCodexAppThreadMetadata({
+      threadId: event.threadId,
+      codexBin: getBot(larkAppId).config.cliPathOverride,
+      cwd: event.cwd,
+      timeoutMs: 3_000,
+    });
+    const title = metadata.name?.trim();
+    return title ? { ...event, title: Array.from(title).slice(0, 300).join('') } : event;
+  } catch (error) {
+    logger.warn(`[codex-notifier] thread title lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    return event;
+  }
+}
+
+async function deliverCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<{ status: 'accepted' | 'duplicate'; messageId: string }> {
+  const store = codexNotifierStore(larkAppId);
+  const enrichedEvent = store.get(event.eventId) ? event : await enrichCodexNotifierEvent(larkAppId, event);
+  const recorded = store.record(enrichedEvent);
+  const deliveryEvent = recorded.record.event;
+  if (!recorded.inserted) {
+    if (
+      deliveryEvent.type !== event.type
+      || deliveryEvent.source !== event.source
+      || deliveryEvent.threadId !== event.threadId
+      || deliveryEvent.nativeTurnId !== event.nativeTurnId
+      || deliveryEvent.status !== event.status
+    ) {
+      throw new Error('codex_notifier_event_id_conflict');
+    }
+    if (recorded.record.delivery.status === 'delivered' && recorded.record.delivery.messageId) {
+      return { status: 'duplicate', messageId: recorded.record.delivery.messageId };
+    }
+  }
+
+  const deliveryKey = `${larkAppId}:${event.eventId}`;
+  const current = codexNotifierDeliveries.get(deliveryKey);
+  if (current) return current;
+
+  const delivery = (async (): Promise<{ status: 'accepted'; messageId: string }> => {
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId);
+    if (!ownerOpenId) throw new Error('codex_notifier_owner_unavailable');
+    store.updateDelivery(event.eventId, { status: 'pending' });
+    try {
+      const messageId = await runWithAbortDeadline(
+        'codex_notifier_delivery',
+        CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+        signal => sendUserMessage(
+          larkAppId,
+          ownerOpenId,
+          buildCodexCompletionCard(deliveryEvent),
+          'interactive',
+          codexNotifierMessageUuid(event.eventId),
+          {
+            timeoutMs: CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+            signal,
+          },
+        ),
+      );
+      store.updateDelivery(event.eventId, { status: 'delivered', messageId, incrementAttempts: false });
+      return { status: 'accepted', messageId };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      store.updateDelivery(event.eventId, {
+        status: 'failed',
+        lastError: detail,
+        incrementAttempts: false,
+      });
+      throw error;
+    }
+  })();
+  codexNotifierDeliveries.set(deliveryKey, delivery);
+  try {
+    return await delivery;
+  } finally {
+    codexNotifierDeliveries.delete(deliveryKey);
+  }
+}
+
+/**
+ * P1 revalidation for the Codex-notifier「继续处理」takeover. After the dynamic
+ * import + AbortSignal await inside adoptCodexNotifierEvent, a concurrent path may
+ * have moved the ground: a `/relay` transfer opened its input gate (the starter
+ * would then fail-closed with a bare `return` our no-op sessionReply swallows,
+ * and the outer handler would render a bogus green「已接管」over a half-rewritten
+ * session), or the session was /close'd / swapped / re-created under this key.
+ * Returns true when the takeover MUST abort before mutating any state — so the
+ * caller can throw with zero side effects and no buffered input dropped.
+ */
+function notifierAdoptStaleOrTransferring(
+  ds: DaemonSession,
+  sessions: Map<string, DaemonSession>,
+  activeKey: string,
+  genSessionId: string,
+): boolean {
+  return (
+    sessions.get(activeKey) !== ds
+    || ds.session.sessionId !== genSessionId
+    || ds.session.status !== 'active'
+    || isSessionTransferring(ds)
+  );
+}
+
+/**
+ * P2 predicate: would clearPendingRepoStateForNotifierAdopt drop user input that
+ * was accepted but not yet delivered to the CLI? Two DISTINCT windows with
+ * different gating — do NOT collapse them:
+ *
+ *  (1) repo-select pending buffer — ONLY meaningful while pendingRepo===true.
+ *      pendingPrompt / pendingCodexAppText / pendingAttachments / pendingFollowUps
+ *      are the message stashed for the deferred post-repo-selection fork. But the
+ *      pinned/defaultWorkingDir immediate-launch path (daemon.ts ~16031/17325)
+ *      ALSO seeds these same mirror fields, then forks and clears only
+ *      pendingTurnId (~16097/17387) — leaving pendingPrompt/etc behind on an
+ *      already-delivered session with pendingRepo=false. Gating on pendingRepo
+ *      here is what stops us from warning "message not delivered, resend" about
+ *      a prompt the worker already ran (which would make the user re-run a
+ *      non-idempotent command).
+ *
+ *  (2) just-committed launch window — INDEPENDENT of pendingRepo. commitRepoSelection
+ *      set pendingRepo=false and forked, but pendingRawInput / pendingFollowUpInput
+ *      still wait on the new worker's prompt_ready to actually send. These are the
+ *      only fields that legitimately represent undelivered input while
+ *      pendingRepo=false, so they are checked unconditionally. (The immediate-launch
+ *      path never populates them — it forks with the prompt as a direct argument.)
+ */
+function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
+  const repoSelectBuffered = ds.pendingRepo === true && (
+    (ds.pendingPrompt?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+    || (ds.pendingAttachments?.length ?? 0) > 0
+    || (ds.pendingCodexAppText?.trim().length ?? 0) > 0
+  );
+  // Undelivered regardless of pendingRepo (awaiting prompt_ready on a forked worker).
+  const undeliveredLaunchInput =
+    (ds.pendingRawInput?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUpInput?.cliInput?.trim().length ?? 0) > 0;
+  return repoSelectBuffered || undeliveredLaunchInput;
+}
+
+/**
+ * Fully retire an in-memory repo-select placeholder when the Codex-notifier
+ * 「继续处理」callback takes over the DM session. The legacy inline clear only
+ * reset six fields and left `repoCardMessageId`, `pendingFollowUps`,
+ * `pendingRepoCommitInFlight`, `worktreeCreating`, attachments, mentions, raw
+ * input, etc. behind — a stale repo-card click or a late auto-worktree
+ * completion could then act on the just-adopted session. Clear the whole
+ * pending-repo surface so no residue survives the takeover. Buffered/undelivered
+ * user input (repo-select buffer AND the pendingRawInput/pendingFollowUpInput a
+ * just-committed session is still waiting to send on prompt_ready) is dropped
+ * here — the drop is terminal (never rolled back, since concurrent background
+ * tasks may already have observed pendingRepo=false); the caller tells the user
+ * their input was cancelled on both the success and failure card.
+ */
+function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
+  ds.pendingRepo = false;
+  ds.pendingRepoCommitInFlight = false;
+  ds.worktreeCreating = false;
+  ds.repoCardMessageId = undefined;
+  ds.pendingPrompt = undefined;
+  ds.pendingTurnId = undefined;
+  ds.pendingRawInput = undefined;
+  ds.pendingRawTurnId = undefined;
+  ds.pendingFollowUpInput = undefined;
+  ds.pendingAttachments = undefined;
+  ds.pendingMentions = undefined;
+  ds.pendingSubstituteTrigger = undefined;
+  ds.pendingSubstituteControlCard = undefined;
+  ds.pendingSender = undefined;
+  ds.pendingFollowUps = undefined;
+  ds.pendingFollowUpTurnId = undefined;
+  ds.pendingCodexAppText = undefined;
+  ds.pendingCodexAppApplicationContext = undefined;
+  ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingCodexAppFollowUps = undefined;
+  ds.pendingCodexAppFollowUpContexts = undefined;
+}
+
+async function adoptCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+  cardMessageId: string,
+  ownerOpenId: string,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<Record<string, unknown>> {
+  signal.throwIfAborted();
+  const chatId = await getMessageChatId(larkAppId, cardMessageId, {
+    timeoutMs: remainingCodexNotifierDeadline(
+      deadlineAt,
+      CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS,
+    ),
+    signal,
+  });
+  if (!chatId) throw new Error('无法定位完成通知所在的飞书私聊');
+  signal.throwIfAborted();
+
+  const botCfg = getBot(larkAppId).config;
+  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'thread' ? 'thread' : 'chat';
+  const anchor = scope === 'chat' ? chatId : cardMessageId;
+  const activeKey = sessionKey(anchor, larkAppId);
+  let ds = activeSessions.get(activeKey);
+
+  if (!ds) {
+    const fallbackTitle = event.cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'Codex App';
+    const title = (event.title || `Codex App: ${fallbackTitle}`).slice(0, 50);
+    const session = sessionStore.createSession(chatId, cardMessageId, title, 'p2p');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = scope;
+    session.ownerOpenId = ownerOpenId;
+    session.lastCallerOpenId = ownerOpenId;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = event.cwd;
+    session.cliId = 'codex-app';
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    ds = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'p2p',
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: event.cwd,
+      ownerOpenId,
+    };
+    if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
+      await closeSessionHelper(session.sessionId);
+      throw new Error('通知所在会话路由被一条待处理的持久会话占用');
+    }
+  }
+
+  // Transfer guard OUTSIDE the launch branch. If the session is already on the
+  // target thread with a live worker, the branch below is skipped entirely —
+  // but a concurrent /relay could still be moving this session's routing away.
+  // Returning a green「已接管，可继续」while the route is migrating is a lie.
+  // Fail-closed here first (a freshly-created ds has no transfer gate, so this
+  // is a no-op for the new-session path); the launch branch keeps its own
+  // post-await revalidation for the drift that can open during its awaits.
+  if (isSessionTransferring(ds)) {
+    throw new Error('该会话正在转移，暂时无法接管；请转移完成后在完成通知卡上重试');
+  }
+
+  let bufferedInputDropped = false;
+  // Snapshot the session identity BEFORE the throwable/deadline-bound awaits
+  // below. If the session is closed, swapped, or re-created under this active
+  // key while we await, the post-await revalidation must detect the drift.
+  const adoptGenSessionId = ds.session.sessionId;
+  if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
+    // Do the two throwable, deadline-sensitive steps FIRST, before mutating any
+    // session/pending state: the dynamic import and the 2.2s AbortSignal check.
+    // If either fails here nothing has been touched, so no rollback is needed
+    // and the buffered repo-select input is left intact for a retry.
+    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
+    signal.throwIfAborted();
+
+    // Re-validate AFTER the awaits and BEFORE mutating anything (see
+    // notifierAdoptStaleOrTransferring): a concurrent /relay transfer or a
+    // /close/swap/re-create under this key must fail the takeover explicitly
+    // rather than half-rewrite the session and report a bogus green success.
+    if (notifierAdoptStaleOrTransferring(ds, activeSessions, activeKey, adoptGenSessionId)) {
+      throw new Error('该会话正在转移或已变更，无法接管；请稍后在完成通知卡上重试');
+    }
+
+    // 接管原生 Codex App 线程时固定为纯 codex-app 启动，不能继承通知 Bot 的
+    // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
+    ds.session.cliId = 'codex-app';
+    ds.session.cliPathOverride = botCfg.cliPathOverride;
+    delete ds.session.wrapperCli;
+    delete ds.session.model;
+    ds.session.agentFrozen = true;
+    sessionStore.updateSession(ds.session);
+
+    // 默认 flat DM(p2pMode=chat)下这条按钮回调复用同一私聊的现有会话。若该会话
+    // 恰好停在「待选仓库」挂起态且已缓冲一条尚未提交的输入，接管会消费掉
+    // pendingRepo(#669 的守卫要求接管前 pendingRepo 必须为 false)。旧逻辑只清了
+    // 部分字段并静默丢弃缓冲输入。这里完整清空全部 pending 状态(否则残留的
+    // repoCardMessageId/pendingFollowUps/worktreeCreating 等会让旧选仓卡二次点击、
+    // 迟到 auto-worktree 完成误操作已接管会话——见 runAutoWorktreeCommit 的
+    // pendingRepo 护栏),并记录「缓冲输入已丢弃」以便如实告知用户。
+    //
+    // 不做 pending 快照回滚:clear 之后 startCodexAppThreadSession 的 async guard
+    // 会让出微任务,迟到 auto-worktree / 正在 prepare 的 commit 可能已观察到
+    // pendingRepo=false 而正常结束并在 finally 清掉 in-flight 标志;此时若把
+    // pendingRepo=true/worktreeCreating=true 快照复活,后台任务已不在,会话会永久
+    // 卡在「正在创建/提交」。因此丢弃一旦发布即为终态——用「取消并请重发」的显式
+    // 语义告知用户,而非假装能恢复。
+    // 判断是否有「已收下但尚未真正送达 CLI」的用户输入会被下面的 clear 抹掉
+    // (见 notifierAdoptWouldDropInput:repo-select 镜像字段只在 pendingRepo===true
+    // 计入——立即启动路径也播种这些字段但已 fork 送达,不能误判;pendingRawInput/
+    // pendingFollowUpInput 独立于 pendingRepo,覆盖选仓刚提交等 prompt_ready 的启动窗)。
+    // 有则记录已丢弃,如实告知用户。
+    bufferedInputDropped = notifierAdoptWouldDropInput(ds);
+    clearPendingRepoStateForNotifierAdopt(ds);
+
+    // 完成事件已经携带恢复所需的原生 threadId/cwd。按钮回调不再额外启动一次
+    // app-server 做非必要的元数据刷新，避免子进程把飞书回调拖过截止时间。
+    const target = {
+      threadId: event.threadId,
+      name: event.title,
+      preview: event.finalPreview ?? '',
+      cwd: event.cwd,
+      status: event.status,
+    };
+
+    try {
+      await startCodexNotifierAdoptionSession(
+        startCodexAppThreadSession,
+        target,
+        ds,
+        {
+          activeSessions,
+          sessionReply,
+          getActiveCount,
+          lastRepoScan,
+        },
+        larkAppId,
+        cardMessageId,
+      );
+    } catch (err) {
+      // 接管失败/超时:pending 已清空且不回滚(见上)。若曾丢弃过缓冲/未送达输入,把「已取消、
+      // 请重发」前置到抛给外层的错误里——外层用它渲染失败卡,用户就不会以为原消息还
+      // 在队列里等着(否则失败卡只说"接管失败请重试",缓冲却已没了=静默丢失)。
+      if (bufferedInputDropped) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`你此前发送但尚未送达的消息已取消，请在接管成功后重新发送。（接管未完成：${detail}）`);
+      }
+      throw err;
+    }
+  }
+
+  const baseAdoptNotice = scope === 'chat'
+    ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
+    : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。';
+  return buildCodexNotifierResultCard(
+    '已接管 Codex App 任务',
+    bufferedInputDropped
+      ? `⚠️ 你此前发送但尚未送达的消息未随本次接管发送，请重新发送一次。\n\n${baseAdoptNotice}`
+      : baseAdoptNotice,
+    'green',
+  );
+}
+
+export const __testOnly_notifierAdoptStaleOrTransferring = notifierAdoptStaleOrTransferring;
+export const __testOnly_notifierAdoptWouldDropInput = notifierAdoptWouldDropInput;
+export const __testOnly_clearPendingRepoStateForNotifierAdopt = clearPendingRepoStateForNotifierAdopt;
+export const __testOnly_adoptCodexNotifierEvent = adoptCodexNotifierEvent;
+
+const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
+  getExpectedOwnerOpenId: larkAppId =>
+    getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId),
+  getEventRecord: (larkAppId, eventId) => codexNotifierStore(larkAppId).get(eventId),
+  readConfig: () => readGlobalConfig().codexNotifier,
+  openAppThread: openCodexAppThread,
+  adoptEvent: adoptCodexNotifierEvent,
+  runWithAbortDeadline,
+  isAbortDeadlineError: error => error instanceof AbortDeadlineError,
+  adoptionTimeoutMs: CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS,
+  logInfo: message => logger.info(message),
+  logWarn: message => logger.warn(message),
+  logError: message => logger.error(message),
+});
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
+  codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -4092,6 +4701,16 @@ const cardDeps: CardHandlerDeps = {
       `[v3-distillation:${proposalId}] card action failed: ` +
       stableV3DistillationErrorCode(err),
     ),
+  },
+  // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
+  // replayMessageEvent 由 startLarkEventDispatcher 内部注入到 handlers 上。
+  replayGrantedMessage: (data, larkAppId) => {
+    const handlers = botHandlers.get(larkAppId);
+    if (!handlers?.replayMessageEvent) {
+      logger.warn(`replayGrantedMessage: no handlers/replayMessageEvent for ${larkAppId}`);
+      return;
+    }
+    handlers.replayMessageEvent(data);
   },
 };
 
@@ -4526,6 +5145,18 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       detail: 'meeting receiver asks are not an idempotent managed action',
     });
   }
+  // No-transport session (apiOnly bot or HTTP virtual chat): `botmux ask` posts
+  // an interactive Lark card and blocks the turn on a human click — impossible
+  // without a real Feishu chat. Fail fast with `unsupported` instead of letting
+  // it fall into the Lark dispatcher and hang the agent on a card that can never
+  // render. (Structured HTTP awaiting_input is a separate, future capability.)
+  if (askSession && !larkTransportEnabled({ chatId: askSession.chatId, apiOnly: getBot(askSession.larkAppId).config.apiOnly })) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'unsupported',
+      detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
+    });
+  }
 
   // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
   // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
@@ -4570,7 +5201,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         } else {
           navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
         }
-        cocoDs.worker.send({ type: 'coco_drive_picker', navKeys, needsReviewSubmit, comment } as DaemonToWorker);
+        sendWorkerSessionInput(cocoDs, {
+          type: 'coco_drive_picker',
+          navKeys,
+          needsReviewSubmit,
+          comment,
+        });
         logger.info(`[${cocoDs.session.sessionId.slice(0, 8)}] CoCo picker drive: ${navKeys.length} keys, review=${needsReviewSubmit}, comment=${comment ? 'yes' : 'no'}`);
       } catch (err) {
         logger.warn(`CoCo picker drive failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -4700,14 +5336,122 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   if (ds?.worker) {
+    const requestId = randomUUID();
+    const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, requestId } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
+      cancelSessionReadyAck(requestId);
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const acknowledged = await ack;
+    if (!acknowledged) {
+      logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
     }
   }
   return jsonRes(res, 200, { ok: true });
+});
+
+async function respondCodexNotifierIngress(
+  res: import('node:http').ServerResponse,
+  larkAppId: string,
+  rawEvent: unknown,
+  pluginId?: string,
+): Promise<void> {
+  if (!codexNotifierIngressEnabled(larkAppId, pluginId === CODEX_NOTIFIER_PLUGIN_ID)) {
+    return jsonRes(res, 403, { ok: false, error: 'codex_notifier_disabled' });
+  }
+  let event: CodexTaskCompletedEvent;
+  try {
+    event = pluginId === undefined
+      ? parseCodexNotifierEvent(rawEvent)
+      : parseCodexNotifierPluginEvent(pluginId, rawEvent);
+  } catch (error) {
+    const code = error instanceof CodexNotifierEventValidationError
+      ? error.code
+      : 'invalid_event';
+    return jsonRes(res, 400, { ok: false, error: code });
+  }
+
+  try {
+    const result = await deliverCodexNotifierEvent(larkAppId, event);
+    return jsonRes(res, 200, { ok: true, status: result.status, messageId: result.messageId });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail === 'codex_notifier_event_id_conflict') {
+      return jsonRes(res, 409, { ok: false, error: 'event_id_conflict' });
+    }
+    logger.warn(`[codex-notifier] delivery failed event=${event.eventId.slice(0, 12)}: ${detail}`);
+    return jsonRes(res, 502, { ok: false, error: 'delivery_failed' });
+  }
+}
+
+// ─── 内建 Codex 完成事件入口 ────────────────────────────────────────────────
+// Dashboard 单例 worker 持有可靠 outbox，通过 host HMAC 投递到入队时选定的 Bot。
+ipcRoute('POST', '/api/codex-notifier/events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  let item;
+  try {
+    item = parseCodexNotifierOutboxItem(raw);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_outbox_item' });
+  }
+  if (item.targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, materializeCodexNotifierOutboxEvent(item));
+});
+
+// 旧独立插件的兼容入口保留一个迁移周期，只负责排空已经落盘的历史 outbox。
+ipcRoute('POST', '/api/plugin-events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!hasExactSafeJsonKeys(raw, ['pluginId', 'targetBotAppId', 'event'])) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_body' });
+  }
+  const {
+    pluginId,
+    targetBotAppId,
+    event: rawEvent,
+  } = raw;
+  if (pluginId !== CODEX_NOTIFIER_PLUGIN_ID) {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_plugin' });
+  }
+  if (targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, rawEvent, pluginId);
 });
 
 // ─── hooks emit 转发端点 ────────────────────────────────────────────────────
@@ -5220,8 +5964,15 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
 });
 
 function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig | undefined {
-  const cfg = getBot(larkAppId)?.config.vcMeetingAgent;
-  return cfg?.enabled === true ? cfg : undefined;
+  // Delegate to the pure predicate (bot-registry) so the apiOnly fail-close and the
+  // enabled check live in ONE tested place. apiOnly (core-only) bots have no Feishu
+  // connection — a VC listener drives `lark-cli vc +meeting-events --as bot`, which
+  // breaks the zero-Feishu-network contract. This accessor gates every VC entry
+  // (config read / event fetch / sync) INCLUDING the boot-time
+  // `restoreVcMeetingRuntimeSessionsForBot`, whose call site sits OUTSIDE the
+  // `!cfg.apiOnly` boot block — so a migrated bots.json (normal VC bot flipped to
+  // apiOnly, stale runtime record on disk) can no longer re-spawn lark-cli at boot.
+  return vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
 }
 
 function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | undefined {
@@ -6534,6 +7285,8 @@ type VcMeetingConsumerSelectionApplyOptions = {
   /** Only the authenticated recovery-card path may resume the same legacy
    * member after `meeting_ended`; ordinary ended selections stay fenced. */
   allowClosingRecovery?: boolean;
+  /** Per-meeting context for profiles newly activated by this selection. */
+  activationContext?: string;
 };
 
 /** Publish a membership mutation before its first await. Meeting close uses
@@ -9255,10 +10008,33 @@ function vcMeetingRuntimeAgentForProfile(
     ...(opts.activationError ? { activationError: opts.activationError.slice(0, 500) } : {}),
     ...(filter ? { filter } : {}),
     responseMode: profile.responseMode,
+    listenerPlacement: profile.listenerDelivery?.placement ?? 'auto',
     capabilities: vcMeetingCanonicalProfileCapabilities(profile),
     ownedSinks: vcMeetingCanonicalProfileOwnedSinks(profile),
     deliveryProfileHash: opts.deliveryProfileHash ?? vcMeetingConsumerProfileHash(profile),
   };
+}
+
+function vcMeetingProfileWithActivationContext(
+  profile: VcMeetingConsumerProfileConfig,
+  activationContext: string | undefined,
+): VcMeetingConsumerProfileConfig {
+  if (!activationContext) return profile;
+  const contextSection = [
+    '本次会议补充说明（仅适用于本次会议，不修改角色预设）：',
+    activationContext,
+  ].join('\n');
+  const combined = profile.instructions
+    ? `${profile.instructions}\n\n${contextSection}`
+    : contextSection;
+  const normalized = normalizeVcMeetingProfileInstructions(combined);
+  if (!normalized.ok || !normalized.instructions) {
+    throw new Error(
+      `profile ${profile.id} 的预设职责与本次会议补充说明无法合并：`
+      + `${normalized.ok ? '内容为空' : normalized.error}`,
+    );
+  }
+  return { ...profile, instructions: normalized.instructions };
 }
 
 /** Rehydrate the exact immutable profile snapshot selected for this member
@@ -9275,6 +10051,9 @@ function vcMeetingProfileFromRuntimeAgent(
     ...(selected.instructions ? { instructions: selected.instructions } : {}),
     ...(selected.filter ? { filter: selected.filter } : {}),
     responseMode: selected.responseMode,
+    ...(selected.listenerPlacement !== 'auto'
+      ? { listenerDelivery: { placement: selected.listenerPlacement } }
+      : {}),
     capabilities: [...selected.capabilities],
     ...(selected.ownedSinks.length > 0 ? { ownedSinks: [...selected.ownedSinks] } : {}),
   };
@@ -9359,6 +10138,7 @@ async function ensureVcMeetingProfileMember(
     && JSON.stringify(prior.ownedSinks) === JSON.stringify(canonicalOwnedSinks);
   const samePolicy = sameStreamSemantics
     && prior.responseMode === profile.responseMode
+    && prior.outputPlacement === (profile.listenerDelivery?.placement ?? 'auto')
     && JSON.stringify(prior.capabilities) === JSON.stringify(canonicalCapabilities)
     && sameOwnedSinks;
   // Receiver registration commits before the hub projection. A crash in that
@@ -9375,6 +10155,7 @@ async function ensureVcMeetingProfileMember(
     && receiverPrior.instructions === instructions
     && receiverPrior.outputChatId === listenerChatId
     && receiverPrior.responseMode === profile.responseMode
+    && receiverPrior.outputPlacement === (profile.listenerDelivery?.placement ?? 'auto')
     && JSON.stringify(receiverPrior.filter ?? {}) === JSON.stringify(canonicalFilter ?? {})
     && JSON.stringify(receiverPrior.capabilities) === JSON.stringify(canonicalCapabilities)
     && JSON.stringify(receiverPrior.ownedSinks) === JSON.stringify(canonicalOwnedSinks)
@@ -9442,7 +10223,10 @@ async function ensureVcMeetingProfileMember(
       responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
       ...policy,
     },
-    outputRoute: { chatId: orphanedReceiver?.outputChatId ?? listenerChatId },
+    outputRoute: {
+      chatId: orphanedReceiver?.outputChatId ?? listenerChatId,
+      placement: orphanedReceiver?.outputPlacement ?? profile.listenerDelivery?.placement ?? 'auto',
+    },
   };
   const receiver = await postVcMeetingMemberProjection(profile.agentAppId, projection);
   const body = vcMeetingResponseRecord(receiver.body);
@@ -9474,6 +10258,7 @@ async function ensureVcMeetingProfileMember(
     membershipGeneration,
     status: 'active',
     responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
+    outputPlacement: orphanedReceiver?.outputPlacement ?? profile.listenerDelivery?.placement ?? 'auto',
     ...policy,
     joinedAtIngestSeq,
     receiverSessionId,
@@ -9592,6 +10377,7 @@ async function pauseVcMeetingSingleConsumerMembership(
     membershipGeneration,
     status: 'paused',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     joinedAtIngestSeq: prior.joinedAtIngestSeq,
     receiverSessionId: prior.receiverSessionId,
     outputChatId: prior.outputChatId,
@@ -9616,7 +10402,7 @@ async function pauseVcMeetingSingleConsumerMembership(
       joinedAtIngestSeq: prior.joinedAtIngestSeq,
       responseMode: prior.responseMode,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   });
   const body = vcMeetingResponseRecord(receiver.body);
   if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
@@ -9668,6 +10454,7 @@ async function pauseVcMeetingProfileMembership(
     membershipGeneration,
     status: 'paused',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: prior.joinedAtIngestSeq,
     receiverSessionId: prior.receiverSessionId,
@@ -9694,7 +10481,7 @@ async function pauseVcMeetingProfileMembership(
       responseMode: prior.responseMode,
       ...policy,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   });
   const body = vcMeetingResponseRecord(receiver.body);
   if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
@@ -9731,6 +10518,7 @@ function retireVcMeetingSingleConsumerForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
     outputChatId: member.outputChatId,
@@ -9752,6 +10540,7 @@ function retireVcMeetingSingleConsumerForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
     outputChatId: member.outputChatId,
@@ -9803,6 +10592,7 @@ function retireVcMeetingProfileMemberForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
@@ -9826,6 +10616,7 @@ function retireVcMeetingProfileMemberForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
@@ -10020,6 +10811,7 @@ function vcMeetingProfileMemberSemanticsMatchRuntime(
     && member.outputChatId === listenerChatId
     && member.deliveryProfileHash === selected.deliveryProfileHash
     && member.responseMode === selected.responseMode
+    && (member.outputPlacement ?? 'auto') === selected.listenerPlacement
     && JSON.stringify(member.filter ?? {}) === JSON.stringify(selected.filter ?? {})
     && JSON.stringify(member.capabilities) === JSON.stringify(selected.capabilities)
     && JSON.stringify(member.ownedSinks) === JSON.stringify(selected.ownedSinks);
@@ -10062,6 +10854,7 @@ function refreshVcMeetingProfileOwnerBoot(session: VcMeetingDaemonSession): bool
         joinedAtIngestSeq: member.joinedAtIngestSeq,
         receiverSessionId: member.receiverSessionId,
         outputChatId: member.outputChatId,
+        outputPlacement: member.outputPlacement ?? 'auto',
       });
       if (!applied.ok) throw new Error(`receiver ${member.memberId}: ${applied.reason}`);
     }
@@ -10086,6 +10879,7 @@ function refreshVcMeetingProfileOwnerBoot(session: VcMeetingDaemonSession): bool
         membershipGeneration: member.membershipGeneration,
         status: member.status,
         responseMode: member.responseMode,
+        outputPlacement: member.outputPlacement ?? 'auto',
         ...policy,
         joinedAtIngestSeq: member.joinedAtIngestSeq,
         receiverSessionId: member.receiverSessionId,
@@ -11395,7 +12189,7 @@ async function removeVcMeetingProfileMember(
       ownedSinks: prior.ownedSinks,
       sinkOwnerGeneration: prior.sinkOwnerGeneration,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   };
   const receiver = await postVcMeetingMemberProjection(prior.agentAppId, projection);
   const body = vcMeetingResponseRecord(receiver.body);
@@ -11416,6 +12210,7 @@ async function removeVcMeetingProfileMember(
     membershipGeneration,
     status: 'removed',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     ...(prior.filter ? { filter: prior.filter } : {}),
     capabilities: prior.capabilities,
     ownedSinks: prior.ownedSinks,
@@ -11649,7 +12444,9 @@ async function applyVcMeetingConsumerProfileSelection(
     );
     const requestedProfiles = resolution.selectedProfiles.map((profile) => {
       const existing = existingByProfileId.get(profile.id);
-      return existing ? vcMeetingProfileFromRuntimeAgent(existing) : profile;
+      return existing
+        ? vcMeetingProfileFromRuntimeAgent(existing)
+        : vcMeetingProfileWithActivationContext(profile, opts.activationContext);
     });
     const retainedAfterRemovalFailure: VcMeetingRuntimeSelectedAgent[] = [];
     const removalErrors: string[] = [];
@@ -11742,6 +12539,7 @@ async function applyVcMeetingConsumerProfileSelection(
     session.consumerSelectionApplying = false;
     session.consumerPendingProfileIds = undefined;
     session.consumerPendingIntervalMs = undefined;
+    session.consumerPendingActivationContext = undefined;
   }
 }
 
@@ -11909,13 +12707,14 @@ async function applyVcMeetingConsumerProfileStagedState(
   const selectedProfileIds = session.consumerPendingProfileIds
     ?? (fallbackProfileIds ? [...fallbackProfileIds] : undefined);
   const stagedIntervalMs = session.consumerPendingIntervalMs;
+  const activationContext = session.consumerPendingActivationContext;
   if (stagedIntervalMs) session.syncIntervalMs = stagedIntervalMs;
   let result = await applyVcMeetingConsumerProfileSelection(
     key,
     session,
     cfg,
     selectedProfileIds,
-    opts,
+    { ...opts, ...(activationContext ? { activationContext } : {}) },
   );
   if (!result.ok && selectedProfileIds === undefined && session.consumerMode === 'pending') {
     // A conflicting/invalid hand-edited default must never leave a pending
@@ -13796,6 +14595,11 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
           session.consumerSelectionApplying = false;
         }
       }
+      const activationContext = vcMeetingActivationContextFromCard(data);
+      if (!activationContext.ok) {
+        return { toast: { type: 'error', content: activationContext.error } };
+      }
+      session.consumerPendingActivationContext = activationContext.context;
       return applyVcMeetingConsumerSelectionInBackground(
         key,
         session,
@@ -14428,7 +15232,22 @@ async function resolvePinnedWorkingDir(ctx: {
   chatId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  listenerWorkingDir?: string;
 }) {
+  if (ctx.listenerWorkingDir) {
+    const resolved = expandHome(ctx.listenerWorkingDir);
+    try {
+      if (statSync(resolved).isDirectory()) {
+        return {
+          pinnedWorkingDir: resolved,
+          oncallEntry: undefined,
+          inheritedFrom: null,
+          pinnedFromBotDefault: false,
+        };
+      }
+    } catch { /* fall through to normal resolution */ }
+    logger.warn(`[message-listener:${ctx.larkAppId}] listener workingDir invalid (${resolved}); falling back to normal resolution`);
+  }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
@@ -14512,6 +15331,10 @@ async function replyInvalidWorkingDirs(
   ds.pendingRepo = false;
   activeSessions.delete(sessionKey(anchor, larkAppId));
   sessionStore.closeSession(ds.session.sessionId);
+  publishClosedSessionPatch(
+    ds.session.sessionId,
+    ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+  );
   const msg = tr('cmd.repo.working_dir_not_exist', {
     dirs: invalid.map(d => `\`${d}\``).join(', '),
   }, localeForBot(larkAppId));
@@ -14524,6 +15347,69 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
   return resolveAdapterDefaultPassthroughCommands(larkAppId).includes(cmd);
 }
 
+/** Preserve the established mid-session passthrough semantics when a cold-start
+ * scratch loses its registration race to a concurrently-created real session. */
+function deliverPassthroughToExistingSession(
+  ds: DaemonSession,
+  cmd: string,
+  commandContent: string,
+  anchor: string,
+  larkAppId: string,
+  turn: {
+    messageId: string;
+    replyRootId?: string;
+    senderOpenId?: string;
+    senderIsBot: boolean;
+    substitute: boolean;
+  },
+): void {
+  if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
+    // Passthrough commands bypass the normal message-forwarding block, so bind
+    // the accepted Lark turn before the worker rotates its marker at the PTY
+    // write boundary. This helper also covers a cold-start registration race.
+    ds.session.quoteTargetId = turn.messageId;
+    ds.session.quoteTargetSenderOpenId = turn.senderOpenId;
+    ds.session.quoteTargetSenderIsBot = turn.senderIsBot;
+    const substituteReplyMode = turn.substitute
+      ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+      : 'thread';
+    beginReplyTargetTurn(ds, turn.replyRootId, turn.messageId, new Date().toISOString(), {
+      quoteOnly: substituteReplyMode === 'quote',
+      substitute: turn.substitute,
+    });
+    if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
+      ds.session.lastCallerOpenId = turn.senderOpenId;
+    }
+    sessionStore.updateSession(ds.session);
+    // Compatibility note (empty-start opening): a raw passthrough is a
+    // LITERAL CLI command — its contract is that the CLI sees exactly the
+    // bytes the user typed, never a botmux XML envelope. So it deliberately
+    // does NOT consume `Session.initialUserTurnPending`: wrapping `/model`
+    // in `<user_message>` would break the literal contract, and silently
+    // clearing the marker would lose the opening for the next real turn.
+    // `/model` on an empty-started session therefore stays literal and the
+    // FOLLOWING business message still opens as a new topic.
+    beginNewTurn(ds, commandContent);
+    sendWorkerSessionInput(ds, {
+      type: 'raw_input',
+      content: commandContent,
+      turnId: turn.messageId,
+    });
+    markSessionActivity(ds);
+    logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
+    return;
+  }
+  void sessionReply(
+    anchor,
+    tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+    'text',
+    larkAppId,
+  );
+}
+
+export const __testOnly_deliverPassthroughToExistingSession =
+  deliverPassthroughToExistingSession;
+
 async function startInitialPassthroughSession(args: {
   larkAppId: string;
   chatId: string;
@@ -14533,8 +15419,10 @@ async function startInitialPassthroughSession(args: {
   messageId: string;
   replyRootId?: string;
   parsed: LarkMessage;
+  cmd: string;
   commandContent: string;
   senderOpenId?: string;
+  substitute: boolean;
   /** Bot-locked union_id (quota gate's teamBot leg — bot senders only). */
   senderUnionId?: string;
   /** Raw sender union_id (quota gate's teamMember leg — may be a human). */
@@ -14546,20 +15434,31 @@ async function startInitialPassthroughSession(args: {
   ownerOpenId: string | undefined;
   ownerUnionId: string | undefined;
   creatorOpenId: string | undefined;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
 
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
   const directChatSender = chatType === 'p2p'
-    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
+    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId })
     : undefined;
+  // Group cold-start passthroughs only need a stable caller identity while the
+  // repo picker is pending. Avoid adding a contact lookup to every /goal start;
+  // an optional display name can be learned later from the normal cache path.
+  const initialPassthroughSender = directChatSender ?? (senderOpenId
+    ? {
+      openId: senderOpenId,
+      type: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'bot' as const : 'user' as const,
+    }
+    : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
   const now = Date.now();
@@ -14598,6 +15497,8 @@ async function startInitialPassthroughSession(args: {
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: '',
     pendingRawInput: commandContent,
+    pendingRawTurnId: messageId,
+    pendingSender: (!pinnedWorkingDir || autoWt) ? initialPassthroughSender : undefined,
     ownerOpenId,
     currentTurnTitle: commandContent.substring(0, 50),
     workingDir: pinnedWorkingDir,
@@ -14607,9 +15508,32 @@ async function startInitialPassthroughSession(args: {
     sessionStore.updateSession(ds.session);
   }
   beginReplyTargetTurn(ds, replyRootId, messageId);
-  rememberTurnCaller(ds, messageId, senderOpenId, undefined, parsed.senderType === 'app' || parsed.senderType === 'bot');
   sessionStore.updateSession(ds.session);
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  const creationKey = sessionKey(anchor, larkAppId);
+  if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
+    const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds);
+    if (winner) {
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] Initial passthrough registration lost to ` +
+        `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+      );
+      deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId, {
+        messageId,
+        replyRootId,
+        senderOpenId,
+        senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot',
+        substitute,
+      });
+    } else {
+      void sessionReply(
+        anchor,
+        tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    }
+    return;
+  }
 
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
@@ -14622,6 +15546,8 @@ async function startInitialPassthroughSession(args: {
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     rememberLastCliInput(ds, commandContent, commandContent);
+    // Raw passthrough gets its human turn only at the literal PTY write
+    // boundary (prompt_ready -> raw_input), never during CLI startup.
     forkWorker(ds, '', false);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -14672,7 +15598,7 @@ function mergeVcMeetingApplicationContext(
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -14759,9 +15685,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // operate），破坏「人绝不继承 bot 信任」的边界。旧联邦 team-bots 表结构上只收
   // bot（学习入口限 bot sender），这里对齐同一不变量。senderUnionId 本身保持原义
   //（人类会话的 ownerUnionId 还靠它）。
-  const teamTrustUnionId: string | undefined =
-    (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot') ? senderUnionId : undefined;
+  // 飞书盖章的 bot 发送方。既锁 union 信任腿（下面的 teamTrustUnionId），也决定
+  // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
+  // enforceMessageQuotaForCliInput 的 botSender 说明。
+  const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
+  const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
   const botCfg = getBot(larkAppId).config;
+  const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    parsed.content = listenerPrompt;
+    cmdContent = listenerPrompt;
+  }
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
   emitHookEvent('topic.new', {
     larkAppId,
@@ -14789,6 +15724,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
     memberUnionId: senderUnionId,
+    botSender: isBotSenderType,
   })) {
     return;
   }
@@ -14871,10 +15807,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           messageId,
           replyRootId,
           parsed,
+          cmd,
           commandContent,
           senderOpenId,
+          substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -14892,7 +15831,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // chat-granted users (who only pass canTalk) management commands like
       // /cd /restart /oncall bind. Previously this gate only fired in oncall chats,
       // which left a hole once per-chat grants flow through canTalk.
-      if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
+      // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
+      // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -14929,7 +15870,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         setDirectChatDisplayNameFromSender(
           session,
           chatType,
-          await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+          await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId }),
         );
       }
       session.larkAppId = larkAppId;
@@ -14955,7 +15896,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
       }
       sessionStore.updateSession(session);
-      activeSessions.set(sessionKey(anchor, larkAppId), {
+      const commandDs: DaemonSession = {
         session,
         worker: null,
         workerPort: null,
@@ -14970,14 +15911,25 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         hasHistory: false,
         ownerOpenId: senderOpenId,
         ...cmdPending,
-      });
+      };
+      const commandKey = sessionKey(anchor, larkAppId);
+      if (!setActiveSessionIfActive(activeSessions, commandKey, commandDs)) {
+        const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, commandDs);
+        if (!winner) return;
+        logger.info(
+          `[${session.sessionId.substring(0, 8)}] Daemon-command registration lost to ` +
+          `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+        );
+      }
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
+    listenerAuthorized: !!messageListener,
+  })) {
     return;
   }
 
@@ -15001,21 +15953,48 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const codexAppQuoteContext = ctx.forwardSeedData
     ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
-  const codexAppMessageContext = codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const promptContent = codexAppQuoteContext + codexAppApplicationContext + content;
+  // 普通群「对已有消息发起话题再 @」：入站是话题内回复（root_id 指向另一条更早
+  // 的话题根消息），bot 从未留存该话题历史，且正文里没有任何信号表明存在话题根+
+  // 前情。首轮注入一行 hint（非全文、零网络请求），提示 CLI 可用 `botmux history`
+  // 按需拉取话题历史（对齐 quote hint 的「提示+按需」模式，避免无条件全量预取+
+  // 下载所有历史附件+长话题只取最旧 50 条且把 50 当精确总数的问题）。gate 已证明
+  // 这是话题回复，无需再发网络探测。coalesced forward 已自带上下文不注入。仅首轮
+  // — 后续 handleThreadReply 回合 CLI 已在首轮拿到该 hint，不重复注入。
+  const topicThreadContext = (parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
+    ? buildTopicThreadContext(localeForBot(larkAppId))
+    : '';
+  // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
+  // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
+  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
+  const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+    larkAppId,
+    chatId,
+    chatType,
+    botCfg.cliId,
+    parsed.content,
+    parsed.mentions,
+  );
+  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+    listenerWorkingDir: messageListener?.workingDir,
+  });
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15030,9 +16009,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
-  const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
+  const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
+  const groupChatName = await groupChatNamePromise;
+  if (groupChatName) session.chatDisplayName = groupChatName;
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -15046,6 +16028,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+    parsed.content,
+    parsed.mentions,
+    groupChatName,
+  );
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -15073,6 +16060,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
+    pendingTurnId: messageId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -15082,7 +16070,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
-    currentTurnTitle: (ctx.forwardSeedData ? followupContent : content).substring(0, 50),
+    currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
   };
   if (pinnedWorkingDir) {
@@ -15093,9 +16081,31 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
-  rememberTurnCaller(ds, messageId, senderOpenId, undefined, parsed.senderType === 'app' || parsed.senderType === 'bot');
   sessionStore.updateSession(ds.session);
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  const creationKey = sessionKey(anchor, larkAppId);
+  if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
+    const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds);
+    if (winner) {
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] New-topic registration lost to ` +
+        `${winner.session.sessionId.substring(0, 8)}; handing message to routing winner`,
+      );
+      await handleThreadReply(
+        data,
+        { ...ctx, scope, anchor },
+        {
+          parsed,
+          resources,
+          attachments,
+          quotaChecked: true,
+          queueAlreadyAppended: true,
+          senderResolved: true,
+          sender: newTopicSender,
+        },
+      );
+    }
+    return;
+  }
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
@@ -15111,11 +16121,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -15144,11 +16154,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -15157,6 +16167,85 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 // for the same chat (reconnect replay / double-delivery) can't both spawn —
 // claimed synchronously before the first await, released in `finally` (FR-13).
 const autoStartJoinInFlight = new Set<string>();
+// A join candidate becomes visible in activeSessions before its seed/reply
+// target and synchronous bootstrap are ready. Inbound turns for that exact
+// routing key must wait; otherwise they can re-fork the worker-null session and
+// then be replaced by the join handler's own fork. Deferred pendingRepo /
+// auto-worktree paths release after publishing their stable buffered state.
+const AUTO_START_JOIN_READY_MAX_WAIT_MS = 5_000;
+let testOnlyAutoStartJoinReadyMaxWaitMs: number | undefined;
+
+interface AutoStartJoinReadyBarrier {
+  ready: Promise<void>;
+  cancelled: boolean;
+  settle: () => void;
+  cancel: () => void;
+}
+
+const autoStartJoinReadyBySessionKey = new Map<string, AutoStartJoinReadyBarrier>();
+
+function beginAutoStartJoinReadyBarrier(
+  routingKey: string,
+  onCancel: () => void,
+): AutoStartJoinReadyBarrier {
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  let settled = false;
+  let barrier!: AutoStartJoinReadyBarrier;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    resolveReady();
+    if (autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      autoStartJoinReadyBySessionKey.delete(routingKey);
+    }
+  };
+  const cancel = () => {
+    if (settled) return;
+    barrier.cancelled = true;
+    try {
+      onCancel();
+    } catch (err) {
+      logger.warn(`[auto-start:入群] bootstrap timeout cleanup failed for ${routingKey}: ${err}`);
+    } finally {
+      settle();
+    }
+  };
+  barrier = { ready, cancelled: false, settle, cancel };
+  autoStartJoinReadyBySessionKey.set(routingKey, barrier);
+  return barrier;
+}
+
+async function waitForAutoStartJoinReady(larkAppId: string, anchor: string): Promise<void> {
+  const routingKey = sessionKey(anchor, larkAppId);
+  while (true) {
+    const barrier = autoStartJoinReadyBySessionKey.get(routingKey);
+    if (!barrier) return;
+    const maxWaitMs = testOnlyAutoStartJoinReadyMaxWaitMs ?? AUTO_START_JOIN_READY_MAX_WAIT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      barrier.ready.then(() => 'ready' as const),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), maxWaitMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout' && autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      logger.warn(
+        `[auto-start:入群] bootstrap exceeded ${maxWaitMs}ms for ${anchor.substring(0, 12)}; ` +
+        `yielding registration to the waiting turn`,
+      );
+      barrier.cancel();
+    }
+  }
+}
+
+export function __testOnly_setAutoStartJoinReadyMaxWaitMs(value?: number): void {
+  testOnlyAutoStartJoinReadyMaxWaitMs = value;
+}
+
 // 主动开工 — 场景①: `${appId}:${chatId}` → the activeSessions key of the
 // auto-started join session. Needed because in a 话题群 the session is keyed at
 // the seed message id (not chatId), so a plain `activeSessions.has(chatId)`
@@ -15196,11 +16285,13 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
  * prompt is the configured prompt, or empty (the role/identity envelope still
  * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
  *
- * Scope is mode-aware: a 普通群 gets a chat-scope session anchored at chatId; a
- * 话题群 (topic mode) has no thread to attach to yet, so we seed a fresh topic
- * (a top-level message) and run a thread-scope session anchored at that seed —
- * otherwise a chat-scope session in a 话题群 is the known stale-session bug
- * (every reply would wrap into a new topic, and later messages route elsewhere).
+ * Scope is mode-aware: a 普通群 keeps a chat-scope session anchored at chatId.
+ * When its reply mode is shared, a top-level seed supplies the visible topic
+ * root while every turn still reuses that chat-scope session. A 话题群 has no
+ * thread to attach to yet, so it also seeds a fresh topic, but runs a
+ * thread-scope session anchored at that seed — otherwise a chat-scope session
+ * in a 话题群 is the known stale-session bug (every reply would wrap into a new
+ * topic, and later messages route elsewhere).
  */
 async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
@@ -15223,6 +16314,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
   }
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
+  let joinReady: AutoStartJoinReadyBarrier | undefined;
   try {
     // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
     // platforms (e.g. Nexus) create the chat, add bots first and the human
@@ -15278,6 +16370,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
+    const needsSharedReply = mode === 'group'
+      && resolveRegularGroupMode(larkAppId, chatId) === 'shared';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15313,8 +16407,112 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
+      pendingTurnId: undefined,
     };
-    activeSessions.set(dsKey, ds);
+    if (!setActiveSessionIfActive(activeSessions, dsKey, ds)) {
+      await closeSessionHelper(session.sessionId);
+      return;
+    }
+    const joinBootstrapExternallyTakenOver = (): boolean => (
+      activeSessions.get(dsKey) !== ds
+      || ds.session.status !== 'active'
+      || !!(ds.worker && !ds.worker.killed)
+    );
+    const joinBootstrapWasTakenOver = (): boolean => {
+      const takenOver = (
+        joinReady?.cancelled === true
+        || joinBootstrapExternallyTakenOver()
+      );
+      if (takenOver && ds.worker && !ds.worker.killed) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap 期间会话已由其它入口启动，让位且不再 refork`,
+        );
+      }
+      return takenOver;
+    };
+    // Publish the barrier only after this candidate wins registration. There is
+    // no await between the CAS and this write, so a turn can never observe the
+    // worker-null session without also observing the barrier. Publishing earlier
+    // would unnecessarily stall real messages during membership retry and
+    // mode/working-dir discovery, where their own session may safely win.
+    joinReady = beginAutoStartJoinReadyBarrier(dsKey, () => {
+      // Scheduler/dashboard/trigger paths do not wait on the inbound-message
+      // barrier and may legitimately start this exact ds while join bootstrap
+      // is awaiting Lark/network I/O. Once that happens, timeout cancellation
+      // must yield to the new worker instead of closing its active turn.
+      if (joinBootstrapExternallyTakenOver()) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap timeout 时会话已被接管，跳过候选回收`,
+        );
+        return;
+      }
+      // A user turn waited longer than the serializer's normal safety cap.
+      // Relinquish this half-bootstrapped registration instead of letting the
+      // turn fall back to the old "refork now, then get killed by late join"
+      // behavior. closeSessionHelper completes map/status/store mutation before
+      // its first await; the late best-effort cleanup must not hold the turn.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      void closing.catch((err) => {
+        logger.warn(`[auto-start:入群] timeout close failed for ${session.sessionId.substring(0, 8)}: ${err}`);
+      });
+    });
+    const rollbackRegisteredJoinSession = async (): Promise<void> => {
+      // closeSession transitions the row before its first await, but this
+      // handler owns a caller-supplied registry too. Drop only our identity so
+      // slow best-effort cleanup cannot block a retry or erase a replacement.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      await closing;
+    };
+
+    // Shared-mode seed/reply authority is externally visible. Publish it only
+    // after this candidate owns the routing key; a CAS loser must leave no
+    // orphaned "joined" topic and must not silently consume the first prompt.
+    let sharedReplyRootId: string | undefined;
+    const withdrawSharedReplySeed = (): void => {
+      if (!sharedReplyRootId) return;
+      const messageId = sharedReplyRootId;
+      sharedReplyRootId = undefined;
+      void deleteMessage(larkAppId, messageId);
+    };
+    const armSharedReplyTarget = (): void => {
+      if (!sharedReplyRootId) return;
+      ds.pendingTurnId = sharedReplyRootId;
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      sessionStore.updateSession(ds.session);
+    };
+    if (needsSharedReply) {
+      try {
+        sharedReplyRootId = await sendMessage(
+          larkAppId,
+          chatId,
+          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          'text',
+        );
+      } catch (err: any) {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 发送失败：${err?.message ?? err}`);
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      if (joinReady.cancelled) {
+        // The send may have reached Lark even though its response exceeded the
+        // local wait cap. Best-effort withdraw the now-ownerless shared seed.
+        withdrawSharedReplySeed();
+        return;
+      }
+      if (activeSessions.get(dsKey) !== ds || ds.session.status !== 'active') {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已被替换，停止首轮`);
+        withdrawSharedReplySeed();
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      if (ds.worker && !ds.worker.killed) {
+        withdrawSharedReplySeed();
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已由其它入口启动，让位`);
+        return;
+      }
+    }
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
     groupJoinAnchorByChat.set(chatLiveKey, dsKey);
@@ -15324,51 +16522,97 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
       undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds), codexAppText },
+      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, codexAppText },
     );
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId });
       return;
     }
 
     // Pinned working dir → spawn immediately.
     if (pinnedWorkingDir) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
 
     // No default dir → degrade to repo-selection card (D6 / FR-4).
-    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+      withdrawSharedReplySeed();
+      return;
+    }
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);
       const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      // The repo card itself belongs under the shared join seed. Arm the target
+      // immediately before its single network await; pendingRepo already makes
+      // this a stable buffered state for normal inbound/scheduler paths.
+      armSharedReplyTarget();
+      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      if (joinBootstrapWasTakenOver()) {
+        void deleteMessage(larkAppId, repoCardMessageId);
+        // If another entry actually started this same ds, its output still owns
+        // the shared seed we just armed. Preserve that root; closed/replaced
+        // candidates may withdraw it.
+        if (!ds.worker || ds.worker.killed) withdrawSharedReplySeed();
+        return;
+      }
+      ds.repoCardMessageId = repoCardMessageId;
       announcePendingRepoSession(ds);
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
     } else {
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
+    joinReady?.settle();
     autoStartJoinInFlight.delete(lockKey);
   }
 }
+
+export const __testOnly_handleBotAdded = handleBotAdded;
 
 /** Reverse-lookup a foreign bot's display name for a sender open_id observed on
  *  this app's WS events. Priority:
@@ -15402,18 +16646,41 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
-async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
+/**
+ * Work already completed by handleNewTopic (or an earlier auto-create pass)
+ * before its registration CAS lost to a concurrent session creator. Reusing
+ * it avoids a second quota/download/queue side effect when the same persisted-
+ * dedupe event is handed to the routing winner.
+ */
+interface PreparedThreadReply {
+  parsed: LarkMessage;
+  resources: MessageResource[];
+  attachments: LarkAttachment[];
+  quotaChecked: true;
+  queueAlreadyAppended: true;
+  senderResolved: true;
+  sender: ResolvedSender | undefined;
+}
+
+async function handleThreadReply(
+  data: any,
+  ctx: RoutingContext,
+  prepared?: PreparedThreadReply,
+): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
-  await resolveNonsupportMessage(data, larkAppId);
-  const { parsed, resources } = parseEventMessage(data);
+  await waitForAutoStartJoinReady(larkAppId, anchor);
+  if (!prepared) await resolveNonsupportMessage(data, larkAppId);
+  const parsedResult = prepared ?? parseEventMessage(data);
+  const parsed = parsedResult.parsed;
+  const resources = parsedResult.resources;
 
   // Expand merge_forward: fetch sub-messages and collect their resources
-  if (parsed.msgType === 'merge_forward') {
+  if (!prepared && parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
     resources.push(...extraResources);
   }
 
-  learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
@@ -15450,27 +16717,29 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     + parsed.content;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
-  emitHookEvent('thread.reply', {
-    larkAppId,
-    chatId: ctxChatId,
-    chatType: ctxChatType,
-    scope,
-    anchor,
-    messageId: parsed.messageId,
-    rootId: parsed.rootId,
-    parentId: parsed.parentId,
-    senderOpenId: senderOpenIdForPrefix,
-    senderType: parsed.senderType,
-    msgType: parsed.msgType,
-    sessionId: existingHookSession?.session.sessionId,
-    content: parsed.content,
-  });
-  if (isForeignBot) {
-    logger.info(
-      `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
-      `senderType=${parsed.senderType} via=${isBotSenderType ? 'sender_type' : 'cross-ref'}`,
-    );
+  if (!prepared) {
+    const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
+    emitHookEvent('thread.reply', {
+      larkAppId,
+      chatId: ctxChatId,
+      chatType: ctxChatType,
+      scope,
+      anchor,
+      messageId: parsed.messageId,
+      rootId: parsed.rootId,
+      parentId: parsed.parentId,
+      senderOpenId: senderOpenIdForPrefix,
+      senderType: parsed.senderType,
+      msgType: parsed.msgType,
+      sessionId: existingHookSession?.session.sessionId,
+      content: parsed.content,
+    });
+    if (isForeignBot) {
+      logger.info(
+        `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
+        `senderType=${parsed.senderType} via=${isBotSenderType ? 'sender_type' : 'cross-ref'}`,
+      );
+    }
   }
 
   // resolveSender is deferred until we know the message actually needs prompt
@@ -15478,8 +16747,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // anchor" all return early; routing them through resolveSender first would
   // tack the 800ms budget onto paths that never see the sender tag. Use the
   // helper below at every actual injection point.
-  let threadSenderCached: import('./im/lark/identity-cache.js').ResolvedSender | undefined;
-  let threadSenderResolved = false;
+  let threadSenderCached: ResolvedSender | undefined = prepared?.sender;
+  let threadSenderResolved = prepared?.senderResolved ?? false;
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
@@ -15487,7 +16756,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
-      isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
+      isForeignBot
+        ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined, messageId: parsed.messageId }
+        : { messageId: parsed.messageId },
     );
     return threadSenderCached;
   };
@@ -15495,18 +16766,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
-  const handoffSession = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (handoffSession?.pendingCodexFreshHandoff) {
-    await sessionReply(
-      anchor,
-      localeForBot(larkAppId) === 'en'
-        ? 'Codex context handoff is in progress. A fresh Codex session will continue in this topic shortly.'
-        : 'Codex 正在进行上下文交接，稍后会在当前话题内由全新会话继续。',
-      'text',
-      larkAppId,
-    );
-    return;
-  }
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -15573,6 +16832,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
+    botSender: isBotSenderType || isForeignBot,
   })) {
     return;
   }
@@ -15643,10 +16903,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           messageId: parsed.messageId,
           replyRootId,
           parsed,
+          cmd,
           commandContent,
           senderOpenId: threadSenderOpenId,
+          substitute: !!substituteTrigger,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType || isForeignBot,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -15663,58 +16926,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // 拉起）。TODO（后续产品决策）：是否把 CLI passthrough 也纳入 canOperate，
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
-      if (ds?.worker && !ds.worker.killed) {
-        // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
-        // shows up as a fresh streaming card instead of silently PATCH-ing the
-        // previous turn's card.
-        const effectiveCliId = ds.session.cliId ?? getBot(larkAppId).config.cliId;
-        if (shouldFreshHandoffCodex(effectiveCliId, commandContent)) {
-          if (ds.pendingCodexFreshHandoff) {
-            await sessionReply(
-              anchor,
-              localeForBot(larkAppId) === 'en'
-                ? 'A Codex handoff is already in progress.'
-                : 'Codex 上下文交接正在进行中，请稍候。',
-              'text',
-              larkAppId,
-            );
-            return;
-          }
-          ds.pendingCodexFreshHandoff = {
-            requestedAt: Date.now(),
-            requestId: randomUUID(),
-            reason: 'manual_compact',
-            interruptedUserGoal: ds.lastUserPrompt ?? ds.session.lastUserPrompt,
-            summaryTurnId: `codex-handoff-${randomUUID()}`,
-            phase: 'collecting',
-          };
-          persistCodexHandoff(ds);
-          beginNewTurn(ds, 'Codex Handoff Summary');
-          const pending = ds.pendingCodexFreshHandoff;
-          armCodexHandoffWatchdog(ds, pending);
-          try {
-            ds.worker.send({
-              type: 'raw_input',
-              content: commandContent,
-              followUpContent: CODEX_HANDOFF_SUMMARY_PROMPT,
-              followUpTurnId: pending.summaryTurnId,
-              followUpAfterIdle: true,
-            } as DaemonToWorker);
-          } catch (err) {
-            logger.warn(`[${tag(ds)}] Failed to send manual /compact handoff; using bounded fallback: ${err instanceof Error ? err.message : String(err)}`);
-            void migrateCodexHandoffToFreshSession(ds, fallbackCodexHandoffSummary(ds));
-          }
-          markSessionActivity(ds);
-          logger.info(`[${anchor.substring(0, 12)}] Codex /compact → fresh-session handoff armed`);
-          return;
-        }
-        beginNewTurn(ds, commandContent);
-        ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
-        markSessionActivity(ds);
-        logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
-      } else {
-        sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+      if (ds) {
+        deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
+          messageId: parsed.messageId,
+          replyRootId,
+          senderOpenId: threadSenderOpenId,
+          senderIsBot: isForeignBot,
+          substitute: !!substituteTrigger,
+        });
       }
+      else void sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -15730,7 +16951,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
-      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
+      // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
+      // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -15768,7 +16991,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
         }
         sessionStore.updateSession(session);
-        activeSessions.set(sessionKey(anchor, larkAppId), {
+        const threadCommandDs: DaemonSession = {
           session,
           worker: null,
           workerPort: null,
@@ -15783,7 +17006,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           hasHistory: false,
           ownerOpenId: threadSenderOpenId,
           ...cmdPending,
-        });
+        };
+        const commandKey = sessionKey(anchor, larkAppId);
+        if (!setActiveSessionIfActive(activeSessions, commandKey, threadCommandDs)) {
+          const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, threadCommandDs);
+          if (!winner) return;
+          logger.info(
+            `[${session.sessionId.substring(0, 8)}] Thread daemon-command registration lost to ` +
+            `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+          );
+        }
       }
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
@@ -15816,6 +17048,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           askId: pendingAsk.askId,
           by: threadSenderOpenId,
           text: askReplyText,
+          // Actor context so the broker's talk check uses the same predicate as
+          // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
+          // (covers team-拉群 with no union_id), a platform teamMember human →
+          // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
+          // to the plain evaluateTalk(openId, chatType).
+          actor: {
+            botSender: isBotSenderType || isForeignBot,
+            senderUnionId: threadTeamTrustUnionId,
+            memberUnionId: threadSenderUnionId,
+          },
         });
         if (outcome === 'accepted') {
           logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${threadSenderOpenId.substring(0, 12)}`);
@@ -15848,7 +17090,17 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType)) {
+  if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
+    larkAppId,
+    ctxChatId ?? data?.message?.chat_id,
+    quotaSenderOpenId,
+    parsed.messageId,
+    anchor,
+    threadTeamTrustUnionId,
+    threadSenderUnionId,
+    ctxChatType,
+    isBotSenderType || isForeignBot,
+  )) {
     return;
   }
 
@@ -15862,20 +17114,26 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
-  const { attachments, needLogin } = await downloadResources(effectiveAppId, parsed.messageId, resources);
-  if (attachments.length > 0) {
-    parsed.attachments = attachments;
-  }
-  if (needLogin) {
-    sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
+  let attachments: LarkAttachment[];
+  if (prepared) {
+    attachments = prepared.attachments;
+  } else {
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    attachments = downloaded.attachments;
+    if (attachments.length > 0) {
+      parsed.attachments = attachments;
+    }
+    if (downloaded.needLogin) {
+      sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
+    }
   }
 
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
+  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
     markSessionActivity(ds);
-    const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
@@ -15893,7 +17151,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
     beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
-    rememberTurnCaller(ds, parsed.messageId, callerOpenId, undefined, isForeignBot);
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -15901,7 +17158,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   // If waiting for repo selection, buffer the message and remind user
-  if (ds?.pendingRepo) {
+  if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
@@ -15925,7 +17182,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // follow-ups now fold into the same <user_message>, so a same-user tag is
     // pure duplication. A differing sender still gets attributed so the CLI can
     // tell multi-user buffered messages apart after repo selection unlocks.
-    const followUpSender = await getThreadSender();
+    // This branch is also the synchronization barrier for a pending first
+    // worker. Do not await contact/name resolution here: a commit waiting on
+    // getAvailableBots could otherwise resume first, snapshot stale buffers,
+    // and fork before this message is appended. Event identity is sufficient
+    // for caller equality and sender attribution; names remain optional.
+    const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
+      ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
+      : undefined;
+    const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
@@ -15938,6 +17203,34 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (followUpSenderBlock) {
         enriched = `${followUpSenderBlock}\n${enriched}`;
         codexAppFollowUpContextParts.unshift(followUpSenderBlock);
+      }
+    }
+    const sameInitialCaller = !!followUpSender?.openId
+      && followUpSender.openId === ds.pendingSender?.openId;
+    if (ds.pendingRawInput) {
+      if ((!hadBufferedFollowUps || ds.pendingFollowUpTurnId) && sameInitialCaller) {
+        // The persisted quote target is a single latest-turn pointer. Treat a
+        // same-caller raw command + buffered follow-ups as one batch and join
+        // every staged PTY input to that latest turn. Keeping the raw command
+        // on its older id would fail provenance as soon as the follow-up moves
+        // the durable pointer forward.
+        ds.pendingRawTurnId = parsed.messageId;
+        ds.pendingFollowUpTurnId = parsed.messageId;
+      } else {
+        // Mixed callers cannot share one durable turn pointer. Revoke the
+        // entire batch rather than letting either identity borrow the other.
+        ds.pendingRawTurnId = undefined;
+        ds.pendingFollowUpTurnId = undefined;
+      }
+    } else if (ds.pendingTurnId) {
+      // One deferred model prompt may fold several same-user messages together;
+      // bind it to the newest exact message so the durable quote and marker
+      // still join. If another user contributes, clear authority instead of
+      // letting either identity authorize the combined prompt.
+      if (sameInitialCaller) {
+        ds.pendingTurnId = parsed.messageId;
+      } else {
+        ds.pendingTurnId = undefined;
       }
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
@@ -15955,14 +17248,17 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
-    const pendingReplyKey = ds.worktreeCreating ? 'daemon.worktree_building_wait' : 'daemon.choose_repo_first';
+    const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
+      ? 'daemon.worktree_building_wait'
+      : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
 
   // Route to file queue (keyed by anchor: rootMessageId for thread, chatId for chat)
   messageQueue.ensureQueue(anchor);
-  messageQueue.appendMessage(anchor, parsed);
+  if (!prepared?.queueAlreadyAppended) messageQueue.appendMessage(anchor, parsed);
+  if (ds) publishSessionMessagePreviewPatch(ds);
 
   if (!ds) {
     // No active session at this anchor — auto-create. This branch is mostly a
@@ -15977,6 +17273,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
     const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
+    const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+      larkAppId,
+      autoCreateChatId,
+      autoCreateChatType,
+      botCfg.cliId,
+      parsed.content,
+      parsed.mentions,
+    );
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
@@ -16004,6 +17308,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    const groupChatName = await groupChatNamePromise;
+    if (groupChatName) session.chatDisplayName = groupChatName;
+    session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+      parsed.content,
+      parsed.mentions,
+      groupChatName,
+    );
     sessionStore.updateSession(session);
 
     // chat-scope only — see the handleNewTopic twin above (topic substitute
@@ -16044,6 +17355,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
+      pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
@@ -16064,9 +17376,27 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
-    rememberTurnCaller(newDs, parsed.messageId, senderOId, undefined, isForeignBot);
     sessionStore.updateSession(newDs.session);
-    activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    const creationKey = sessionKey(anchor, larkAppId);
+    if (!setActiveSessionIfActive(activeSessions, creationKey, newDs)) {
+      const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, newDs);
+      if (winner) {
+        logger.info(
+          `[${session.sessionId.substring(0, 8)}] Reply auto-create registration lost to ` +
+          `${winner.session.sessionId.substring(0, 8)}; handing message to routing winner`,
+        );
+        await handleThreadReply(data, ctx, {
+          parsed,
+          resources,
+          attachments,
+          quotaChecked: true,
+          queueAlreadyAppended: true,
+          senderResolved: true,
+          sender: autoCreateSender,
+        });
+      }
+      return;
+    }
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
@@ -16081,11 +17411,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
@@ -16114,11 +17444,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
     }
 
     return;
@@ -16139,34 +17469,78 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const selfBot = getBot(ds.larkAppId);
     if (!isBridge) ensureSessionWhiteboard(ds);
     const effectiveCliId = ds.session.cliId ?? dsBotCfgForMsg.cliId;
-    const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds);
+    // Empty-started session (repo select/skip/switch booted the CLI with no
+    // turn): a LIVE worker is not proof the CLI ever saw botmux's opening
+    // context — only `buildNewTopicCliInput` emits <botmux_routing> /
+    // <botmux_builtin_skills> / <identity>. Probe (non-consuming) before the
+    // awaits below, then claim SYNCHRONOUSLY right before building so two
+    // near-simultaneous first messages can only produce one opener; the loser
+    // degrades to an ordinary follow-up in queue order.
+    const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const turnSender = await getThreadSender();
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildBridgeInputContent(promptContent, {
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         }) }
+      : openingTurn
+      ? buildNewTopicCliInput(
+          promptContent,
+          ds.session.sessionId,
+          effectiveCliId,
+          ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
+          attachments,
+          parsed.mentions,
+          openingBots,
+          undefined,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          localeForBot(larkAppId),
+          turnSender,
+          {
+            larkAppId,
+            chatId: ds.session.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger,
+            codexAppText: parsed.content,
+            codexAppApplicationContext,
+            codexAppMessageContext,
+          },
+        )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: effectiveCliId,
           cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
-          sender: await getThreadSender(),
+          sender: turnSender,
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
-          topicGroupMemoryBlock,
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
         });
-    cliInput.userGoal = parsed.content.slice(0, 4_000);
     beginNewTurn(ds, parsed.content);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sendWorkerInput(ds, cliInput, parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    let accepted = false;
+    try {
+      accepted = sendWorkerInput(ds, cliInput, parsed.messageId);
+      // Record the input as the session's last real CLI turn ONLY after the
+      // worker accepted it. Recording before delivery (the old order) persisted
+      // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
+      // reached the CLI; a rejected send then left that poison behind, and the
+      // next message's worker-null refork would read it as `hadPriorCliInput`
+      // and wrongly `--resume` a CLI that never took a real turn.
+      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
+    } finally {
+      // The opening is one-shot: give it back when the worker died / refused,
+      // so the next message re-opens instead of silently losing the context.
+      if (openingTurn && !accepted) releaseInitialUserTurn(ds);
+    }
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -16227,25 +17601,39 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       currentText: parsed.content,
       currentMessageContext: codexAppMessageContext,
     });
-    const topicGroupMemoryBlock = ds.adoptedFrom ? '' : await loadTopicGroupMemoryBlockForSession(ds);
+    // Empty-started session that lost its worker (daemon restart, idle sweep,
+    // CLI exit) — same rule as the live branch: this is still the FIRST real
+    // user turn, so it must be built as a new topic. A queued(待办池) activation
+    // is excluded: its queuedPrompt already owns the first turn.
+    const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const reforkSender = await getThreadSender();
+    // An empty-started CLI has nothing to resume: `hasHistory` is set
+    // unconditionally by restoreActiveSessions (and by claude_exit /
+    // suspendWorker), so it cannot tell "booted idle" from "has real history".
+    // `session.lastCliInput` can: rememberLastCliInput writes it on EVERY real
+    // CLI input, and the empty-start fork deliberately writes none. Snapshot it
+    // BEFORE this turn's own rememberLastCliInput below, so a session some
+    // non-IM path (scheduler / webhook trigger / doc comment) already fed keeps
+    // its normal `--resume` instead of being cold-spawned over.
+    const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
       cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: await getThreadSender(),
-      topicGroupMemoryBlock,
+      sender: reforkSender,
       substituteTrigger,
       codexAppText: reforkCodexApp.text,
       codexAppApplicationContext,
       codexAppMessageContext: reforkCodexApp.messageContext,
     });
-    const wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
       queued: queuedDashboardTurn,
       queuedText: queuedCodexAppText,
     });
-    wrappedInput.userGoal = parsed.content.slice(0, 4_000);
     if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
       // Backlog sessions persisted before clean-input have no raw queued text.
       // Keep this activation entirely legacy: reforkContent already contains
@@ -16253,13 +17641,68 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // contain the reply and would silently discard the original task.
       logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
     }
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    if (openingTurn) {
+      // Replace the follow-up envelope built above with the real opening. The
+      // discarded build is pure string assembly (no side effects) — keeping the
+      // refork statement unconditional keeps the queued/substitute wiring, and
+      // its guard test, on a single code path.
+      wrappedInput = buildNewTopicCliInput(
+        reforkContent,
+        ds.session.sessionId,
+        ds.session.cliId ?? dsBotCfgForFork.cliId,
+        ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        attachments,
+        parsed.mentions,
+        openingBots,
+        undefined,
+        { name: selfBot.botName, openId: selfBot.botOpenId },
+        localeForBot(larkAppId),
+        reforkSender,
+        {
+          larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
+          codexAppText: reforkCodexApp.text,
+          codexAppApplicationContext,
+          codexAppMessageContext: reforkCodexApp.messageContext,
+        },
+      );
+    }
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    try {
+      // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
+      // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
+      // losing the observe/bridge semantics and typing the wrapped prompt into a
+      // brand-new CLI instead of the user's original external pane. This branch
+      // is reachable whenever an adopt session's bridge worker has exited (crash,
+      // or the "adopted session ended" kill path) and a new Lark turn arrives.
+      // The turn's input rides in on the init prompt (bridge-formatted by
+      // buildReforkCliInput above); forkAdoptWorker queues it and the adopt idle
+      // detector flushes it to the observed pane. Adopt never --resumes a botmux
+      // session, so the openingTurn/hadPriorCliInput resume logic doesn't apply.
+      if (ds.adoptedFrom) {
+        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId: parsed.messageId });
+      } else {
+        forkWorker(ds, wrappedInput, {
+          // See `hadPriorCliInput` above — an opening on a CLI that never took any
+          // input cold-spawns rather than `--resume`-ing an empty session.
+          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          turnId: parsed.messageId,
+        });
+      }
+    } catch (e) {
+      if (openingTurn) releaseInitialUserTurn(ds);
+      throw e;
+    }
+    // Record the input as the session's last real CLI turn ONLY after the fork
+    // succeeded. Recording before the fork (the old order) persisted lastCliInput
+    // for a turn that never launched when forkWorker threw; the retry then read
+    // that poison as `hadPriorCliInput` and wrongly `--resume`d a CLI that never
+    // took a real turn — breaking the empty-start invariant. forkWorker itself
+    // persists the session (clearing queued); this records last* + reply state.
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, {
-      resume: ds.hasHistory,
-      turnId: parsed.messageId,
-    });
   }
 }
 
@@ -16271,11 +17714,21 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
  *   2) bot 的 defaultWorkingDir / workingDir 配置
  *   3) fallback 到 ~
  *
- * 创建后立即 fork worker 并把评论内容作为首轮输入。
- * 返回创建好的 DaemonSession（已加入 activeSessions），失败返回 null。
+ * 本函数只同步建立 session skeleton 并竞争 routing ownership；不解析评论
+ * 作者、不写 per-turn target、也不 fork。胜出的 authoritative
+ * handleDocComment delivery owner 统一完成这些动作。
+ * 返回胜出的 DaemonSession（已加入 activeSessions），失败返回 null。
  */
 async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx: DocCommentContext): Promise<DaemonSession | null> {
   const botCfg = getBot(larkAppId).config;
+  const virtualChatId = `doc:${sub.fileToken}`;
+  const virtualAnchor = virtualChatId;
+  const routingKey = sessionKey(virtualAnchor, larkAppId);
+  const existing = activeSessions.get(routingKey);
+  if (existing?.session.status === 'active' && ownsCurrentRoute(existing, larkAppId)) {
+    persistDocBindingToSession(sub, larkAppId, existing);
+    return existing;
+  }
 
   // 解析 workingDir：订阅时指定的 > bot 配置 defaultWorkingDir > bot 配置 workingDir > ~
   const workingDir = sub.workingDir
@@ -16283,11 +17736,8 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     ?? botCfg.workingDir
     ?? '~';
 
-  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
   const title = `[Doc] ${sub.fileToken.slice(0, 8)}: ${ctx.text.slice(0, 40)}`;
 
-  const virtualChatId = `doc:${sub.fileToken}`;
-  const virtualAnchor = sub.sessionAnchor;
   const now = Date.now();
 
   const session = sessionStore.createSession(virtualChatId, virtualAnchor, title, 'group');
@@ -16317,36 +17767,66 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     currentTurnTitle: ctx.text.substring(0, 50),
   };
 
-  // 记录本轮回评论落点
-  const turnId = ctx.replyId || ctx.commentId;
-  (ds.docCommentTurns ??= new Map()).set(turnId, {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId: ctx.commentId,
-    replyToOpenId: ctx.authorOpenId,
-    replyToName: sender?.name,
-    replyId: ctx.replyId,
-    reactionId: undefined, // 由调用方在加 reaction 后回填
-  });
+  const selected = await registerDocSessionCandidate(routingKey, ds);
+  if (!selected) {
+    logger.warn(`[doc-comment] auto-create registration lost without an active winner file=${sub.fileToken.slice(0, 12)}`);
+    return null;
+  }
+  await persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds);
+  if (selected !== ds) {
+    logger.info(
+      `[doc-comment] auto-create ${session.sessionId.slice(0, 8)} lost to ` +
+      `${selected.session.sessionId.slice(0, 8)}; handing comment to routing winner`,
+    );
+    return selected;
+  }
 
-  const docTarget = {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId: ctx.commentId,
-    replyToName: sender?.name,
-    replyToOpenId: ctx.authorOpenId,
-    turnId,
-    replyId: ctx.replyId,
-  };
-  (ds.session.docCommentTargets ??= {})[turnId] = docTarget;
-  try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
-
-  activeSessions.set(sessionKey(virtualAnchor, larkAppId), ds);
-
-  // 不在这里 forkWorker —— handleDocComment 会统一处理（它会检查 worker 状态、
-  // 加 reaction、设 docCommentTurns、然后 fork 或 send）。这里只建好 session 骨架。
+  // 不在这里 forkWorker —— handleDocComment 会统一处理 reaction、per-turn
+  // 回复落点及 fork/send。这里只建好 session skeleton。
   logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
-  return ds;
+  return selected;
+}
+
+/**
+ * One authoritative delivery result per document-comment turn. Event delivery
+ * and the --all poller can observe the same reply concurrently; followers must
+ * await the owner's real result rather than treating an in-flight claim as a
+ * success and advancing the poll cursor past a later failure.
+ */
+const handledDocCommentTurns = new BoundedMap<string, Promise<boolean>>(5_000);
+
+async function runClaimedDocCommentTurn(
+  claimKey: string,
+  work: () => Promise<void>,
+  onOwnerFailure?: (error: unknown) => Promise<void>,
+): Promise<boolean> {
+  const existing = handledDocCommentTurns.get(claimKey);
+  if (existing) return await existing;
+
+  let resolveClaim!: (ok: boolean) => void;
+  const claim = new Promise<boolean>((resolve) => { resolveClaim = resolve; });
+  handledDocCommentTurns.set(claimKey, claim);
+
+  try {
+    await work();
+    resolveClaim(true);
+    return true;
+  } catch (err) {
+    try {
+      await onOwnerFailure?.(err);
+    } finally {
+      if (handledDocCommentTurns.get(claimKey) === claim) {
+        handledDocCommentTurns.delete(claimKey);
+      }
+      resolveClaim(false);
+    }
+    throw err;
+  }
+}
+
+export const __testOnly_runClaimedDocCommentTurn = runClaimedDocCommentTurn;
+export function __testOnly_resetDocCommentClaims(): void {
+  handledDocCommentTurns.clear();
 }
 
 /**
@@ -16364,135 +17844,210 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   const { larkAppId, sub, commentId, text } = ctx;
   const turnId = ctx.replyId || commentId;
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
-  if (handledDocCommentTurns.has(claimKey)) {
-    logger.info(`[doc-comment] duplicate turn skipped file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
-    return true; // 已处理过，算成功（让 poller 推进游标）
-  }
-  const loc = localeForBot(larkAppId);
-
-  let ds: DaemonSession | undefined | null = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
-  if (!ds) {
-    // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
-    logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
-    ds = await autoCreateDocSession(sub, larkAppId, ctx);
-    if (!ds) {
-      // auto-create 失败：不设 claim（允许后续重试），返回 false 让 poller 不推进游标
-      logger.warn(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; will retry comment ${commentId.slice(0, 12)}`);
-      return false;
-    }
-  }
-  // ds 确认有效后才设 claim——auto-create 失败时不占坑，允许重试。
-  handledDocCommentTurns.set(claimKey, Date.now());
-
-  try {
-  // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
-  if (userReplyId) {
-    reactionId = await addCommentReaction(larkAppId,
-      { fileToken: sub.fileToken, fileType: sub.fileType },
-      commentId, userReplyId, 'Typing');
-  }
+  let deliveryDs: DaemonSession | undefined;
+  let deliverySession: Session | undefined;
 
-  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
-  const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
-  const dsBotCfg = getBot(ds.larkAppId).config;
-  const promptInput = {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    question: text,
-    author: authorName,
-    selectedText: ctx.selectedText,
-    priorReplies: ctx.priorReplies?.map(reply => ({
-      author: reply.authorOpenId?.slice(0, 12),
-      text: reply.text,
-    })),
-    projectDir: ds.workingDir ?? sub.workingDir,
-    brand: normalizeBrand(dsBotCfg.brand),
-    locale: loc,
+  const targetMatchesThisTurn = (target: {
+    fileToken: string;
+    fileType: string;
+    commentId: string;
+    replyId?: string;
+  } | undefined): boolean => !!target
+    && target.fileToken === sub.fileToken
+    && target.fileType === sub.fileType
+    && target.commentId === commentId
+    && target.replyId === userReplyId;
+
+  const cleanupFailedDelivery = async (): Promise<void> => {
+    if (deliveryDs) {
+      const runtimeTarget = deliveryDs.docCommentTurns?.get(turnId);
+      if (targetMatchesThisTurn(runtimeTarget)) {
+        deliveryDs.docCommentTurns?.delete(turnId);
+      }
+    }
+
+    let removedPersistedTarget = false;
+    if (deliverySession) {
+      const persistedTarget = deliverySession.docCommentTargets?.[turnId];
+      if (targetMatchesThisTurn(persistedTarget)) {
+        delete deliverySession.docCommentTargets?.[turnId];
+        removedPersistedTarget = true;
+      }
+    }
+    if (removedPersistedTarget && deliverySession) {
+      try {
+        // Persist only the exact object still owned by this bot store. A stale
+        // continuation must not reinsert a displaced/cross-file Session row.
+        if (sessionStore.getOwnedSession(deliverySession.sessionId) === deliverySession) {
+          sessionStore.updateSession(deliverySession);
+        }
+      } catch (persistErr) {
+        logger.debug(
+          `[doc-comment] failed to persist aborted target cleanup ` +
+          `file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}: ` +
+          `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+        );
+      }
+    }
+
+    if (reactionId && userReplyId) {
+      try {
+        await removeCommentReaction(
+          larkAppId,
+          { fileToken: sub.fileToken, fileType: sub.fileType },
+          commentId,
+          userReplyId,
+          reactionId,
+        );
+      } catch (reactionErr) {
+        logger.debug(
+          `[doc-comment] failed to remove Typing after aborted delivery ` +
+          `file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}: ` +
+          `${reactionErr instanceof Error ? reactionErr.message : String(reactionErr)}`,
+        );
+      }
+    }
   };
 
-  // 记录本轮回评论的落点。两条路都要覆盖：
-  //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
-  //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
-  //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
-  (ds.docCommentTurns ??= new Map()).set(turnId, {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId,
-    replyToOpenId: ctx.authorOpenId,
-    replyToName: sender?.name,
-    replyId: userReplyId,
-    reactionId,
-  });
-  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
+  try {
+    const duplicate = handledDocCommentTurns.has(claimKey);
+    if (duplicate) {
+      logger.info(`[doc-comment] duplicate turn awaiting owner file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+    }
+    return await runClaimedDocCommentTurn(claimKey, async () => {
+      const loc = localeForBot(larkAppId);
+      let ds: DaemonSession | undefined | null = resolveBoundDocSession(sub, larkAppId);
+      if (!ds) {
+        // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
+        logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
+        ds = await autoCreateDocSession(sub, larkAppId, ctx);
+        if (!ds) {
+          throw new Error(`auto-create session failed for ${sub.fileToken.slice(0, 12)}`);
+        }
+      }
+      deliveryDs = ds;
+      const generation = captureRoutingGeneration(ds);
+      deliverySession = generation.session;
+      ensureCurrentRoutingGeneration(generation, 'comment:start');
 
-  const selfBot = getBot(ds.larkAppId);
+      // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
+      if (userReplyId) {
+        reactionId = await addCommentReaction(larkAppId,
+          { fileToken: sub.fileToken, fileType: sub.fileType },
+          commentId, userReplyId, 'Typing');
+      }
+      ensureCurrentRoutingGeneration(generation, 'comment:reaction');
 
-  if (ds.worker && !ds.worker.killed) {
-    const isBridge = !!ds.adoptedFrom;
-    if (!isBridge) ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds);
-    const { promptContent, cliInput } = buildDocCommentTurnInput({
-      ds,
-      promptInput,
-      botCliId: dsBotCfg.cliId,
-      botCliPathOverride: dsBotCfg.cliPathOverride,
-      botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender,
-      mode: 'live',
-      topicGroupMemoryBlock,
-    });
-    beginNewTurn(ds, text);
-    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-    sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
-    await noteTurnReceived(ds, commentId, text, sender, turnId);
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sendWorkerInput(ds, cliInput, turnId);
-    logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
-  } else {
-    // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
-    logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-    if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-    ds.usageLimit = undefined;
-    ds.currentTurnTitle = text.substring(0, 50);
-    parkStreamCard(ds);
-    ds.streamCardId = undefined;
-    ds.streamCardNonce = undefined;
-    ds.streamCardPending = true;
-    ds.currentImageKey = undefined;
-    persistStreamCardState(ds);
-    // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
-    // the live-worker branch above (if (!isBridge) ensure…).
-    if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = ds.adoptedFrom ? '' : await loadTopicGroupMemoryBlockForSession(ds);
-    const { promptContent, cliInput: wrappedInput } = buildDocCommentTurnInput({
-      ds,
-      promptInput,
-      botCliId: dsBotCfg.cliId,
-      botCliPathOverride: dsBotCfg.cliPathOverride,
-      botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender,
-      mode: 'refork',
-      topicGroupMemoryBlock,
-    });
-    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-    await noteTurnReceived(ds, commentId, text, sender, turnId);
-    rememberLastCliInput(ds, promptContent, wrappedInput);
-    sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
-  }
-  return true;
+      const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
+      ensureCurrentRoutingGeneration(generation, 'comment:sender');
+      const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
+      const dsBotCfg = getBot(ds.larkAppId).config;
+      const promptInput = {
+        fileToken: sub.fileToken,
+        fileType: sub.fileType,
+        question: text,
+        author: authorName,
+        selectedText: ctx.selectedText,
+        priorReplies: ctx.priorReplies?.map(reply => ({
+          author: reply.authorOpenId?.slice(0, 12),
+          text: reply.text,
+        })),
+        projectDir: ds.workingDir ?? sub.workingDir,
+        brand: normalizeBrand(dsBotCfg.brand),
+        locale: loc,
+      };
+
+      // 记录本轮回评论的落点。两条路都要覆盖：
+      //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
+      //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
+      //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
+      (ds.docCommentTurns ??= new Map()).set(turnId, {
+        fileToken: sub.fileToken,
+        fileType: sub.fileType,
+        commentId,
+        replyToOpenId: ctx.authorOpenId,
+        replyToName: sender?.name,
+        replyId: userReplyId,
+        reactionId,
+      });
+      const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
+
+      const selfBot = getBot(ds.larkAppId);
+
+      if (ds.worker && !ds.worker.killed) {
+        const targetWorker = ds.worker;
+        const isBridge = !!ds.adoptedFrom;
+        if (!isBridge) ensureSessionWhiteboard(ds);
+        const { promptContent, cliInput } = buildDocCommentTurnInput({
+          ds,
+          promptInput,
+          botCliId: dsBotCfg.cliId,
+          botCliPathOverride: dsBotCfg.cliPathOverride,
+          botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
+          sender,
+          mode: 'live',
+        });
+        beginNewTurn(ds, text);
+        (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+        // rememberLastCliInput persists both the exact comment target and the
+        // structured sidecar before any worker-visible delivery can occur.
+        rememberLastCliInput(ds, promptContent, cliInput);
+        await noteTurnReceived(ds, commentId, text, sender, turnId);
+        ensureCurrentRoutingGeneration(generation, 'comment:live-note');
+        if (ds.worker !== targetWorker || targetWorker.killed) {
+          throw new Error('worker generation changed during comment:live-note');
+        }
+        if (!sendWorkerInput(ds, cliInput, turnId)) {
+          throw new Error('worker became unavailable during comment:live-send');
+        }
+        logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
+        return;
+      }
+
+      // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
+      logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
+      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
+      ds.usageLimit = undefined;
+      ds.currentTurnTitle = text.substring(0, 50);
+      parkStreamCard(ds);
+      ds.streamCardId = undefined;
+      ds.streamCardNonce = undefined;
+      ds.streamCardPending = true;
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
+      // the live-worker branch above (if (!isBridge) ensure…).
+      if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
+      const { promptContent, cliInput: wrappedInput } = buildDocCommentTurnInput({
+        ds,
+        promptInput,
+        botCliId: dsBotCfg.cliId,
+        botCliPathOverride: dsBotCfg.cliPathOverride,
+        botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
+        sender,
+        mode: 'refork',
+      });
+      (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+      rememberLastCliInput(ds, promptContent, wrappedInput);
+      await noteTurnReceived(ds, commentId, text, sender, turnId);
+      ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
+      if (ds.worker && !ds.worker.killed) {
+        throw new Error('worker became active during comment:refork-note');
+      }
+      sessionStore.updateSession(ds.session);
+      if (ds.adoptedFrom) {
+        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
+      } else {
+        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+      }
+    }, cleanupFailedDelivery);
   } catch (err) {
-    // 投递失败：清理 claim 允许重试，返回 false 让 poller 不推进游标。
-    handledDocCommentTurns.delete(claimKey);
     logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
-
-/** 同一条评论可能同时被长连接通知和 --all 轮询看到；daemon 内统一去重。 */
-const handledDocCommentTurns = new BoundedMap<string, number>(5_000);
 
 let docCommentPollRunning = false;
 
@@ -16597,7 +18152,7 @@ async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): P
       //   • 有 sessionId 且其会话 status==='closed' → 真的关了 → 退订 + 删表
       //   • 会话不存在（被清理）→ 同上
       //   • 会话 active / 缺 sessionId（老订阅，无从判定）→ 保留 + 重订阅（保守，不误删）
-      const stored = sub.sessionId ? sessionStore.getSession(sub.sessionId) : undefined;
+      const stored = sub.sessionId ? sessionStore.getOwnedSession(sub.sessionId) : undefined;
       const definitelyClosed = sub.sessionId && (!stored || stored.status === 'closed');
       if (definitelyClosed) {
         if (sub.managedBy !== 'watch-comment') await unsubscribeDocFile(appId, file);
@@ -16634,6 +18189,90 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
   }
 }
 
+/**
+ * Host-overload thresholds, seeded from module defaults and overridable via env
+ * so an operator can tune sensitivity without a code change:
+ *   BOTMUX_OVERLOAD_ENTER_LOAD_RATIO / _EXIT_LOAD_RATIO   (× logical CPU count)
+ *   BOTMUX_OVERLOAD_ENTER_MEM_FRAC   / _EXIT_MEM_FRAC      (0..1)
+ *   BOTMUX_OVERLOAD_MIN_REALERT_MS
+ * Setting BOTMUX_OVERLOAD_ALERT=0 disables the watcher entirely (checked at the
+ * call site). Swap is not read on this platform, so its thresholds stay default
+ * but are inert (reading passes swap=undefined).
+ */
+function resolveOverloadThresholds(): OverloadThresholds {
+  // Enter thresholds priority (env > global config > default) + hysteresis-safe
+  // exit derivation live in the pure computeOverloadThresholds() so they can be
+  // unit-tested without importing this side-effectful module. We only gather the
+  // impure inputs (CPU count, persisted config, env strings) here.
+  const cfg = readGlobalConfig().hostOverloadAlert ?? {};
+  return computeOverloadThresholds({
+    cpuCount: cpus().length || 1,
+    configEnterLoadRatio: cfg.enterLoadRatio,
+    configEnterMemUsedFrac: cfg.enterMemUsedFrac,
+    env: {
+      enterLoadRatio: process.env.BOTMUX_OVERLOAD_ENTER_LOAD_RATIO,
+      exitLoadRatio: process.env.BOTMUX_OVERLOAD_EXIT_LOAD_RATIO,
+      enterMemUsedFrac: process.env.BOTMUX_OVERLOAD_ENTER_MEM_FRAC,
+      exitMemUsedFrac: process.env.BOTMUX_OVERLOAD_EXIT_MEM_FRAC,
+      minReAlertMs: process.env.BOTMUX_OVERLOAD_MIN_REALERT_MS,
+    },
+    warn: (message) => logger.warn(message),
+  });
+}
+
+/**
+ * Machine-wide de-dup for the host-overload alert. load/mem are host-wide, so if
+ * more than one bot has the `overloadAlert` toggle on, every such daemon would
+ * independently detect the same edge and DM its owner. This claims a short-lived
+ * episode marker in the shared botmux data dir so only the first daemon to see a
+ * given edge actually sends; siblings within the dedup window back off.
+ *
+ * The key is just the edge kind (`entered` / `recovered`): within DEDUP_WINDOW_MS
+ * the first daemon to see an edge claims it and siblings back off. (An earlier
+ * version bucketed `entered` by `Math.round(load15)`, but sibling daemons
+ * sampling load15 either side of an X.5 boundary rounded to different bands,
+ * got different keys, and each DMed — so the band is dropped.)
+ *
+ * The claim is a real mutual exclusion: the ENTIRE read-check-write runs inside
+ * one `withFileLockSync` critical section on the marker. An earlier version used
+ * `openSync(marker, 'wx')`, but that only serializes the FIRST claim — once the
+ * marker exists (it persists after the first alert), every later edge
+ * (recovered / expired) fell back to an unlocked read→replace, so two daemons
+ * both detecting the same `recovered` edge could both read the stale key, both
+ * replace it, and each DM. Serializing the whole section closes that hole. Best-
+ * effort: if the lock itself can't be taken (FS error), allow the DM (better a
+ * rare duplicate than a silent miss).
+ */
+function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
+  const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
+  const marker = join(config.session.dataDir, '.overload-episode.json');
+  const key = kind;
+  try {
+    return withFileLockSync(marker, () => {
+      const now = Date.now();
+      if (existsSync(marker)) {
+        try {
+          const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
+          if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
+            return false; // Same edge already claimed within the window.
+          }
+        } catch {
+          // Corrupt marker → fall through and take it over.
+        }
+      }
+      // Winner: claim the episode. atomicWriteFileSync is fine here — the lock,
+      // not the write, provides mutual exclusion.
+      atomicWriteFileSync(marker, JSON.stringify({ key, at: now }));
+      return true;
+    }, { maxWaitMs: 2_000 });
+  } catch (err) {
+    // Couldn't acquire the lock (timeout / FS error) → don't silently drop the
+    // edge; allow this DM (a rare duplicate is better than a missed alert).
+    logger.warn(`[overload] episode claim lock failed (${kind}): ${err instanceof Error ? err.message : String(err)}; allowing DM`);
+    return true;
+  }
+}
+
 /** Build the current dashboard URL (active token, not a rotation) from the
  *  dashboard process's persisted `.dashboard-port` / `.dashboard-token`. Falls
  *  back to a token-less base URL if the dashboard hasn't published a token yet. */
@@ -16655,6 +18294,25 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   }
 }
 
+async function waitForManagedActivationCommit(index: number, appId: string): Promise<void> {
+  const activationAppId = process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+  if (activationAppId === undefined) return;
+  if (activationAppId !== appId) {
+    throw new Error(`Managed activation App drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+  const activationJobId = process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
+  if (!activationJobId) {
+    throw new Error(`Managed activation receipt is missing at BOTMUX_BOT_INDEX=${index}`);
+  }
+  while (isManagedActivationStartingAtIndex(index, appId, activationJobId)) {
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  const committed = loadBotConfigAtIndex(index);
+  if (committed.larkAppId !== appId) {
+    throw new Error(`Managed activation target drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+}
+
 export async function startDaemon(botIndex?: number): Promise<void> {
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
@@ -16672,27 +18330,42 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
   ensureCjkFontsInstalled();
 
+  // Auto-migrate legacy sandbox fields (readIsolation / sandboxHidePaths /
+  // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
+  // loading, so the parsed configs below already carry the new model. Writes
+  // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
+  // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
+  // fleet bots.json. A headless core-only service must never touch an ambient
+  // host fleet config — its identity is a synthesized in-memory apiOnly bot.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await migrateSandboxConfigAtStartup();
+  }
+
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
-  if (idx < 0 || idx >= botConfigs.length) {
-    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
+  let cfg = botIndex === undefined
+    ? botConfigs[idx]
+    : loadBotConfigAtIndex(idx);
+  if (!cfg) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
   }
-  let cfg = botConfigs[idx];
+  if (botIndex !== undefined) {
+    // During managed activation PM2 may report this process online before it
+    // is allowed to register a bot or receive traffic. The dashboard clears
+    // the exact startup marker only after it has re-read the PM2 receipt ACK.
+    await waitForManagedActivationCommit(idx, cfg.larkAppId);
+    botConfigs = loadBotConfigs();
+    cfg = loadBotConfigAtIndex(idx);
+  }
   // One-time, lock-protected catalog bootstrap. This runs only after the
   // complete bots.json has parsed successfully, and the helper re-reads the
   // latest file under its lock before deciding. Explicit [] and legacy agent
   // policy are durable opt-outs. Reload the selected config after a write so
   // this daemon exposes the seeded selection card immediately on the same boot.
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(cfg.larkAppId);
+  const selectedAppId = cfg.larkAppId;
+  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
   if (profileBootstrap.ok) {
-    const selectedAppId = cfg.larkAppId;
-    // Reload even when another concurrent daemon won the one-time write. Both
-    // processes may have loaded the old file before taking the config lock;
-    // the loser still needs the winner's catalog on this boot.
-    botConfigs = loadBotConfigs();
-    cfg = botConfigs.find(candidate => candidate.larkAppId === selectedAppId)
-      ?? botConfigs[idx];
     if (profileBootstrap.seeded) {
       logger.info(
         `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
@@ -16704,6 +18377,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
       + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
     );
+  }
+  // A bootstrap failure is not authority to keep an earlier in-memory config.
+  // Every explicit PM2 daemon must prove its same raw slot and App identity
+  // immediately before registerBot, regardless of the bootstrap result.
+  if (botIndex !== undefined) {
+    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
@@ -16805,14 +18484,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   }, VC_MEETING_DELIVERY_LEASE_SCAN_MS);
   vcMeetingDeliveryLeaseTimer.unref?.();
-  // Watch schedules.json for external writes (e.g. `botmux schedule add`
+  // Bind the schedule store to this daemon's bot (per-bot stores live in each
+  // BOT_HOME), split a legacy shared data/schedules.json if one still exists,
+  // then watch our own store for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
+  scheduleStore.setScheduleScope(cfg.larkAppId);
+  migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
+  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
-  setAskCanTalkChecker((appId, chatId, openId, chatType) => evaluateTalk(appId, chatId, openId, undefined, undefined, chatType).allowed);
+  //
+  // 分派逻辑在 evaluateAskAnswerTalk（生产共用真源）：actor 透传时（文字作答路径）
+  // bot → evaluateBotTalk、人 → evaluateTalk 的完整模型（teamMember 走 memberUnionId
+  // 腿）；不传 actor（卡片点击路径，飞书 card-action 回调无 sender union/bot 标记）→
+  // 退化为纯 evaluateTalk(openId, chatType)，与改动前语义一致。三条分派由
+  // test/ask-answer-talk-dispatch.test.ts 直接咬住。
+  setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
+    evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
+  );
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
@@ -16820,7 +18512,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning <resolvedDataDir>/dashboard-daemons/
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
-  const ipcPort = config.dashboard.ipcBasePort + idx;
+  //
+  // Core-only (in-sandbox, single service): riff's task-runner is handed ONE
+  // fixed port and dials 127.0.0.1:<port> directly, so the port must be exactly
+  // BOTMUX_API_PORT and must NOT drift via the fleet's upward EADDRINUSE probe —
+  // a silent drift would leave the client dialing a dead port. Fleet daemons
+  // keep the ipcBasePort+idx scheme + probe (a port race must not crash boot).
+  const coreOnlyApiPort = process.env.BOTMUX_CORE_ONLY === '1'
+    ? Number(process.env.BOTMUX_API_PORT) || 0
+    : 0;
+  const ipcPort = coreOnlyApiPort || config.dashboard.ipcBasePort + idx;
   // Worker/CLI descendants use this only to reach the current daemon's
   // agent-facing, live-origin-gated endpoints. Internal control endpoints use
   // a separate daemon-to-daemon credential and never trust this port marker.
@@ -16842,6 +18543,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
+  // Expose the live descriptor module-level so the deferred allowedUsers resolve
+  // retry can republish healed open_ids coherently (see republishResolvedAllowedUsers).
+  selfDaemonDescriptor = desc;
+  // Let runtime allowedUsers mutations (set / revoke, in the services layer)
+  // republish the descriptor through the same path without importing daemon
+  // internals. Registered once per daemon; one daemon per bot.
+  setResolvedAllowedUsersRepublishHook(republishResolvedAllowedUsers);
+  // And let a mutation that hit a transient contact failure schedule the same
+  // background resolve-retry the startup path uses (heal-when-API-recovers).
+  setAllowedUsersResolveRetryHook((appId) => scheduleAllowedUsersResolveRetry(appId));
   // 名称状态刷新：displayName 或飞书真名变化后，用有效展示名刷新 descriptor +
   // SessionRow.botName，无需重启 daemon。displayName 路径经 bot-config-store 的
   // 钩子触发；真·改名路径在下面的 renamer 里直接调用。
@@ -16854,6 +18565,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
+  // handlers drive the open-platform console (browser web-session, NOT
+  // getBotClient — so the bot-level gate can't catch them); skip registering
+  // them entirely so the dashboard profile actions are inert for a core-only bot.
+  if (!cfg.apiOnly) {
   // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
@@ -16891,6 +18607,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
+  } // end !cfg.apiOnly (open-platform rename/avatar handlers)
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.
@@ -16916,44 +18633,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
-    onFinalOutput(ds, output) {
-      if (!ds.pendingCodexFreshHandoff
-        || output.turnId !== ds.pendingCodexFreshHandoff.summaryTurnId) return false;
-      // Matching summary output is always consumed from the old topic. If the
-      // external migration step fails, its durable intent owns retries; falling
-      // back to ordinary final delivery would leak the handoff summary into the
-      // exhausted source topic and clear no state.
-      return migrateCodexHandoffToFreshSession(ds, output.content).then(() => true);
-    },
-    onCodexContextExhausted(ds, output) {
-      const pending = ds.pendingCodexFreshHandoff;
-      if (pending && output.turnId === pending.summaryTurnId) {
-        const fallback = buildFallbackCodexHandoffSummary({
-          userGoal: pending.interruptedUserGoal ?? ds.lastUserPrompt ?? ds.session.lastUserPrompt,
-          title: ds.session.title,
-          workingDir: ds.workingDir ?? ds.session.workingDir,
-        });
-        return migrateCodexHandoffToFreshSession(ds, fallback).then(migrated => {
-          if (!migrated) throw new Error('failed to migrate fallback Codex handoff');
-        });
-      }
-      return beginAutomaticCodexContextHandoff(ds, output.turnId, output.interruptedUserGoal);
-    },
-    onCodexStreamDisconnected(ds, output) {
-      return beginAutomaticCodexStreamRecovery(ds, output.turnId, output.interruptedUserGoal);
-    },
-    onCodexHandoffSourceExit(ds) {
-      const pending = ds.pendingCodexFreshHandoff;
-      if (!pending) return;
-      const fallback = pending.selectedSummary ?? buildFallbackCodexHandoffSummary({
-        userGoal: pending.interruptedUserGoal ?? ds.session.lastUserPrompt,
-        title: ds.session.title,
-        workingDir: ds.workingDir ?? ds.session.workingDir,
-      });
-      return migrateCodexHandoffToFreshSession(ds, fallback).then(migrated => {
-        if (!migrated) throw new Error('failed to migrate Codex handoff after source exit');
-      });
-    },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onTurnTerminal(ds, terminal, context) {
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
@@ -16963,6 +18642,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
+    },
+    onDeferredScheduleTurnSettled(ds, context) {
+      scheduleDeferredScheduleSettlement(ds, context);
     },
     onCliExit(_ds, context) {
       const result = handleVcMeetingWorkerGenerationExit(context, {
@@ -17017,6 +18699,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // SessionRow.botName.
   setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
+  setDeviceIsolationDaemonIdentity({
+    larkAppId: cfg.larkAppId,
+    bootInstanceId: desc.bootInstanceId,
+  });
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
   selfV3BootInstanceId = desc.bootInstanceId;
 
@@ -17032,10 +18718,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  // Core-only keeps the trusted-host HMAC ON (codex P1: authRequired:false opened
+  // ALL 96 IPC routes — a co-resident model turn could read/perturb sessions,
+  // scheduler, mutations). Instead we allowlist ONLY the tight riff-facing routes
+  // (routeIsCoreOnlyPublic: /api/trigger + /api/sessions/:id/{trigger-result,insight}
+  // + the always-public /healthz) as no-HMAC; every other route still requires it.
+  // Arm the readiness gate BEFORE the bind (codex P1): between listen() and a
+  // later arm there'd be a window where the port answers unarmed and a trigger
+  // could slip past the 503 barrier. Armed-first means the very first accepted
+  // connection already sees the not-ready gate.
+  if (coreOnly) armCoreOnlyReadinessGate();
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
     authRequired: true,
+    coreOnlyPublicRoutes: coreOnly,
+    // Fleet: probe upward so a port race can't crash boot. Core-only: BIND-OR-FAIL
+    // on the exact BOTMUX_API_PORT — riff was handed that port and the service must
+    // never silently drift to another (client would dial a dead port).
+    ...(coreOnly ? { maxProbe: 0 } : {}),
   });
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
@@ -17044,19 +18746,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.ipcPort = ipcHandle.port;
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
+  // NOTE: the core-only ready line + readiness release (setCoreOnlyReady) are
+  // emitted LATER, AFTER restoreActiveSessions completes — until then BOTH
+  // /healthz AND the public control routes (trigger/result/insight) return 503,
+  // so riff never triggers into a racing durable restore (codex P1).
 
   // Single reverse-proxy port that fronts every session's web terminal under
   // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)
   // instead of one per topic. Bound on the public host so `ssh -L` can reach it.
   const proxyPort = config.web.proxyBasePort + idx;
+  // Core-only (codex P1-4): the web terminal proxy + worker web ports default to
+  // config.web.host (0.0.0.0). In riff's sandbox the whole surface must stay
+  // loopback — an in-sandbox headless service has no reason to expose terminals
+  // on all interfaces. Force 127.0.0.1 so nothing but the local task-runner can
+  // reach it (the IPC server is already 127.0.0.1-bound above).
+  const terminalProxyHost = coreOnly ? '127.0.0.1' : config.web.host;
   let terminalProxy: TerminalProxyHandle | null = null;
   try {
     terminalProxy = await startTerminalProxy({
       port: proxyPort,
-      host: config.web.host,
+      host: terminalProxyHost,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
-          if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+          if (ds.session.sessionId === sessionId && sessionSupportsWebTerminal(ds) && ds.workerPort) {
+            return ds.workerPort;
+          }
         }
         return undefined;
       },
@@ -17073,7 +18787,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // falls back to the worker's own port so links stay reachable if the port
     // was taken (e.g. EADDRINUSE).
     setTerminalProxyPort(terminalProxy.port);
-    logger.info(`[terminal-proxy] listening on ${config.web.host}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
+    logger.info(`[terminal-proxy] listening on ${terminalProxyHost}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
   } catch (err) {
     logger.error(`[terminal-proxy] failed to bind port ${proxyPort} — falling back to direct worker ports for terminal links: ${(err as Error).message}`);
   }
@@ -17125,22 +18839,74 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
-    // Resolve allowed users per bot
-    if (bot.resolvedAllowedUsers.length > 0) {
+    // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
+    // their HTTP control-API triggers authenticate via the dashboard token, not
+    // allowedUsers, and resolving email/union_id entries would call the Feishu
+    // contact API — a network round-trip a no-Feishu bot must never make.
+    if (!cfg.apiOnly && ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0)) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
       // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
       // 误填到本 bot 的配置。
-      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+      //
+      // Transient contact failures must NOT blank the runtime list: an empty
+      // resolved allowlist under a configured allowedUsers is fail-closed and
+      // silently drops even the real owner (@ with no group reply). Reuse the
+      // last-known-good `raw → ou_` cache PER ENTRY (only for still-configured,
+      // transient-failed entries), log loudly, DM owners (fire-and-forget), and
+      // schedule retries. The cache is a persistent sidecar — NOT the dashboard
+      // descriptor, which is overwritten early in boot and deleted on shutdown.
+      const configured = bot.config.allowedUsers ?? bot.resolvedAllowedUsers;
+      const needsResolve = configured.some(entryNeedsContactResolve);
       if (needsResolve) {
+        const previousResolvedMap = readAllowedUsersCache(cfg.larkAppId);
         try {
-          // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
-          const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
-          bot.resolvedAllowedUsers = resolved;
-          bot.rawAllowedUserResolution = map;
-          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
+          // 同时拿到 raw→open_id 映射,供 /revoke 反查删除 email 形式的 raw 条目(R2#2)。
+          const resolveResult = await resolveAllowedUsersWithMap(cfg.larkAppId, configured);
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedMap,
+            resolveResult,
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
+          // Persist the fresh/recovered map so the next boot (and a clean
+          // restart, which deletes the descriptor) can fall back per-entry.
+          // Prune definitively-gone entries + keys no longer configured.
+          writeAllowedUsersCache(cfg.larkAppId, applied.map, {
+            deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+            retainKeys: configured,
+          });
+          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
+          if (applied.failed && applied.notice) {
+            notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            scheduleAllowedUsersResolveRetry(cfg.larkAppId);
+          }
         } catch (err: any) {
-          logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);
+          // A full throw is a transient outage: mark every contact-resolvable
+          // entry transient so the pure fn can recover each from cache.
+          const throwStatus = new Map<string, EntryResolveStatus>();
+          for (const e of configured) {
+            if (entryNeedsContactResolve(e)) throwStatus.set(e, 'transient');
+          }
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedMap,
+            resolveResult: { resolved: [], map: new Map(), errored: true, entryStatus: throwStatus },
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
+          if (applied.usedFallback) {
+            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: configured });
+          }
+          const notice = applied.notice
+            ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
+          notifyAllowedUsersResolveFailure(
+            cfg.larkAppId,
+            `${notice} (throw: ${err?.message ?? err})`,
+            applied.resolved,
+          );
+          scheduleAllowedUsersResolveRetry(cfg.larkAppId);
         }
       }
       // Republish the descriptor with the post-resolution open_ids so the
@@ -17153,6 +18919,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     checkAllowedChatGroupsConfig(bot);
 
+    // apiOnly (core-only) bots never connect to Feishu: skip the open_id probe,
+    // the required-scope check, and the WSClient event subscription. They are
+    // driven purely over the HTTP control API (trigger → spawn → trigger-result),
+    // whose async path early-returns in deliverFinalOutput before any Feishu send.
+    // Seed a synthetic identity so downstream reads (worker botOpenId, dashboard
+    // roster) get a stable non-undefined value instead of the never-probed one.
+    if (cfg.apiOnly) {
+      bot.botOpenId ||= `bot_${cfg.larkAppId}`;
+      bot.botName ||= cfg.displayName ?? cfg.larkAppId;
+      logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
+    } else {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
     // so the registry shows "Claude" / "Codex" instead of the raw app id.
@@ -17182,13 +18959,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // a single failure here is not actionable. Surface as debug only.
       logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
     });
+    } // end !cfg.apiOnly (open_id probe)
 
     // Required-scope check: 启动后 best-effort 校验
     // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
     // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
-    checkRequiredScopes(cfg.larkAppId).catch(err => {
-      logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
-    });
+    // apiOnly 无飞书连接 → 无 scope 概念，跳过。
+    if (!cfg.apiOnly) {
+      checkRequiredScopes(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+      });
+    }
 
     // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
     // if it isn't subscribed the handler simply never fires (no runtime signal).
@@ -17202,7 +18983,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     // Start event dispatcher for this bot
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
+    const botEventHandlers: EventHandlers = {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
@@ -17225,7 +19006,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const evicted = activeSessions.delete(key);
         logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);
       },
-    }, normalizeBrand(cfg.brand));
+    };
+    // 存起来供授权成功后重放消息用（replayGrantedMessage → replayMessageEvent）。
+    botHandlers.set(cfg.larkAppId, botEventHandlers);
+    // apiOnly bots never subscribe to Feishu events → no WSClient. This is the
+    // core decoupling: the daemon serves the HTTP control API only.
+    if (!cfg.apiOnly) {
+      startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
+    }
 
     // A distillation command is durably prepared before its model run/card
     // delivery. Resume active prepared/proposed allocations after a daemon
@@ -17249,21 +19037,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   reapOrphanWorkers();
 
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions, {
-    recoverCodexHandoff: async (ds) => {
-      const pending = ds.pendingCodexFreshHandoff;
-      if (!pending) return;
-      const fallback = pending.selectedSummary ?? buildFallbackCodexHandoffSummary({
-        userGoal: pending.interruptedUserGoal ?? ds.session.lastUserPrompt,
-        title: ds.session.title,
-        workingDir: ds.workingDir ?? ds.session.workingDir,
-      });
-      const migrated = await migrateCodexHandoffToFreshSession(ds, fallback);
-      if (!migrated) {
-        logger.error(`[${tag(ds)}] Failed to recover persisted Codex handoff on daemon boot`);
-      }
-    },
-  });
+  await restoreActiveSessions(activeSessions);
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup
@@ -17355,22 +19129,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try { sweepGlobalBotmuxSkills(); }
   catch (err) { logger.warn(`[skills] post-restore global sweep failed: ${err instanceof Error ? err.message : String(err)}`); }
 
-  // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
-  // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
-  await restoreDocSubscriptions(activeSessions);
+  // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
+  // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
+  // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
+  if (!cfg.apiOnly) {
+    // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
+    // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
+    await restoreDocSubscriptions(activeSessions);
 
-  // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
-  // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
-  const docCommentPollTimer = setInterval(() => {
+    // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
+    // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
+    docCommentPollTimer = setInterval(() => {
+      void pollWatchedDocComments(cfg.larkAppId);
+    }, 5_000);
+    docCommentPollTimer.unref?.();
     void pollWatchedDocComments(cfg.larkAppId);
-  }, 5_000);
-  docCommentPollTimer.unref?.();
-  void pollWatchedDocComments(cfg.larkAppId);
+  }
 
-  // Sweep orphan sandbox overlays left by a previous run's crash/kill: any
+  // Sweep orphan sandbox trees left by a previous run's crash/kill: any
   // <dataDir>/sandboxes/<sid> whose session is no longer active gets its
-  // overlays unmounted and its dirs removed (plus the /var/tmp home scratch).
-  // Active sessions keep theirs — a same-topic worker reuses the upper changeset.
+  // deny-mask mountpoints reclaimed and its dirs removed.
+  // Active sessions keep theirs — a same-topic worker reuses the tree.
   try {
     sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
   } catch (err: any) {
@@ -17384,12 +19164,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   idleWorkerSweepTimer.unref?.();
 
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
-  // worker SIGKILL) bypasses worker-side killCli(), so the overlay mounts +
-  // upper/work dirs of a killed-but-still-active sandboxed session would leak for
-  // the rest of this daemon's lifetime (one daemon per bot can run for days). The
-  // startup sweep alone can't catch a session that dies AFTER boot. This re-runs
-  // the sweep on a timer: it reclaims active sessions whose overlays are already
-  // unmounted (= worker/CLI dead) without ever tearing down a live mount.
+  // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
+  // mountpoints + per-session tree of a killed-but-still-active sandboxed session
+  // would leak for the rest of this daemon's lifetime (one daemon per bot can run
+  // for days). The startup sweep alone can't catch a session that dies AFTER boot.
+  // This re-runs the sweep on a timer: it reclaims sessions whose worker/CLI is
+  // dead without ever tearing down a live one.
   const sandboxReconcileTimer = setInterval(() => {
     try {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
@@ -17424,8 +19204,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try {
       let busy = 0;
       for (const [, ds] of activeSessions) {
-        if (hasActiveSessionWork(ds)
-          || (ds.worker && !ds.worker.killed && sessionRuntimeStatus(ds) === 'working')) busy++;
+        if (ds.worker && !ds.worker.killed && ds.lastScreenStatus === 'working') busy++;
       }
       writeHeartbeat(cfg.larkAppId, busy);
     } catch { /* best-effort */ }
@@ -17435,8 +19214,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   maintenanceHeartbeat.unref?.();
 
   // Auto-update / auto-restart and the restart-report DM run only on the
-  // primary daemon (bot-0) — a restart is host-wide.
-  if (idx === 0) {
+  // primary daemon (bot-0) — a restart is host-wide. NEVER in core-only (codex
+  // P1): a headless in-sandbox service synthesizes its single bot at idx=0, but
+  // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
+  // global botmux install and a detached `botmux restart` would tear down the
+  // real fleet. Core-only manages only its own single process.
+  if (idx === 0 && !coreOnly) {
     startMaintenance();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
@@ -17460,6 +19243,85 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         log: (m) => logger.info(`[restart-report] ${m}`),
       });
     }, 5_000).unref?.();
+  }
+
+  // Host-overload watcher. Machine-level: enabled via the GLOBAL config
+  // `hostOverloadAlert` (dashboard → Global Settings), which names one "notifier
+  // bot". ONLY that bot's own daemon samples + advances the state machine + DMs
+  // (it runs on this host, so no cross-daemon delivery queue is needed) — other
+  // daemons no-op and keep their state cleared. load/mem are host-wide; the
+  // cross-process episode lock is kept purely as a belt-and-suspenders guard
+  // (e.g. a stale duplicate daemon for the same bot). Reads os.loadavg()[2] +
+  // mem every 30s; on a healthy→overloaded or overloaded→healthy edge it DMs the
+  // notifier bot's admin. Hysteresis + a min re-alert window (see
+  // host-overload-alert.ts) keep a load near the line from spamming. Set
+  // BOTMUX_OVERLOAD_ALERT=0 to force the whole feature off regardless of config.
+  if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
+    let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
+    const overloadTimer = setInterval(() => {
+      void (async () => {
+      try {
+        // Global hot switch + target gating: only the selected notifier bot's
+        // daemon samples. When disabled, or the target is another bot / unset,
+        // reset local state so a later re-enable starts clean (no stale edge).
+        const alertCfg = readGlobalConfig().hostOverloadAlert ?? {};
+        if (!isOverloadAlertTarget(alertCfg, { larkAppId: cfg.larkAppId, apiOnly: cfg.apiOnly })) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        // Re-read thresholds each tick so live config edits (enter load/mem)
+        // take effect on the next sample without a restart.
+        const overloadThresholds = resolveOverloadThresholds();
+
+        const reading = {
+          load15: loadavg()[2] ?? 0,
+          memTotalBytes: totalmem(),
+          memFreeBytes: freemem(),
+        };
+        const { nextState, action } = evaluateOverload(overloadState, reading, overloadThresholds, Date.now());
+        overloadState = nextState;
+        if (!action) return;
+
+        // Belt-and-suspenders de-dup: normally only the target daemon reaches
+        // here, but a stale duplicate daemon for the same bot could double-fire.
+        // Claim a short-lived episode lock so the host DMs once per edge.
+        if (!claimOverloadEpisode(action.kind)) {
+          logger.info(`[overload] ${action.kind} edge already claimed; skipping DM (${cfg.larkAppId})`);
+          return;
+        }
+        const ownerOpenId = resolvePrimaryOwnerOpenId(cfg.larkAppId);
+        logger.info(
+          `[overload] ${action.kind}: load15=${action.metrics.load15.toFixed(2)} `
+          + `perCpu=${action.metrics.loadPerCpu.toFixed(2)} mem=${(action.metrics.memUsedFrac * 100).toFixed(0)}% `
+          + `reasons=[${action.reasons.join(',')}] owner=${ownerOpenId ? 'yes' : 'none'} bot=${cfg.larkAppId}`,
+        );
+        if (!ownerOpenId) return; // No resolvable owner to DM; the log above still records the edge.
+        // Interactive card. `entered`: register a one-shot nonce, count the
+        // machine-wide zombie/idle candidates so the buttons can show「(N)」
+        // before a click, and send the stateful two-button card (clicking one
+        // never removes the other — the handler rebuilds this same card).
+        // `recovered`: display-only card. On any send failure, fall back to the
+        // plain-text alert so the owner still hears about it.
+        let cardJson: string;
+        if (action.kind === 'entered') {
+          const nonce = randomUUID();
+          registerOverloadNonce(nonce);
+          let counts = { stopped: 0, idle: 0 };
+          try { counts = await countHostOverload(); }
+          catch (err) { logger.warn(`[overload] count failed, showing 0: ${err instanceof Error ? err.message : String(err)}`); }
+          cardJson = buildOverloadAlertCard(initialOverloadCardState(action, counts, nonce));
+        } else {
+          cardJson = buildOverloadRecoveredCard(action);
+        }
+        void sendUserMessage(cfg.larkAppId, ownerOpenId, cardJson, 'interactive')
+          .catch((err) => {
+            logger.warn(`[overload] card DM failed, falling back to text: ${err instanceof Error ? err.message : String(err)}`);
+            return sendUserMessage(cfg.larkAppId, ownerOpenId, formatOverloadAlert(action));
+          })
+          .catch((err) => logger.warn(`[overload] text fallback DM also failed: ${err instanceof Error ? err.message : String(err)}`));
+      } catch (err) {
+        logger.warn(`[overload] sample failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      })();
+    }, 30_000);
+    overloadTimer.unref?.();
   }
 
   // Graceful shutdown. Sends SIGTERM (or `{type:'close'}` IPC via killWorker)
@@ -17487,6 +19349,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     vcMeetingReceiverRecoveryEscalating.clear();
     vcMeetingReceiverRecoveryScopes.clear();
     vcMeetingRuntimeLeaseRecovery.reset();
+    for (const timer of deferredScheduleSettleTimers.values()) clearTimeout(timer);
+    deferredScheduleSettleTimers.clear();
     vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
@@ -17525,7 +19389,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // detach-preserve a "herdr" session whose real pane is tmux (freeze-once).
         // undefined (frozen pty, or unresolvable legacy) → non-persistent → killWorker.
         if (shutdownBackendDisposition(ds) === 'detach') {
-          // Persistent backends (tmux / herdr / zellij): just kill the worker process —
+          // Persistent backends (tmux / herdr / zellij / zmx): just kill the worker process —
           // the multiplexer session survives for re-attach. The worker's SIGTERM
           // handler calls backend.kill(), which only DETACHES. Going through
           // killWorker() instead would send {type:'close'} → destroySession() →
@@ -17585,4 +19449,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
+  if (coreOnly) {
+    // Readiness barrier release (codex P1-3): restoreActiveSessions + v3 attach +
+    // scheduler + signal handlers are all wired now, so the HTTP surface is safe
+    // to drive. Flip /healthz → 200 THEN print the machine-parseable ready line.
+    // riff's launcher waits for either signal before pointing its client here, so
+    // a trigger can't race a durable restore (transient not_found / re-fire).
+    // Exact ready-line text is a locked contract (regex ^\[core-only\] listening on ).
+    setCoreOnlyReady();
+    // eslint-disable-next-line no-console
+    console.log(`[core-only] listening on 127.0.0.1:${ipcHandle.port} (bot ${cfg.larkAppId}, cli ${cfg.cliId})`);
+  }
 }

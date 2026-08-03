@@ -3,11 +3,13 @@ import { describe, expect, it } from 'vitest';
 import type { ParsedSchedule } from '../src/types.js';
 import {
   computeButtonAvailability,
+  computeDeliveryButtonAvailability,
   computeNextNRuns,
   filterAndPaginateSchedules,
   filterSchedules,
   kindCounts,
   paginateSchedules,
+  resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
   toScheduleRowDto,
   type ScheduleCardTaskInput,
@@ -184,6 +186,26 @@ describe('schedule-card-model · computeNextNRuns', () => {
 });
 
 describe('schedule-card-model · invariants', () => {
+  it('derives all three execution placements, including legacy fresh-topic rows', () => {
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'chat', rootMessageId: 'om_old' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'thread', rootMessageId: 'om_root' }))).toBe('thread');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'top-level', rootMessageId: 'om_root' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'local' }))).toBe('local');
+  });
+
+  it('allows silent execution at every position, including lazy fresh topics', () => {
+    const topLevel = makeTask({ scope: 'chat', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topLevel, 'topic')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability({ ...topLevel, rootMessageId: undefined }, 'topic'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' });
+    const topic = makeTask({ scope: 'thread', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topic, 'top-level')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability(topic, 'new-topic'))
+      .toEqual({ enabled: true });
+  });
+
   it('filter / paginate / toRow do not mutate the input list', () => {
     const tasks = [
       makeTask({ id: 'a', enabled: true, parsed: interval(15) }),
@@ -244,15 +266,24 @@ describe('schedule-card-model · invariants', () => {
   });
 });
 
-describe('schedule-card-model · computeNextNRuns 默认时区 = 本地', () => {
-  it('未注入 timezone 时,cron next-run 落在系统本地整点(默认不再写死 Asia/Shanghai)', () => {
-    const task = makeTask({ parsed: cron('0 9 * * *') });
-    // 不传 timezone → 默认取 scheduleTimeZone()(系统本地)。断言用本地 getHours,
-    // 与实现同源;改动前默认 Asia/Shanghai,在非 +8 机器上此处会 != 9。
-    const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
-    expect(runs).toHaveLength(1);
-    const d = new Date(runs[0]);
-    expect(d.getHours()).toBe(9);
-    expect(d.getMinutes()).toBe(0);
+describe('schedule-card-model · computeNextNRuns 时区 = 显式 host-zone override', () => {
+  it('注入 host 时区后,cron next-run 的墙钟落在该时区整点(消费端行为;真正的 host fallback 由 timezone.test.ts 覆盖)', () => {
+    // computeNextNRuns 不传 timezone 时取 scheduleTimeZone()(env → 全局 config → host)。
+    // 本用例把 BOTMUX_SCHEDULE_TIMEZONE 显式钉到 JS 运行时的 host 时区,测的是「消费端在
+    // 显式 host-zone override 下的墙钟」,而非「无配置时的 host fallback」——后者已由
+    // timezone.test.ts 单测。这样断言 getHours 与被钉时区同源,不受机器 config.json 干扰。
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const task = makeTask({ parsed: cron('0 9 * * *') });
+      const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
+      expect(runs).toHaveLength(1);
+      const d = new Date(runs[0]);
+      expect(d.getHours()).toBe(9);
+      expect(d.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 });

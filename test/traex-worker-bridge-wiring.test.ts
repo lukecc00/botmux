@@ -4,6 +4,20 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('TRAE worker structured-bridge wiring', () => {
+  it('gives the RPC app-server the non-secret Lark route required by botmux ask', () => {
+    const start = workerSource.indexOf('async function engageCodexRpc');
+    const end = workerSource.indexOf('engine = new CodexRpcEngine', start);
+    const envSetup = workerSource.slice(start, end);
+
+    expect(envSetup).toContain('engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;');
+    expect(envSetup).toContain('engineEnv.BOTMUX_CHAT_ID = cfg.chatId;');
+    expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
+    expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
+    expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
+    expect(envSetup).toContain('engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;');
+    expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
+  });
+
   it('dispatches TRAE rollouts to the dedicated task_complete reader', () => {
     const start = workerSource.indexOf('function structuredBridgeIngestPath');
     const end = workerSource.indexOf('\n}\n', start);
@@ -37,5 +51,15 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(follower).toContain('findTraexRolloutByPid(pid)');
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
+  });
+
+  it('does not silently swallow completed TRAE turns whose final text is empty', () => {
+    const start = workerSource.indexOf('function emitReadyCodexTurns');
+    const end = workerSource.indexOf('\n}\n\nfunction stopCodexBridge', start);
+    const body = workerSource.slice(start, end);
+
+    expect(body).toContain('shouldEmitEmptyCompletedBridgeFallback');
+    expect(body).toContain('emptyCompletedBridgeFallbackContent()');
+    expect(body).not.toContain('if (!turn.finalText) continue;');
   });
 });

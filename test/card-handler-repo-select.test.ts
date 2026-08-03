@@ -55,6 +55,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -64,6 +67,7 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killWorker: vi.fn(),
+  teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   scheduleCardPatch: vi.fn(),
   parkStreamCard: vi.fn(),
   clearUsageLimitState: vi.fn(),
@@ -93,6 +97,8 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
 
 vi.mock('../src/core/session-activity.js', () => ({
   publishAttentionPatch: vi.fn(),
+  publishClosedSessionPatch: vi.fn(),
+  announcePendingRepoSession: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -114,6 +120,10 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
+vi.mock('../src/services/default-worktree.js', () => ({
+  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -123,20 +133,22 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
-import { buildNewTopicCliInput, getAvailableBots } from '../src/core/session-manager.js';
+import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
+import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
-import { createSession, closeSession } from '../src/services/session-store.js';
+import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -172,6 +184,9 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
     cliVersion: '1.0.0',
     lastMessageAt: Date.now(),
     hasHistory: true,
+    // Match makeSelectEvent / makeSkipEvent / makeManualEvent open_message_id —
+    // only the live posted card may drive selection.
+    repoCardMessageId: 'om_card',
     ...overrides,
   } as unknown as DaemonSession;
 }
@@ -233,6 +248,8 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
+  vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
   vi.mocked(getBot).mockImplementation(() => ({
     config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
@@ -240,10 +257,11 @@ beforeEach(() => {
     botOpenId: 'ou_bot',
   }) as any);
   let n = 0;
-  vi.mocked(createSession).mockImplementation((chatId: string, rootId: string, title: string, chatType?: string) => ({
+  vi.mocked(createSession).mockImplementation((chatId: string, rootId: string, title: string, chatType?: string, scope?: 'thread' | 'chat') => ({
     sessionId: `uuid-new-${++n}`,
     chatId,
     rootMessageId: rootId,
+    scope,
     title,
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -251,11 +269,39 @@ beforeEach(() => {
   }) as any);
 });
 
+afterEach(async () => {
+  // Repo-card withdrawal deliberately runs in the next macrotask. Drain it
+  // before the following test resets mocks so callbacks cannot leak across
+  // test boundaries and pollute another case's call history.
+  await new Promise<void>(resolve => setImmediate(resolve));
+});
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('repo select card — plain switch', () => {
+  it('mid-session selection publishes the closed preview patch for the displaced session', async () => {
+    const ds = makeDs();
+    const oldSession = ds.session;
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(closeSession).toHaveBeenCalledWith(oldSession.sessionId);
+    expect(publishClosedSessionPatch).toHaveBeenCalledWith(oldSession.sessionId, undefined);
+  });
+
   it('pendingRepo selection forks the CLI with the buffered prompt', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_initial_turn',
+      currentReplyTarget: {
+        rootMessageId: ROOT_ID,
+        turnId: 'om_stale_reply_target',
+        updatedAt: new Date().toISOString(),
+      },
+      worker: null,
+    });
     ds.session.riffRepoDirs = ['/stale/riff/repo'];
     const { deps, sessionReply } = makeDeps(ds);
 
@@ -265,12 +311,82 @@ describe('repo select card — plain switch', () => {
     expect(ds.workingDir).toBe('/repos/alpha');
     expect(ds.session.workingDir).toBe('/repos/alpha');
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({ content: 'mock-prompt' });
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'om_initial_turn' },
+    );
+    expect(ds.pendingTurnId).toBeUndefined();
     expect(ds.session.riffRepoDirs).toBeUndefined();
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已选择');
     expect(killWorker).not.toHaveBeenCalled();
     // First-spawn (pendingRepo) closes nothing, so no "session closed" card.
     expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+    // The buffered message IS the first real user turn — nothing left pending.
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  // ─── empty start (no buffered user input at all) ─────────────────────────
+  //
+  // Reached when the session was created by a bare `/repo` (the message IS the
+  // command, so pendingPrompt is ''). The CLI must boot idle — NOT with an
+  // empty `<user_message>` opening — and leave a durable marker so the user's
+  // next real message gets the full new-topic opening context.
+
+  it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    // No empty/boilerplate `<user_message>` opening burned on the cold start.
+    expect(buildNewTopicCliInput).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('skip_repo with nothing buffered marks the first turn pending too', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('raw-passthrough cold start does NOT mark the first turn pending', async () => {
+    // `/goal …` owns the first turn (delivered literally on prompt_ready), so
+    // this is not an "empty start awaiting its first user turn".
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingRawInput: '/goal 发布 onboarding',
+      pendingRawTurnId: 'om_goal_first',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('mid-session card switch empty-starts the replacement CLI and marks its first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: false });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(killWorker).toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.hasHistory).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
   it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {
@@ -299,13 +415,19 @@ describe('repo select card — plain switch', () => {
       content: 'mock-prompt',
       codexAppInput,
     });
+    expect(vi.mocked(forkWorker).mock.calls[0]).toHaveLength(2);
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
       substituteTrigger,
     }));
   });
 
   it('skip_repo also forwards the complete Codex App sidecar to forkWorker', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_skip_turn',
+      worker: null,
+    });
     ds.session.cliId = 'codex-app';
     const substituteTrigger = {
       target: { userId: 'u_configured' },
@@ -326,13 +448,317 @@ describe('repo select card — plain switch', () => {
     await handleCardAction(makeSkipEvent(), deps, APP_ID);
 
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({
-      content: 'mock-prompt',
-      codexAppInput,
-    });
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      {
+        content: 'mock-prompt',
+        codexAppInput,
+      },
+      { turnId: 'om_skip_turn' },
+    );
+    expect(ds.pendingTurnId).toBeUndefined();
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
       substituteTrigger,
     }));
+  });
+
+  it('keeps the pending repo card untouched when skip_repo is clicked while a worktree is being created', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_pending_turn',
+      repoCardMessageId: 'om_card',
+      worktreeCreating: true,
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    const result = await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(result?.toast?.content).toContain('已有一个 worktree 正在创建');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingPrompt).toBe('hello world');
+    expect(ds.pendingTurnId).toBe('om_pending_turn');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets a pending plain selection win over a concurrent skip_repo during prompt preparation', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    const { deps } = makeDeps(ds);
+    let releaseBots: (() => void) | undefined;
+    vi.mocked(getAvailableBots).mockImplementationOnce(() => new Promise(resolve => {
+      releaseBots = () => resolve([]);
+    }));
+
+    const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(releaseBots).toBeTruthy());
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
+
+    const late = await handleCardAction(makeSkipEvent(), deps, APP_ID);
+    expect(late?.toast?.content).toContain('已有一个 worktree 正在创建');
+    expect(forkWorker).not.toHaveBeenCalled();
+
+    releaseBots!();
+    await first;
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.workingDir).toBe('/repos/alpha');
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+  });
+
+  it('lets skip_repo win over a concurrent plain selection during prompt preparation', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    const { deps } = makeDeps(ds);
+    let releaseBots: (() => void) | undefined;
+    vi.mocked(getAvailableBots).mockImplementationOnce(() => new Promise(resolve => {
+      releaseBots = () => resolve([]);
+    }));
+
+    const first = handleCardAction(makeSkipEvent(), deps, APP_ID);
+    await vi.waitFor(() => expect(releaseBots).toBeTruthy());
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    expect(late?.toast?.content).toContain('已有一个 worktree 正在创建');
+    expect(forkWorker).not.toHaveBeenCalled();
+
+    releaseBots!();
+    await first;
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+  });
+
+  it('holds the pending claim through post-fork confirmation so a second card click cannot mid-session-switch', async () => {
+    // Regression: previously pendingRepoCommitInFlight was cleared right after
+    // forkWorker, while sessionReply was still awaiting. A second card option
+    // in that window saw pendingRepo=false + claim released → treated as
+    // mid-session switch → killWorker + empty new session.
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_first_turn',
+      repoCardMessageId: 'om_card',
+      worker: null,
+    });
+    const { deps, sessionReply } = makeDeps(ds);
+    let releaseReply: (() => void) | undefined;
+    sessionReply.mockImplementation(async () => new Promise<string>(res => {
+      releaseReply = () => res('om_confirm');
+    }));
+
+    const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(releaseReply).toBeTruthy());
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
+    expect(ds.session.sessionId).toBe('uuid-old');
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    // After successful fork the card is marked consumed before confirm reply,
+    // so the second click is rejected even while claim is still held.
+    expect(late?.toast?.content).toMatch(/仓库已选定|worktree 正在创建|ignore the old card/i);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(ds.session.sessionId).toBe('uuid-old');
+    expect(ds.workingDir).toBe('/repos/alpha');
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+
+    releaseReply!();
+    await first;
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.session.sessionId).toBe('uuid-old');
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
+    expect(ds.repoCardMessageId).toBeUndefined();
+  });
+
+  it('skip_repo does not persist the default $HOME cwd onto session.workingDir', async () => {
+    // Regression: skip reused commitRepoSelection which always pinned dirPath.
+    // getSessionWorkingDir falls back to $HOME when unset; pinning that lets a
+    // sibling bot inherit HOME instead of getting its own repo card.
+    const home = homedir();
+    vi.mocked(getSessionWorkingDir).mockReturnValueOnce(home);
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_skip_home',
+      repoCardMessageId: 'om_card',
+      worker: null,
+    });
+    // Explicitly unpinned — the default-dir case.
+    ds.workingDir = undefined;
+    ds.session.workingDir = undefined;
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.workingDir).toBeUndefined();
+    expect(ds.session.workingDir).toBeUndefined();
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已直接开启会话');
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
+  });
+
+  it('returns before pending-card withdrawal settles and still rejects stale clicks', async () => {
+    // The callback must complete before the card-withdraw request settles, or
+    // Feishu can observe a missing/late ACK after the original card disappears.
+    // The local consume mark, rather than the network request, keeps stale
+    // clicks from entering the mid-session switch path.
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_first_turn',
+      repoCardMessageId: 'om_card',
+      worker: null,
+    });
+    // Simulate a live worker after the first fork so a mid-session path would
+    // call killWorker if the stale click were allowed through.
+    vi.mocked(forkWorker).mockImplementationOnce((session) => {
+      (session as any).worker = { killed: false, send: vi.fn() };
+    });
+    const { deps } = makeDeps(ds);
+    let releaseDelete: (() => void) | undefined;
+    vi.mocked(deleteMessage).mockImplementationOnce(() => new Promise<boolean>(res => {
+      releaseDelete = () => res(false); // withdraw "failed" / no-op
+    }) as any);
+
+    const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = first.then(() => !vi.mocked(deleteMessage).mock.calls.length);
+    await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(releaseDelete).toBeTruthy());
+    // Consume is local and synchronous before the background delete.
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+    expect(ds.session.sessionId).toBe('uuid-old');
+
+    const lateWhileDeletePending = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(lateWhileDeletePending?.toast?.content).toMatch(/仓库已选定|worktree 正在创建|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+
+    releaseDelete!();
+    await first;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.session.sessionId).toBe('uuid-old');
+    expect(ds.workingDir).toBe('/repos/alpha');
+
+    // After claim release, Feishu may still show the card (delete returned false).
+    // Consume mark alone must keep rejecting.
+    const lateAfter = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(lateAfter?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe('uuid-old');
+  });
+
+  it('returns before a mid-session card withdrawal settles', async () => {
+    const ds = makeDs();
+    ds.session.workingDir = '/repos/gamma';
+    const { deps } = makeDeps(ds);
+    let releaseDelete: (() => void) | undefined;
+    vi.mocked(deleteMessage).mockImplementationOnce(() => new Promise<boolean>(res => {
+      releaseDelete = () => res(false);
+    }) as any);
+
+    const action = handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = action.then(() => !vi.mocked(deleteMessage).mock.calls.length);
+    await vi.waitFor(() => expect(releaseDelete).toBeTruthy());
+
+    releaseDelete!();
+    await action;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
+    expect(ds.workingDir).toBe('/repos/beta');
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('defers current-repo skip-card withdrawal until the action returns', async () => {
+    const ds = makeDs();
+    const { deps } = makeDeps(ds);
+
+    const action = handleCardAction(makeSkipEvent(), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = action.then(() => !vi.mocked(deleteMessage).mock.calls.length);
+
+    await action;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
+    expect(ds.repoCardMessageId).toBeUndefined();
+  });
+
+  it('keeps the first-spawn session when confirm sessionReply throws (card still marked consumed)', async () => {
+    // Sibling window: sessionReply throws → finally releases claim, card may
+    // still be visible. Consume mark must still reject the second click.
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_first_turn',
+      repoCardMessageId: 'om_card',
+      worker: null,
+    });
+    vi.mocked(forkWorker).mockImplementationOnce((session) => {
+      (session as any).worker = { killed: false, send: vi.fn() };
+    });
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockRejectedValueOnce(new Error('reply boom'));
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+    expect(ds.workingDir).toBe('/repos/alpha');
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe('uuid-old');
+  });
+
+  it('keeps pending buffers and releases the claim when forkWorker throws, then allows retry', async () => {
+    const pendingFollowUps = ['buffered follow-up'];
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingFollowUps,
+      pendingTurnId: 'om_buffered_turn',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+    vi.mocked(forkWorker).mockImplementationOnce(() => { throw new Error('fork boom'); });
+
+    await expect(
+      handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID),
+    ).rejects.toThrow('fork boom');
+
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.pendingPrompt).toBe('hello world');
+    expect(ds.pendingFollowUps).toBe(pendingFollowUps);
+    expect(ds.pendingTurnId).toBe('om_buffered_turn');
+    expect(deleteMessage).not.toHaveBeenCalled();
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(2);
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.pendingPrompt).toBeUndefined();
+    expect(ds.pendingFollowUps).toBeUndefined();
+    expect(ds.pendingTurnId).toBeUndefined();
   });
 
   it('mid-session selection closes the old session and forks a fresh one', async () => {
@@ -359,6 +785,128 @@ describe('repo select card — plain switch', () => {
     // the switch target — otherwise `claude --resume` reopens it in the wrong cwd.
     expect(closedCard).toContain('gamma');
     expect(closedCard).not.toContain('beta');
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('keeps the old ZMX session and repo card active when authoritative teardown is refused', async () => {
+    const ds = makeDs();
+    ds.session.backendType = 'zmx';
+    ds.session.workingDir = '/repos/gamma';
+    const oldSession = ds.session;
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementationOnce(() => {
+      throw new Error('ownership probe unavailable');
+    });
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(teardownAuthoritativePersistentBackingBeforeClose).toHaveBeenCalledWith(ds);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session).toBe(oldSession);
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    expect(ds.consumedRepoCardMessageIds).toBeUndefined();
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('ownership probe unavailable');
+  });
+
+  it('mid-session claims the card before confirm await so a second click cannot double kill/fork', async () => {
+    // Regression: mid-session used to mark consumed only after sessionReply.
+    // Park the "已切换" reply; a second click on the same card must toast and
+    // not kill/create/fork again.
+    const ds = makeDs();
+    ds.session.workingDir = '/repos/gamma';
+    const { deps, sessionReply } = makeDeps(ds);
+    let releaseReply: (() => void) | undefined;
+    sessionReply.mockImplementation(async (_root, text) => {
+      if (typeof text === 'string' && text.includes('已切换') && !releaseReply) {
+        return new Promise<string>(res => { releaseReply = () => res('om_switched'); });
+      }
+      return 'om_reply';
+    });
+
+    const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(releaseReply).toBeTruthy());
+    // Card must already be claimed before the hung confirm reply.
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+    expect(ds.session.sessionId).toMatch(/^uuid-new-/);
+    const sessionAfterFirst = ds.session.sessionId;
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe(sessionAfterFirst);
+    expect(ds.workingDir).toBe('/repos/alpha');
+
+    releaseReply!();
+    await first;
+    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe(sessionAfterFirst);
+  });
+
+  it('rejects a card click after restart-like state (no live repoCardMessageId)', async () => {
+    // P2: consumed list is in-memory; after daemon restart both it and
+    // repoCardMessageId are empty. Old Feishu cards must still be rejected.
+    const ds = makeDs({ repoCardMessageId: undefined, consumedRepoCardMessageIds: undefined });
+    ds.session.workingDir = '/repos/gamma';
+    const { deps } = makeDeps(ds);
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session.sessionId).toBe('uuid-old');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
+  });
+
+  it('mid-session chat selection preserves scope and the original message root', async () => {
+    const originalRoot = 'om_original_chat_start';
+    const ds = makeDs({
+      scope: 'chat',
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        rootMessageId: originalRoot,
+      },
+    });
+    ds.session.workingDir = '/repos/gamma';
+    const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps: CardHandlerDeps = {
+      activeSessions,
+      sessionReply,
+      lastRepoScan: new Map([[CHAT_ID, PROJECTS]]),
+    };
+    const event = {
+      ...makeSelectEvent('repo_switch', '/repos/beta'),
+      action: {
+        option: '/repos/beta',
+        value: { key: 'repo_switch' as const, root_id: CHAT_ID },
+      },
+    };
+
+    await handleCardAction(event, deps, APP_ID);
+
+    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
+    expect(ds.session.scope).toBe('chat');
+    expect(ds.session.rootMessageId).toBe(originalRoot);
+    const persisted = vi.mocked(updateSession).mock.calls.find(
+      ([s]) => s.sessionId.startsWith('uuid-new-'),
+    )?.[0];
+    expect(persisted).toEqual(expect.objectContaining({
+      scope: 'chat',
+      rootMessageId: originalRoot,
+    }));
   });
 
   it('ignores a keyless dropdown (option + root_id, no repo_switch/repo_worktree key)', async () => {
@@ -384,6 +932,37 @@ describe('repo select card — plain switch', () => {
 });
 
 describe('repo select card — worktree open', () => {
+  it('runAutoWorktreeCommit bails when pendingRepo was consumed mid-build (e.g. notifier adopt)', async () => {
+    // A takeover (Codex-notifier「继续处理」, etc.) can consume pendingRepo while
+    // the up-to-30s worktree build runs. The late completion must NOT funnel into
+    // commitRepoSelection and kill+replace the just-adopted session.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const d = deferred<{ dir: string }>();
+    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(d.promise as any);
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify: vi.fn(),
+    });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+
+    // Simulate the takeover consuming pendingRepo while git runs.
+    ds.pendingRepo = false;
+    d.resolve({ dir: '/repos/alpha-wt' });
+    await run;
+
+    // Guard fired: no commit, no fork/kill, workingDir untouched.
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDir).toBeUndefined();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
   it('double click starts ONE background creation and commits once', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
@@ -828,7 +1407,8 @@ describe('repo select card — worktree open', () => {
   });
 
   it('worktree_toggle_mode flips the persisted picker mode and re-sends a fresh repo card', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    // Callback open_message_id must match the live posted card.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
     const { deps, sessionReply } = makeDeps(ds);
     const event = {
       operator: { open_id: OWNER },
@@ -842,7 +1422,7 @@ describe('repo select card — worktree open', () => {
     // persisted the flipped mode (config undefined → true)
     expect(vi.mocked(applyConfigField)).toHaveBeenCalledWith('app_test', expect.objectContaining({ configKey: 'worktreeMultiPicker' }), true);
     // withdrew the old card and posted a fresh interactive repo card
-    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_old_card');
+    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_card');
     const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
     expect(interactiveCall).toBeDefined();
     expect(createRepoWorktree).not.toHaveBeenCalled();
@@ -850,10 +1430,49 @@ describe('repo select card — worktree open', () => {
     expect(ds.worktreeCreating).not.toBe(true);
   });
 
+  it('worktree_toggle_mode rejects a stale/wrong card id before flipping config', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_live_card' });
+    const { deps } = makeDeps(ds);
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_stale_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(vi.mocked(applyConfigField)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
+    expect(ds.repoCardMessageId).toBe('om_live_card');
+  });
+
+  it('worktree_toggle_mode rejects restart-like state with no live repoCardMessageId', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hi',
+      worker: null,
+      repoCardMessageId: undefined,
+      consumedRepoCardMessageIds: undefined,
+    });
+    const { deps } = makeDeps(ds);
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(vi.mocked(applyConfigField)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
+  });
+
   it('worktree_toggle_mode requires canOperate — a non-operator (even the pending-session owner) cannot flip bot config', async () => {
     // It writes bot-level worktreeMultiPicker (bots.json), so it must NOT ride
     // the pendingRepoOwnerException that lets talk-only users start their own session.
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_old_card' });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
     const { deps } = makeDeps(ds);
     vi.mocked(canOperate).mockReturnValueOnce(false); // non-operator
     const event = {

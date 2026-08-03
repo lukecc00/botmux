@@ -13,7 +13,7 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 
 describe('worker backend exit crash ordering', () => {
   it('fences a delayed old-backend exit before it can clear the replacement backend or durable turn', () => {
-    const start = workerSource.indexOf('const observedBackend = backend;');
+    const start = workerSource.indexOf('backend.onExit((code, signal) => {\n    const intentionalRestart = intentionalRestartBackend === observedBackend;');
     const end = workerSource.indexOf('\n\n  if (isPipeMode', start);
 
     expect(start).toBeGreaterThanOrEqual(0);
@@ -38,18 +38,33 @@ describe('worker backend exit crash ordering', () => {
   });
 
   it('drains a persisted reliable terminal before claiming cli_exit ambiguous', () => {
-    const start = workerSource.indexOf('const observedBackend = backend;');
+    const start = workerSource.indexOf('backend.onExit((code, signal) => {\n    const intentionalRestart = intentionalRestartBackend === observedBackend;');
     const end = workerSource.indexOf('\n\n  if (isPipeMode', start);
     const callback = workerSource.slice(start, end);
 
     const reliable = callback.indexOf('cliAdapter?.reliableTurnTerminal === true');
-    const claudeDrain = callback.indexOf('bridgeDrainAndMaybeEmit();', reliable);
-    const structuredDrain = callback.indexOf('codexBridgeDrainAndMaybeEmit({ signalIdle: false });', reliable);
+    // The inline bridge/codex drain was extracted into the shared
+    // drainReliableTerminalBeforeInterrupt() helper (PR #507) so the restart
+    // IPC path drains identically before its own ambiguous emit; onExit calls
+    // it before claiming cli_exit ambiguous. Drain-before-ambiguous ordering is
+    // still what matters and is unit-tested against the helper's internals.
+    const drain = callback.indexOf('drainReliableTerminalBeforeInterrupt();', reliable);
     const ambiguous = callback.indexOf("'ambiguous'", reliable);
 
     expect(reliable).toBeGreaterThanOrEqual(0);
+    expect(drain).toBeGreaterThan(reliable);
+    expect(ambiguous).toBeGreaterThan(drain);
+  });
+
+  it('the shared drain helper keeps claude-before-codex drain order', () => {
+    const fn = workerSource.indexOf('function drainReliableTerminalBeforeInterrupt');
+    expect(fn).toBeGreaterThanOrEqual(0);
+    const body = workerSource.slice(fn, fn + 700);
+    const reliable = body.indexOf('cliAdapter?.reliableTurnTerminal !== true');
+    const claudeDrain = body.indexOf('bridgeDrainAndMaybeEmit();', reliable);
+    const structuredDrain = body.indexOf('codexBridgeDrainAndMaybeEmit({ signalIdle: false });', claudeDrain);
+    expect(reliable).toBeGreaterThanOrEqual(0);
     expect(claudeDrain).toBeGreaterThan(reliable);
     expect(structuredDrain).toBeGreaterThan(claudeDrain);
-    expect(ambiguous).toBeGreaterThan(structuredDrain);
   });
 });

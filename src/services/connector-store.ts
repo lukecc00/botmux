@@ -6,6 +6,7 @@ import { config } from '../config.js';
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
+export type ConnectorTopicMessageMode = 'default' | 'custom' | 'none';
 
 export interface ConnectorDefinition {
   id: string;
@@ -39,6 +40,19 @@ export interface ConnectorDefinition {
     // untrusted event data when a turn fires. Empty/absent = no extra instruction.
     instruction?: string;
   };
+  /** Feishu topic seed shown when this webhook has to open a new topic.
+   *  Missing on older stores means `default` for backwards compatibility. */
+  topicMessage?: {
+    mode: ConnectorTopicMessageMode;
+    /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
+    text?: string;
+  };
+  /** When true, the daemon drops the trailing final_output reply for turns this
+   *  webhook fires (the live streaming card / start notice still show). Lets a
+   *  webhook that only needs the bot's in-topic `botmux send` output avoid the
+   *  extra "完成/总结" message. Missing = false. Ignored for wait/async response
+   *  modes, whose whole contract is to return the final output. */
+  suppressFinalOutput?: boolean;
   loggingPolicy: {
     storePayload: boolean;
     storeHeaders: boolean;

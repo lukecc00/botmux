@@ -1,4 +1,13 @@
 import { defineConfig } from '@rspress/core';
+import { pluginLlms } from '@rspress/plugin-llms';
+
+const docsBase = process.env.BOTMUX_DOCS_BASE || '/';
+// Rspress resolves public assets against `base` when emitting HTML. Keeping
+// the favicon root-relative avoids a duplicated docs/public/botmux lookup;
+// the navbar logo itself needs the public base included in its emitted URL.
+const faviconPath = '/botmux-logo.png';
+const productLogoPath = `${docsBase.replace(/\/+$/, '')}/botmux-logo.png`;
+const socialLogoUrl = 'https://deepcoldy.github.io/botmux/botmux-logo.png';
 
 const zhSidebar = [
   {
@@ -29,6 +38,7 @@ const zhSidebar = [
       { text: '本地白板', link: '/whiteboard' },
       { text: '角色与团队', link: '/roles' },
       { text: 'tmux 会话常驻', link: '/tmux' },
+      { text: 'ZMX 会话后端', link: '/zmx' },
       { text: '会话接入 Adopt', link: '/adopt' },
       { text: '会话接力 Relay', link: '/relay' },
       { text: '一键建会话群', link: '/group' },
@@ -39,6 +49,7 @@ const zhSidebar = [
       { text: '语音总结', link: '/voice' },
       { text: 'Dashboard 管控面', link: '/dashboard' },
       { text: '接入点（Webhook）', link: '/webhook' },
+      { text: 'API 编程式触发任务', link: '/api-task-trigger' },
       { text: 'Workflow（实验性）', link: '/workflow' },
       { text: '生命周期 Hooks', link: '/hooks' },
       { text: 'Skill + CLI 交互', link: '/skill-cli' },
@@ -102,6 +113,7 @@ const enSidebar = [
       { text: 'Local Whiteboard', link: '/en/whiteboard' },
       { text: 'Roles & Teams', link: '/en/roles' },
       { text: 'tmux Session Persistence', link: '/en/tmux' },
+      { text: 'ZMX Session Backend', link: '/en/zmx' },
       { text: 'Adopt a Session', link: '/en/adopt' },
       { text: 'Relay a Session', link: '/en/relay' },
       { text: 'One-Click Session Groups', link: '/en/group' },
@@ -112,6 +124,7 @@ const enSidebar = [
       { text: 'Voice Summary', link: '/en/voice' },
       { text: 'Dashboard', link: '/en/dashboard' },
       { text: 'Webhook Ingress', link: '/en/webhook' },
+      { text: 'Programmatic Task Trigger API', link: '/en/api-task-trigger' },
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },
       { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
@@ -148,13 +161,16 @@ const enSidebar = [
 
 export default defineConfig({
   root: 'docs',
-  base: process.env.BOTMUX_DOCS_BASE || '/',
+  base: docsBase,
   lang: 'zh',
   title: 'botmux 文档',
   description: '飞书话题群 ↔ AI 编程 CLI 桥接',
-  icon: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592185_botmux-favicon.svg',
-  logo: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592185_botmux-favicon.svg',
+  icon: faviconPath,
+  logo: productLogoPath,
   logoText: 'botmux 文档',
+  // llms.txt 支持：产出 /llms.txt（索引）+ /llms-full.txt（全文），并为每篇文档
+  // 生成 .md 纯文本版，方便 AI / LLM 抓取本站内容（AI 友好）。
+  plugins: [pluginLlms()],
   // 多语言：zh 为默认语（无前缀），en 走 /en/ 前缀
   locales: [
     { lang: 'zh', label: '简体中文', title: 'botmux 文档', description: '飞书话题群 ↔ AI 编程 CLI 桥接' },
@@ -164,10 +180,10 @@ export default defineConfig({
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
-    ['meta', { property: 'og:image', content: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592455_botmux-logo.svg' }],
+    ['meta', { property: 'og:image', content: socialLogoUrl }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-    ['meta', { name: 'twitter:image', content: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592455_botmux-logo.svg' }],
-    ['meta', { name: 'theme-color', content: '#06b6d4' }],
+    ['meta', { name: 'twitter:image', content: socialLogoUrl }],
+    ['meta', { name: 'theme-color', content: '#646CEA' }],
   ],
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },

@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/bot-registry.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -70,6 +70,19 @@ describe('registerBot', () => {
     const client = state.client as unknown as { opts: Record<string, unknown> };
     expect(client.opts.appId).toBe('app_test_001');
     expect(client.opts.appSecret).toBe('secret_001');
+  });
+
+  it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {
+    // Regression (riff clean-sandbox boot): apiOnly bots have appSecret='' and the
+    // real Lark SDK ctor throws "appSecret or clientAssertionProvider is required",
+    // fataling core-only at boot. registerBot must skip construction entirely — the
+    // client is null and never used (getBotClient throws LarkTransportDisabledError,
+    // getAllBotClients filters apiOnly). NOTE the suite's FakeClient never throws, so
+    // this asserts the SKIP (client===null), which is what makes the real SDK safe.
+    const state = mod.registerBot({ larkAppId: 'local_riff', larkAppSecret: '', apiOnly: true, cliId: 'codex-app' } as any);
+    expect(state.client).toBeNull();
+    // getBotClient still fail-closes for apiOnly (never returns the null).
+    expect(() => mod.getBotClient('local_riff')).toThrow(/LarkTransportDisabled|core-only|apiOnly|transport/i);
   });
 
   it('should default the SDK Client domain to feishu when brand is unset', () => {
@@ -185,6 +198,60 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(mod.effectiveBotDisplayName(state)).toBe('Claude');
     state.config.displayName = '小助手';
     expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
+  });
+
+  it('normalizes per-chat messageListeners without enabling them by default', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        messageListeners: {
+          oc_chat: {
+            enabled: true,
+            name: '告警监听',
+            replyCardTitle: '  告警自动分析  ',
+            prompt: '只分析告警消息',
+            senderPolicy: {
+              includeSenderOpenIds: [' ou_user ', 'ou_user'],
+              excludeSenderOpenIds: ['ou_noise'],
+              includeSenderTypes: ['user', 'app', 'junk'],
+              excludeSelf: false,
+            },
+            messagePolicy: {
+              includeMsgTypes: ['text', 'post', 'text'],
+            },
+          },
+          oc_disabled: {
+            enabled: false,
+            prompt: 'draft',
+          },
+          oc_bad: {
+            enabled: true,
+            prompt: '   ',
+          },
+        },
+      },
+    ]));
+
+    expect(cfg.messageListeners?.oc_chat).toEqual({
+      enabled: true,
+      name: '告警监听',
+      replyCardTitle: '告警自动分析',
+      prompt: '只分析告警消息',
+      senderPolicy: {
+        includeSenderOpenIds: ['ou_user'],
+        excludeSenderOpenIds: ['ou_noise'],
+        includeSenderTypes: ['user', 'bot'],
+        excludeSelf: false,
+      },
+      messagePolicy: {
+        includeMsgTypes: ['text', 'post'],
+        scope: 'top_level',
+      },
+      replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    });
+    expect(cfg.messageListeners?.oc_disabled.enabled).toBe(false);
+    expect(cfg.messageListeners?.oc_bad).toBeUndefined();
   });
 
   it('normalizes startupCommands (adds leading /, keeps args, dedupes)', () => {
@@ -319,6 +386,7 @@ describe('parseBotConfigsFromText — brand', () => {
                 instructions: '  维护决策和待办。\r\n\t标记负责人。  ',
                 filter: { activityTypes: ['transcript_received', 'chat_received'] },
                 responseMode: 'silent',
+                listenerDelivery: { placement: 'topic' },
                 capabilities: ['meeting.read'],
               },
               {
@@ -348,6 +416,7 @@ describe('parseBotConfigsFromText — brand', () => {
           instructions: '维护决策和待办。\n\t标记负责人。',
           filter: { activityTypes: ['transcript_received', 'chat_received'] },
           responseMode: 'silent',
+          listenerDelivery: { placement: 'topic' },
           capabilities: ['meeting.read'],
         },
         {
@@ -520,6 +589,10 @@ describe('parseBotConfigsFromText — brand', () => {
       .toThrow(/meeting_text requires capability meeting\.output\.request/);
     expect(() => parseProfile({ id: 'legacy-generalist', responseMode: 'listener_thread' }))
       .toThrow(/listener_thread requires listener\.output\.request/);
+    expect(() => parseProfile({ listenerDelivery: { placement: 'broadcast' } }))
+      .toThrow(/listenerDelivery\.placement: must be auto, chat, or topic/);
+    expect(() => parseProfile({ listenerDelivery: { placement: 'topic', extra: true } }))
+      .toThrow(/listenerDelivery: unknown field\(s\): extra/);
     expect(() => parseProfile({
       responseMode: 'listener_thread',
       capabilities: ['meeting.read', 'listener.output.request'],
@@ -734,6 +807,160 @@ describe('parseBotConfigsFromText — brand', () => {
   });
 });
 
+// ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
+
+describe('parseBotConfigsFromText — apiOnly', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('allows an apiOnly bot to omit larkAppSecret (no Feishu connection)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'local_riff', apiOnly: true, cliId: 'codex-app' },
+    ]));
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.larkAppId).toBe('local_riff');
+    // Secret falls back to '' so downstream env plumbing stays a string.
+    expect(cfg.larkAppSecret).toBe('');
+    expect(cfg.cliId).toBe('codex-app');
+  });
+
+  it('preserves an explicit secret on an apiOnly bot if provided', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'local_x', larkAppSecret: 'kept', apiOnly: true },
+    ]));
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.larkAppSecret).toBe('kept');
+  });
+
+  it('throws if an apiOnly bot provides a non-string larkAppSecret (type hole guard)', () => {
+    // "may be omitted; if present must be a string" — a number/object/array/false
+    // must NOT slip into the string-typed field via the exemption.
+    for (const bad of [42, {}, [], false] as const) {
+      expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'local_x', apiOnly: true, larkAppSecret: bad },
+      ])), `secret=${JSON.stringify(bad)}`).toThrow(/larkAppSecret must be a string when provided/);
+    }
+  });
+
+  it('STILL throws for a normal (non-apiOnly) bot missing larkAppSecret', () => {
+    // Guard: the secret exemption must be scoped to apiOnly only. A normal
+    // Feishu bot with no secret is a misconfig, not a headless bot.
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'app_normal' },
+    ]))).toThrow(/larkAppSecret is required/);
+  });
+
+  it('still throws for an apiOnly bot missing larkAppId', () => {
+    // larkAppId stays mandatory in every mode — it is the daemon identity,
+    // dashboard routing key, and cachedLarkAppId gate.
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      { apiOnly: true, cliId: 'codex-app' },
+    ]))).toThrow(/larkAppId is required/);
+  });
+
+  it('leaves apiOnly undefined (not false) for normal bots — keeps bots.json clean', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.apiOnly).toBeUndefined();
+  });
+
+  it('coerces a truthy-but-non-true apiOnly to undefined (strict === true)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', apiOnly: 'yes' },
+    ]));
+    expect(cfg.apiOnly).toBeUndefined();
+  });
+});
+
+// ─── core-only synthesis (BOTMUX_CORE_ONLY) ─────────────────────────────────
+
+describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
+  const saved: Record<string, string | undefined> = {};
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+
+  beforeEach(async () => {
+    mod = await freshImport();
+    fsMock = (await import('node:fs')) as any;
+    for (const k of CORE_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+  });
+  afterEach(() => {
+    for (const k of CORE_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  });
+
+  it('synthesizes ONE apiOnly bot from env with no bots.json / no creds', () => {
+    fsMock.existsSync.mockReturnValue(false); // no ~/.botmux/bots.json on disk
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
+    process.env.BOTMUX_CORE_CLI = 'codex-app';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff');
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].cliId).toBe('codex-app');
+    expect(cfgs[0].larkAppSecret).toBe(''); // never a real Feishu secret
+  });
+
+  it('is AUTHORITATIVE: ignores an ambient ~/.botmux/bots.json (never boots a real fleet bot)', () => {
+    // The bug the smoke test caught: core-only on a host WITH a real bots.json
+    // must NOT fall through and load the real (transport-enabled) fleet bot.
+    fsMock.existsSync.mockReturnValue(true); // a real bots.json exists on disk...
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_real_fleet', larkAppSecret: 'REAL_SECRET', cliId: 'claude-code' },
+    ]));
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff'); // synthetic, NOT cli_real_fleet
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].larkAppSecret).toBe(''); // the REAL_SECRET is never read
+  });
+
+  it('IGNORES an ambient BOTS_CONFIG too (codex P1-2: authoritative, no file override in core-only)', () => {
+    // A leaked/inherited BOTS_CONFIG must NOT boot a file-defined (possibly real
+    // Feishu) bot in core-only — identity is exactly the env-synthesized apiOnly one.
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_real_via_bots_config', larkAppSecret: 'SECRET', cliId: 'claude-code' },
+    ]));
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTS_CONFIG = '/tmp/leaked-bots.json';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff'); // synthetic, NOT the BOTS_CONFIG bot
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].larkAppSecret).toBe('');
+  });
+
+  it('defaults the synthetic id to local_riff and cli to codex-app', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.larkAppId).toBe('local_riff');
+    expect(cfg.cliId).toBe('codex-app');
+  });
+
+  it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'cli_pretending_real';
+    expect(() => mod.loadBotConfigs()).toThrow(/must match local_<slug>/);
+  });
+
+  it('does nothing when BOTMUX_CORE_ONLY is unset (normal file path)', () => {
+    fsMock.existsSync.mockReturnValue(false); // no file → normal path throws
+    expect(() => mod.loadBotConfigs()).toThrow(/No bot configuration found/);
+  });
+});
+
+
 // ─── getBot / getBotClient ────────────────────────────────────────────────
 
 describe('getBot / getBotClient', () => {
@@ -764,6 +991,85 @@ describe('getBot / getBotClient', () => {
 
   it('getBotClient should throw for unknown appId', () => {
     expect(() => mod.getBotClient('missing')).toThrow('Bot not registered: missing');
+  });
+});
+
+describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  const saved = {
+    app: process.env.BOTMUX_LARK_APP_ID,
+    brand: process.env.BOTMUX_BRAND_LABEL,
+    usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
+  };
+  beforeEach(async () => { mod = await freshImport(); });
+  afterEach(() => {
+    if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
+    if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
+    if (saved.usageDisplay === undefined) delete process.env.BOTMUX_USAGE_DISPLAY;
+    else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
+  });
+
+  it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_BRAND_LABEL = '[{cwdName}]({cwdUrl})';
+    // No bot registered, no config path — old code would return undefined; env wins.
+    expect(mod.resolveBrandLabel('app_sbx')).toBe('[{cwdName}]({cwdUrl})');
+  });
+
+  it('present-but-empty env brandLabel means suppress (returns "")', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_BRAND_LABEL = '';
+    expect(mod.resolveBrandLabel('app_sbx')).toBe('');
+  });
+
+  it('ignores env when the appId is NOT the current process bot (no cross-bot bleed)', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_self';
+    process.env.BOTMUX_BRAND_LABEL = '[self]()';
+    expect(mod.resolveBrandLabel('app_other')).toBeUndefined();
+  });
+
+  it('resolves the usage-display mode from registry or sandbox env (default streaming)', () => {
+    expect(mod.resolveUsageDisplay('app_default')).toBe('streaming');
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_registered_footer',
+      usageDisplay: 'footer',
+    }));
+    expect(mod.resolveUsageDisplay('app_registered_footer')).toBe('footer');
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_registered_off',
+      usageDisplay: 'off',
+    }));
+    expect(mod.resolveUsageDisplay('app_registered_off')).toBe('off');
+
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_USAGE_DISPLAY = 'footer';
+    expect(mod.resolveUsageDisplay('app_sbx')).toBe('footer');
+    expect(mod.resolveUsageDisplay('app_other')).toBe('streaming');
+  });
+
+  it('reads a legacy showUsageInCardFooter:false as off', () => {
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_legacy_off',
+      // legacy field, no usageDisplay set
+      showUsageInCardFooter: false,
+    } as any));
+    expect(mod.resolveUsageDisplay('app_legacy_off')).toBe('off');
+  });
+
+  it('prefers freshly loaded registry config over a frozen pane env for the same app', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_hot';
+    process.env.BOTMUX_USAGE_DISPLAY = 'streaming';
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_hot',
+      usageDisplay: 'off',
+    }));
+    expect(mod.resolveUsageDisplay('app_hot')).toBe('off');
+
+    process.env.BOTMUX_USAGE_DISPLAY = 'off';
+    mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
+    expect(mod.resolveUsageDisplay('app_hot')).toBe('streaming');
   });
 });
 
@@ -877,6 +1183,8 @@ describe('loadBotConfigs', () => {
     fsMock.statSync.mockReturnValue({ mtimeMs: 0 });
     // Clean env
     delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
   });
 
   it('should throw when no config source is available', () => {
@@ -902,6 +1210,92 @@ describe('loadBotConfigs', () => {
     expect(configs[0].larkAppId).toBe('env_app');
     expect(configs[0].larkAppSecret).toBe('env_secret');
     expect(configs[0].cliId).toBe('claude-code'); // default
+  });
+
+  it('does not register activation-pending bots before their critical scopes are ready', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs.map(config => config.larkAppId)).toEqual(['ready_app']);
+  });
+
+  it('loads an activating raw slot only for its exact managed daemon identity', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'activating_app',
+      larkAppSecret: 'activating_secret',
+      activationStarting: { appId: 'activating_app', jobId: 'bot_activation' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'activating_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_activation';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('activating_app');
+    expect(mod.isManagedActivationStartingAtIndex(0, 'activating_app', 'bot_activation')).toBe(true);
+  });
+
+  it('loads a committed raw slot only for the same managed activation receipt', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'committed_app',
+      larkAppSecret: 'committed_secret',
+      activationCommitted: { appId: 'committed_app', jobId: 'bot_committed' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'committed_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'wrong_job';
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_committed';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('committed_app');
+  });
+
+  it('rejects a deactivating slot even if a corrupted config lost activationPending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'deactivating_app',
+      larkAppSecret: 'deactivating_secret',
+      activationDeactivating: { appId: 'deactivating_app', jobId: 'bot_deactivating' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+  });
+
+  it('keeps daemon slot indexes stable when an earlier bot is activation-pending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
   });
 
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
@@ -1177,5 +1571,40 @@ describe('loadBotConfigs', () => {
 
     const c = mod.loadBotConfigs()[0];
     expect(c.defaultOncallAutoboundChats).toEqual(['oc_ok', 'oc_also']);
+  });
+});
+
+// ─── vcMeetingAgentConfigActive — apiOnly VC fail-close (codex #668 round-2 B2) ───
+
+describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  beforeEach(async () => { mod = await freshImport(); });
+
+  const enabledVc = { enabled: true, listenerChatId: 'oc_listener' } as any;
+
+  it('returns the config for a NORMAL bot with enabled VC (unchanged behavior)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc }))
+      .toEqual(enabledVc);
+  });
+
+  it('returns undefined for an apiOnly bot EVEN WHEN vcMeetingAgent.enabled is true', () => {
+    // The core B2 invariant: a migrated bots.json (normal VC bot flipped to apiOnly,
+    // leaving enabled:true) must NOT yield an active VC config — otherwise the boot
+    // restore path would spawn `lark-cli vc +meeting-events --as bot`, breaking the
+    // zero-Feishu-network contract. apiOnly short-circuits BEFORE the enabled check.
+    expect(mod.vcMeetingAgentConfigActive({ apiOnly: true, vcMeetingAgent: enabledVc }))
+      .toBeUndefined();
+  });
+
+  it('returns undefined when VC is not enabled (normal bot)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
+      .toBeUndefined();
+    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
+  });
+
+  it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
+      .toBeUndefined();
   });
 });

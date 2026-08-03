@@ -16,6 +16,7 @@
 
 import type { CliId } from '../../adapters/cli/types.js';
 import type { V3GoalNode } from './dag.js';
+import type { RunChatBinding } from './grill-state.js';
 import type { V3ArmedAttemptWorkerFence } from './worker-fence.js';
 
 // ─── Manifest (node product declaration) ───────────────────────────────────
@@ -227,6 +228,10 @@ export interface BotSnapshot {
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */
   sandbox?: boolean;
+  /** New three-tier fs-policy lists (deny-by-default). Carried alongside the
+   *  legacy fields so a workflow worker builds the SAME policy as a normal
+   *  session; without it the readWrite tier + user-expressed deny are lost. */
+  sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
@@ -258,6 +263,13 @@ export interface RunNodeRequest {
   outputDir: string;
   /** Already includes the GOAL_ENV keys; pool merges into the worker env. */
   env: Record<string, string>;
+  /** The run's authenticated chat binding (recorded by the daemon at run
+   *  birth).  The pool threads it into the worker init so the CLI child sees
+   *  the standard BOTMUX_* identity env (real chatId / ownerOpenId / …)
+   *  instead of synthetic `v3-chat-*` values — custom CLI wrappers rely on
+   *  `BOTMUX_OWNER_OPEN_ID` for per-user permission isolation.  Absent for
+   *  standalone/dev runs → synthetic values, no owner env. */
+  chatBinding?: RunChatBinding;
   /** Durable pre-fork ownership record. The pool must activate this exact
    * fence before it sends init, and may resolve only after outer `close`. */
   workerFence?: V3ArmedAttemptWorkerFence;

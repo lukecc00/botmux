@@ -6,9 +6,16 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import {
+  clampGrantQuotaForCard,
+  DEFAULT_GRANT_DURATION_MS,
+  DEFAULT_GRANT_QUOTA,
+  GRANT_DURATION_OPTIONS,
+} from '../../services/grant-policy.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -71,11 +78,12 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
     { action: 'config_set', field: 'lang', ...locVal }));
-  // 私聊单聊模式：thread（默认，每条 DM 独立会话）| chat（扁平连续会话）。thread 与
-  // 未设等价，故 thread 选项用 unset 哨兵：选它即清字段、回默认，避免把字面
-  // 'thread' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启前后一致）。
-  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'chat' ? 'chat' : CONFIG_UNSET,
-    [{ text: t('card.config.p2p.thread', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.chat', undefined, locale), value: 'chat' }],
+  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）。chat 与
+  // 未设等价，故 chat 选项用 unset 哨兵：选它即清字段、回默认（扁平连续 DM），
+  // 避免把字面 'chat' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启
+  // 前后一致）。只有显式 'thread'（每条 DM 独立）才是需要落盘的值。
+  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'thread' ? 'thread' : CONFIG_UNSET,
+    [{ text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' }],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
@@ -340,23 +348,26 @@ export function buildSessionCard(
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
-  const actions: any[] = [
-    {
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
-    },
-  ];
+    });
+  }
   if (!showManageButtons) {
     const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
     if (localBtn) actions.push(localBtn);
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
+    if (terminalUrl) {
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+        type: 'default',
+        value: { action: 'get_write_link', ...actionBase },
+      });
+    }
   }
   if (showManageButtons && !adoptMode) {
     actions.push({
@@ -702,9 +713,9 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
 ): void {
-  const { status, usageLimit, displayMode, imageKey, cliName, locale } = opts;
+  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage } = opts;
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -721,6 +732,17 @@ function pushStreamBody(
       elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
     }
     elements.push({ tag: 'hr' });
+  }
+  // Native Context / Token usage line (grey, small) when this bot displays usage
+  // on the streaming card. Missing metrics are omitted independently by
+  // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
+  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
+  if (usageSeg) {
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${usageSeg}</font>`,
+    });
   }
 }
 
@@ -752,6 +774,7 @@ export function buildStreamingCard(
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
   localCliReady = false,
+  usage?: CardUsageSnapshot,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -761,7 +784,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -788,12 +811,14 @@ export function buildStreamingCard(
       value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-    type: 'primary',
-    multi_url: terminalMultiUrl(terminalUrl),
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'primary',
+      multi_url: terminalMultiUrl(terminalUrl),
+    });
+  }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
@@ -804,12 +829,14 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-    type: 'default',
-    value: { action: 'get_write_link', ...actionBase },
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+      type: 'default',
+      value: { action: 'get_write_link', ...actionBase },
+    });
+  }
   if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
@@ -895,9 +922,8 @@ export function buildStreamingCard(
  * Build a static "private snapshot" card for `/card` in private mode — sent via
  * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
  * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
- * one-shot snapshot of the terminal screenshot plus three buttons:
- *   • read-only "open terminal" link (a plain URL button — no callback);
- *   • "get write link", whose callback DMs the writable link to the clicker;
+ * one-shot snapshot of the terminal screenshot plus controls:
+ *   • when available, a read-only "open terminal" link and "get write link";
  *   • "close session", whose callback kills the session and (in private mode)
  *     sends the "closed" card ephemeral to the owner audience too — so the
  *     session title / CLI name / workingDir on it don't leak to the group.
@@ -953,9 +979,9 @@ export function buildPrivateSnapshotCard(
     }
   }
 
-  elements.push({
-    tag: 'action',
-    actions: [
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push(
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -968,17 +994,21 @@ export function buildPrivateSnapshotCard(
         type: 'default',
         value: { action: 'get_write_link', ...actionBase },
       },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-        type: 'danger',
-        value: { action: 'close', ...actionBase },
-      },
-    ],
+    );
+  }
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+    type: 'danger',
+    value: { action: 'close', ...actionBase },
   });
+  elements.push({ tag: 'action', actions });
   elements.push({
     tag: 'note',
-    elements: [{ tag: 'lark_md', content: t('card.private.snapshot_note', undefined, locale) }],
+    elements: [{
+      tag: 'lark_md',
+      content: t(terminalUrl ? 'card.private.snapshot_note' : 'card.private.snapshot_note_no_terminal', undefined, locale),
+    }],
   });
 
   const card = {
@@ -1267,10 +1297,12 @@ export interface GrantCardOpts {
   nonce: string;
   /** 'request' = 无权限者自助申请；'owner' = owner 主动 /grant。仅文案不同。 */
   mode: 'request' | 'owner';
+  /** 当前卡片暂存的限制；缺省使用产品默认值。 */
+  durationMs?: number;
+  quota?: number;
 }
 
-/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。
- *  多目标共用一张卡，按钮 value 带 target_open_ids 数组，owner 点一次范围套用到全部。 */
+/** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
@@ -1279,27 +1311,129 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
       : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
-  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册
-  // （/grant @bot 成功后顺带「认识」对方，等价内部跑一次 /introduce）。
-  const v = { target_open_ids: o.targets.map(t => t.openId), target_names: o.targets.map(t => t.name), chat_id: o.chatId, nonce: o.nonce };
-  // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
-  // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
-  const grantButtons: any[] = [
-    { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
+  const durationMs = o.durationMs ?? DEFAULT_GRANT_DURATION_MS;
+  // 夹取到卡片可提交区间：历史 messageQuota.defaultLimit（parser 无上限）若 >MAX，
+  // 直接透传会让初值超过 normalize 上限 → owner 一点授权就报「参数无效」发不出。
+  const quota = clampGrantQuotaForCard(o.quota ?? DEFAULT_GRANT_QUOTA);
+  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册。
+  const v = {
+    target_open_ids: o.targets.map(t => t.openId),
+    target_names: o.targets.map(t => t.name),
+    chat_id: o.chatId,
+    nonce: o.nonce,
+    mode: o.mode,
+  };
+  const button = (action: string, text: string, type: string): Record<string, unknown> => ({
+    tag: 'button',
+    type,
+    text: { tag: 'plain_text', content: text },
+    name: action,
+    // v2（schema 2.0）卡片的表单提交按钮用 action_type: 'form_submit'（与本文件其它 2.0 表单
+    // 一致，也是本卡最初 live 验证过的写法）。曾一度改成 v2 的 form_action_type: 'submit'（见
+    // 授权卡 UI 并排布局那次），实测点击授权按钮无任何反应——callback 不触发。故钉回 form_submit。
+    action_type: 'form_submit',
+    value: { action, ...v },
+  });
+  const grantButtons: Array<Record<string, unknown>> = [
+    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
-    grantButtons.push({ tag: 'button', type: 'default', text: { tag: 'plain_text', content: t('card.grant.btn_global', undefined, locale) }, value: { action: 'grant_global', ...v } });
+    grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
   }
-  grantButtons.push({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } });
+  grantButtons.push(button('grant_deny', t('card.grant.btn_deny', undefined, locale), 'danger'));
   const card = {
-    config: { wide_screen_mode: true },
-    header: { template: 'orange', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: body } },
-      { tag: 'hr' },
-      { tag: 'action', actions: grantButtons },
-      { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.grant.note', undefined, locale) }] },
-    ],
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) },
+    },
+    body: {
+      direction: 'vertical',
+      padding: '12px 12px 20px 12px',
+      vertical_spacing: 'medium',
+      elements: [
+        { tag: 'markdown', content: body },
+        {
+          tag: 'form',
+          name: 'grant_limits_form',
+          vertical_spacing: 'large',
+          elements: [
+            {
+              tag: 'column_set',
+              flex_mode: 'bisect',
+              horizontal_spacing: 'medium',
+              columns: [
+                {
+                  tag: 'column',
+                  width: 'weighted',
+                  weight: 1,
+                  vertical_spacing: 'small',
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `**${t('card.grant.duration_label', undefined, locale)}**`,
+                    },
+                    {
+                      tag: 'select_static',
+                      name: 'grant_duration',
+                      width: 'fill',
+                      initial_option: String(durationMs),
+                      placeholder: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
+                      options: [
+                        ...GRANT_DURATION_OPTIONS.map(ms => ({
+                          text: { tag: 'plain_text', content: t(`card.grant.duration_${ms}` as any, undefined, locale) },
+                          value: String(ms),
+                        })),
+                        {
+                          text: { tag: 'plain_text', content: t('card.grant.duration_permanent', undefined, locale) },
+                          value: 'permanent',
+                        },
+                      ],
+                    },
+                  ],
+                },
+                {
+                  tag: 'column',
+                  width: 'weighted',
+                  weight: 1,
+                  vertical_spacing: 'small',
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `**${t('card.grant.quota_label', undefined, locale)}**`,
+                    },
+                    {
+                      tag: 'input',
+                      name: 'grant_quota',
+                      width: 'fill',
+                      default_value: quota === undefined ? '' : String(quota),
+                      placeholder: { tag: 'plain_text', content: t('card.grant.quota_placeholder', undefined, locale) },
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              tag: 'column_set',
+              flex_mode: 'none',
+              horizontal_spacing: 'small',
+              columns: grantButtons.map(action => ({
+                tag: 'column',
+                width: 'auto',
+                vertical_align: 'center',
+                elements: [action],
+              })),
+            },
+          ],
+        },
+        {
+          tag: 'markdown',
+          text_size: 'notation',
+          content: `<font color="grey">${t('card.grant.note', undefined, locale)}</font>`,
+        },
+      ],
+    },
   };
   return JSON.stringify(card);
 }
@@ -1318,16 +1452,16 @@ export function buildGrantNotifyCard(
   target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
   locale?: Locale,
   quota?: number,
+  expiresAt?: number,
 ): string {
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
-  const at = entries.map(e =>
-    e.isBot && e.name && e.name.length > 0
-      ? e.name                                              // bot 有名字：纯文本，不 <at>（不唤醒对方）
-      : `<at id=${e.openId}></at>`,                          // 真人 / bot 无名字：@ 点名（bot 无名字时靠飞书据 open_id 展示身份，代价=可能一次空会话）
-  ).join(' ');
+  const at = renderGrantAtMentions(entries);
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+  if (expiresAt !== undefined) {
+    content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
@@ -1346,13 +1480,92 @@ export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, loc
   return JSON.stringify(card);
 }
 
-/** 授权处置后的终态卡（无按钮，防重复点击）。 */
-export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: Locale): string {
-  const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+/**
+ * Reject card for `/adopt` (and Codex App / resume import) attempted while the
+ * session is still on the first-spawn repo-select gate (`pendingRepo`). Adopt
+ * attaches to an already-running CLI, so it cannot double as a way to finish
+ * that gate: the two states are mutually exclusive by design. Rather than fold
+ * the buffered repo-card messages into the takeover (complex + leaks botmux
+ * envelopes into the external CLI), we refuse and offer a one-tap "close
+ * session" so the user can retire the pending session and re-issue `/adopt`
+ * cleanly. The close button reuses the shared `action: 'close'` handler; the
+ * resulting closed card honours privateCard on its own.
+ */
+export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: CliId | undefined, locale?: Locale): string {
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const card = {
     config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.adopt_blocked.title', undefined, locale) },
+      template: 'orange',
+    },
+    elements: [
+      { tag: 'markdown', content: t('card.adopt_blocked.body', undefined, locale) },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+            type: 'danger',
+            value: { action: 'close', ...actionBase },
+          },
+        ],
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+/** 授权处置后的终态卡（无按钮，防重复点击）。 */
+function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
+  return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
+}
+
+/** 被授权目标的 @ 渲染：bot 有名字用纯文本(不 <at> 免唤醒对方)，真人/无名字 bot 用 <at> 点名。 */
+type GrantTargetEntry = { openId: string; name?: string; isBot?: boolean };
+function renderGrantAtMentions(target: string | string[] | GrantTargetEntry[]): string {
+  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
+    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
+  return entries.map(e =>
+    e.isBot && e.name && e.name.length > 0
+      ? e.name
+      : `<at id=${e.openId}></at>`,
+  ).join(' ');
+}
+
+/** 授权处置后的终态卡（无按钮，防重复点击）。授权成功(chat/global)时**就地 patch 原卡**即为
+ *  此卡：正文直接 @ 被授权人 + 额度/有效期,一张卡既是结果态又 ping 到 ta,无需再单独发通知卡或
+ *  撤回原卡（见申晗 2026-07-31 反馈）。deny 或无 targets 时回落到不带 @ 的简单状态文案。 */
+export function buildGrantResultCard(
+  kind: 'chat' | 'global' | 'deny',
+  locale?: Locale,
+  quota?: number,
+  expiresAt?: number,
+  targets?: string | string[] | GrantTargetEntry[],
+): string {
+  let content: string;
+  const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
+  if (kind !== 'deny' && at) {
+    // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
+    // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
+    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  } else {
+    // deny / 无 targets 回落：简单状态态（无 @）。
+    const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+    content = t(key, undefined, locale);
+    if (kind !== 'deny') {
+      if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
+      if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+    }
+  }
+  const card = {
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
     header: { template: kind === 'deny' ? 'grey' : 'green', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content: t(key, undefined, locale) } }],
+    body: { elements: [{ tag: 'markdown', content }] },
   };
   return JSON.stringify(card);
 }
@@ -1360,7 +1573,7 @@ export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: 
 // ─── TUI Prompt cards ───────────────────────────────────────────────────────
 
 /**
- * Build a Feishu interactive card for a TUI prompt detected by ScreenAnalyzer.
+ * Build a Feishu interactive card for a TUI prompt (ask-hook / CoCo picker).
  * Select-type options get buttons; input-type options shown in list with a note.
  */
 export function buildTuiPromptCard(
@@ -1508,6 +1721,24 @@ export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale
   return JSON.stringify(card);
 }
 
+/** Build a terminal failure state when worker/backend input was not confirmed. */
+export function buildTuiPromptFailedCard(message: string, locale?: Locale): string {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.status.failed', undefined, locale) },
+      template: 'red',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: escapeMd(message) },
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
 // ─── Adopt cards ─────────────────────────────────────────────────────────────
 
 function formatDuration(ms: number): string {
@@ -1640,6 +1871,17 @@ export function buildRelayPickerCard(
    *  Authoritative from the /relay command's session chatType. Default 'group'
    *  covers legacy cards rendered before this field existed. */
   targetChatType: 'group' | 'p2p' = 'group',
+  /** When 'private', the card is (or will be) delivered as an ephemeral card
+   *  visible only to the invoker — so the session title / source-chat name never
+   *  leak to other group members. Baked into every button value as `visibility`
+   *  so the re-render handlers (select / page / search) know they must delete +
+   *  resend an ephemeral card instead of returning a body for Lark to patch in
+   *  place (ephemeral cards can't be PATCH-updated). Default 'public' preserves
+   *  the legacy visible-to-all picker. Only ever set 'private' for flat chat-
+   *  scope 普通群 targets: ephemeral has no thread anchor, so command-handler
+   *  gates it on `targetScope === 'chat'` (thread-scope 话题群/话题 stay public
+   *  in-thread — see the gate comment there). p2p never goes ephemeral. */
+  visibility: 'private' | 'public' = 'public',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1664,6 +1906,7 @@ export function buildRelayPickerCard(
     target_scope: targetScope,
     target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
+    visibility,
     search: searchQuery,
     page,
     selected: selectedSessionId ?? '',
@@ -1904,15 +2147,15 @@ export function buildAdoptSelectCard(
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
   const options = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
-    const project = s.cwd.split('/').pop() || s.cwd;
     const cliName = getCliDisplayName(s.cliId);
+    const backendLabel = zellij ? 'zellij' : s.source;
     const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : unknownUptime;
     const targetLabel = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
     const value = zellij
       ? { zellijSession: s.zellijSession, zellijPaneId: s.zellijPaneId, cliPid: s.cliPid }
       : { key: adoptTargetKey(s), source: s.source, tmuxTarget: s.tmuxTarget, cliPid: s.cliPid };
     return {
-      text: { tag: 'plain_text' as const, content: `${cliName} · ${project} · ${targetLabel} · ${uptime}` },
+      text: { tag: 'plain_text' as const, content: `${cliName} · ${backendLabel} · ${targetLabel} · ${uptime}` },
       value: JSON.stringify(value),
     };
   });
@@ -2032,56 +2275,4 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     ],
   };
   return JSON.stringify(card);
-}
-
-// ── Sandbox landing card (owner reviews the sandbox clone's diff, then applies
-//    it back to the real repo). Owner-gated apply; the agent never sees this. ──
-export interface LandCardOpts {
-  sessionId: string;
-  workingDir: string;
-  statText: string;
-  files: number;
-  insertions: number;
-  deletions: number;
-  preview: string;        // patch text for the in-card preview (already truncated)
-  truncated?: boolean;    // preview was cut → full diff is in the attached .patch
-  patchAttached?: boolean; // a .patch file message accompanies this card
-}
-
-export function buildLandCard(o: LandCardOpts, locale?: Locale): string {
-  const v = { sessionId: o.sessionId, workingDir: o.workingDir };
-  const body = t('card.land.body', { files: o.files, ins: o.insertions, del: o.deletions, dir: escapeMd(o.workingDir) }, locale);
-  const elements: any[] = [{ tag: 'div', text: { tag: 'lark_md', content: body } }];
-  // Use the card v2 `markdown` element (NOT a lark_md div) for the stat + diff —
-  // it renders ``` fenced code blocks as real monospace blocks, which lark_md
-  // divs do not. Paths are already project-relative (computeSandboxDiff).
-  if (o.statText) elements.push({ tag: 'markdown', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```text\n' + o.statText.slice(0, 2000) + '\n```' });
-  if (o.preview) {
-    const note = o.truncated ? `\n\n_${t('card.land.truncated', undefined, locale)}_` : '';
-    elements.push({ tag: 'markdown', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' + note });
-  }
-  if (o.patchAttached) elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.patch_note', undefined, locale) }] });
-  elements.push(
-    { tag: 'hr' },
-    { tag: 'action', actions: [
-      { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.land.btn_apply', undefined, locale) }, value: { action: 'land_apply', ...v } },
-      { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.land.btn_discard', undefined, locale) }, value: { action: 'land_discard', ...v } },
-    ] },
-    { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.note', undefined, locale) }] },
-  );
-  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'turquoise', title: { tag: 'plain_text', content: t('card.land.title', undefined, locale) } }, elements });
-}
-
-export function buildLandResultCard(kind: 'applied' | 'discarded' | 'failed', detail: string, locale?: Locale): string {
-  const meta = {
-    applied: { template: 'green', titleKey: 'card.land.applied_title' },
-    discarded: { template: 'grey', titleKey: 'card.land.discarded_title' },
-    failed: { template: 'red', titleKey: 'card.land.failed_title' },
-  }[kind];
-  const body = detail || (kind === 'discarded' ? t('card.land.discarded_body', undefined, locale) : '');
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { template: meta.template, title: { tag: 'plain_text', content: t(meta.titleKey, undefined, locale) } },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content: body } }],
-  });
 }

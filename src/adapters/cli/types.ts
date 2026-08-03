@@ -10,6 +10,12 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on a dropped write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /**
+   * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
+   * Snapshot transports record this before an ambiguous send so adapters with
+   * double-Ctrl+C exit gestures can keep their own recovery outside the window.
+   */
+  readonly lastInjectedCancelAt?: number;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -29,6 +35,13 @@ export type SubmitRecheckResult = boolean | {
   submitted: boolean;
   cliSessionId?: string;
 };
+
+/** Optional per-input correlation metadata. Adapters that do not need it may
+ * ignore it; runner-based adapters use the immutable botmux/Lark turn id to
+ * keep protocol ids separate from reply-routing ids. */
+export interface WriteInputContext {
+  turnId?: string;
+}
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
  *  surfaced by `/adopt`'s second filter. Unlike an AdoptableSession (a live
@@ -103,8 +116,18 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
+     *  Only codex/codex-app adapters honor it; others ignore. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
+     *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
+     *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
+     *  wedge on Codex 0.14x's interactive "Press t to trust" gate. Undefined ⇒
+     *  treated as false by adapters (the worker always sends an explicit boolean
+     *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
+    bypassHookTrust?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -113,16 +136,15 @@ export interface CliAdapter {
      *  shell subprocesses so `botmux send` finds its cred file) — the isolation
      *  itself is enforced worker-side, not via CLI args. */
     readIsolation?: boolean;
+    /** Hybrid Codex input mode. When set, the codex adapter launches the TUI as
+     *  a client of an external app-server (`--remote <ws>`) and resumes the
+     *  botmux-owned thread, so user input is delivered via JSON-RPC (turn/start)
+     *  instead of a drop-prone tmux paste. Both are set together or neither. */
+    remoteWsUrl?: string;
+    remoteThreadId?: string;
   }): string[];
 
-  /** Optional batch surface for a fresh, isolated structured-model task.
-   *
-   * This is intentionally separate from buildArgs(): callers must never pass a
-   * main-session resume id or drive the live TUI. Implementations use the CLI's
-   * native one-shot mode (for example `codex exec --ephemeral` or
-   * `claude --print --no-session-persistence`) and constrain the final response
-   * with the supplied JSON schema. Absence means the CLI is unsupported for
-   * background distillation and the caller must use its non-LLM fallback. */
+  /** Optional batch surface for a fresh, isolated structured-model task. */
   buildIsolatedStructuredRun?(opts: {
     schema: Readonly<Record<string, unknown>>;
     schemaPath: string;
@@ -131,9 +153,38 @@ export interface CliAdapter {
     model?: string;
   }): IsolatedStructuredRunSpec;
 
+  /** Adapter-specific chance to rewrite the first prompt before buildArgs sees
+   *  it. Used for CLIs that support file positional args for long prompts: the
+   *  worker can still treat the prompt as args-baked and skip stdin fallback. */
+  prepareInitialPromptArg?(opts: {
+    initialPrompt: string;
+    sessionId: string;
+    sessionDataDir?: string;
+  }): {
+    initialPrompt: string;
+    readonlyRoots?: string[];
+    cleanupPaths?: string[];
+    cleanupDirs?: string[];
+    /** Safe, short TUI input used only when worker policy must defer this
+     * prepared argv prompt (startup commands, durable cold-start, etc.). */
+    deferredInput?: {
+      content: string;
+      additionalArgs?: string[];
+      env?: Record<string, string>;
+    };
+  };
+
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
-   *  The worker skips queuing the prompt for stdin write. */
+   *  The worker skips queuing the prompt for stdin write unless another
+   *  defer condition routes it through the post-start input queue. */
   readonly passesInitialPromptViaArgs?: boolean;
+
+  /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
+   *  UTF-8 byte length is GREATER than this adapter-specific limit are not
+   *  baked into launch args; the worker defers them to the normal post-start
+   *  input queue. This guards backend launchers (notably tmux) whose command
+   *  string limit can be much lower than OS ARG_MAX. */
+  readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
    *  silently drops its initial-prompt launch flag on a RESUME spawn (e.g.
@@ -180,7 +231,7 @@ export interface CliAdapter {
   writeInput(
     pty: PtyHandle,
     content: string,
-    context?: { turnId?: string; dispatchAttempt?: number },
+    context?: WriteInputContext,
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
@@ -199,20 +250,13 @@ export interface CliAdapter {
     pty: PtyHandle,
     content: string,
     codexAppInput: CodexAppTurnInput,
-    context?: { turnId?: string; dispatchAttempt?: number },
+    context?: WriteInputContext,
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
-
-  /** Persistent runner reattach hook: ask the still-live runner to replay
-   * structured markers for exact pending turns before new prompts continue. */
-  replayPendingTurns?(
-    pty: PtyHandle,
-    turns: Array<{ turnId: string; dispatchAttempt?: number }>,
-  ): Promise<{ submitted: boolean }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files
@@ -248,9 +292,9 @@ export interface CliAdapter {
     readonly sessionStartCommand?: string;
   };
 
-  /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
-   *  CoCo 走 ensureAskHook 装插件）。 */
+  /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
+   *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
+   *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
@@ -325,12 +369,10 @@ export interface CliAdapter {
   readonly supportsReadIsolation?: boolean;
 
   /** CLI 支持会话内移动工作目录（如 Claude Code ≥2.1.205 的 /cd）。
-   *  true → botmux cd 走 idle 注入（不重启进程）；缺省 → 杀进程冷启动兜底。
-   *  ⚠️ 这是家族级声明，不做运行时版本探测：若部署的二进制过旧（或 fork 变体
-   *  没有会话内 /cd），注入会被 TUI 当 unknown command 静默吞掉——daemon 记录
-   *  已重钉、进程仍留在旧目录，直到下一次 respawn 才收敛（inject_command 已同步
-   *  lastInitConfig.workingDir，任何重启路径都落新目录）。部署前提见
-   *  docs/roles/deploy-runbook.md 第 1 步的版本检查。 */
+   *  ⚠️ 历史能力位，**已从角色切换路由退场**：`botmux role switch` 现统一走「杀 CLI +
+   *  `--resume` 在新 cwd respawn」（适配器无关，见 dashboard-ipc-server 的 cd 路由与
+   *  worker 的 restart case），不再按本字段分流 idle 注入 vs 冷启动。字段保留仅供未来
+   *  可能的会话内移动复用，当前无生产读取点。 */
   readonly supportsSessionCwdMove?: boolean;
 
   /** When true, the worker's soft first-prompt timeout keeps queued input held
@@ -369,15 +411,15 @@ export interface CliAdapter {
   readonly claudeStateJsonPath?: string;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
-   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
-   *  agent's project edits are reviewable), but a CLI's token refresh / login
-   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
-   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
-   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
-   *  `~` is expanded. Default to NARROW (auth only) so session history stays
-   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
-   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
-   *  needs, so a narrow carve-out leaves the CLI unable to start.
+   *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem
+   *  to a deny-by-default whitelist (so the agent only sees the rule paths), but a
+   *  CLI's token refresh / login must PERSIST to the real auth — otherwise the
+   *  sandboxed CLI loses its login (see seed's `bytecloud-auth`). The sandbox binds
+   *  each existing path rw (real host path) so auth reads/refreshes/logins hit the
+   *  real files. `~` is expanded. Default to NARROW (auth only) so session history
+   *  stays out of the sandbox — but widen to the CLI's whole state dir when it keeps
+   *  SQLite DBs there (e.g. codex): only whitelisted paths exist in the sandbox, so
+   *  a narrow carve-out leaves the DB dir absent and the CLI unable to start.
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 
@@ -393,7 +435,7 @@ export interface CliAdapter {
    *  app-server) is the one that must survive `--tmpfs /run`.
    *
    *  Return ONLY executable paths — never plain path args like the working dir,
-   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  whose parent dir re-bind would shadow the project bind and widen exposure.
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
@@ -431,6 +473,9 @@ export interface CliAdapter {
     /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
      *  targets the SAME root the adapter will actually write into. */
     dataDir?: string;
+    /** Optional CLI-specific resume store path resolved by the worker after
+     *  applying per-bot env/profile settings (for example Hermes state.db). */
+    stateDbPath?: string;
   }): boolean | undefined;
 
   /** Optional: discover sessions resumable from this CLI's on-disk transcript

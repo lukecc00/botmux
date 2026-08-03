@@ -185,12 +185,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'traex',
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
-    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — the sandbox home
-    // overlay lacks the fcntl locks SQLite needs (same failure as codex.ts).
+    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
+    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
+    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+      }
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -198,9 +209,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           // "Hooks need review" gate
           // after folder trust. Goal-mode workers have no human at their PTY,
           // so without the automation-specific hook flag they never reach the
-          // prompt and `/goal` is never delivered. Keep it tied to the existing
-          // bypass decision: restricted bots must not gain hook trust.
-          '--dangerously-bypass-hook-trust',
+          // prompt and `/goal` is never delivered. Gated by the same global
+          // `bypassHookTrust` toggle as codex (default ON, operator can disable —
+          // it trusts ALL hook sources, not only botmux's), still ANDed with the
+          // existing bypass decision: restricted bots must not gain hook trust.
+          ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
         ...goalEnvConfigArgs(),
@@ -340,6 +353,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // RPC mode bridges native AskUserQuestion directly. Keep the normal
+    // botmux-ask skill available too: TraeX sessions can fail closed to a
+    // standard PTY when RPC is unavailable, where native questions cannot
+    // reach the card bridge.
+    asksViaHook: false,
   };
 }
 

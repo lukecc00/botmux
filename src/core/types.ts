@@ -8,7 +8,6 @@ import type {
   DisplayMode,
   StreamStatus,
   VcMeetingImTurnOrigin,
-  CodexFreshHandoffReason,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
@@ -40,11 +39,24 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
    * sessions; live workers publish it with their ready event. */
   workerViewToken?: string | null;
+  /** Latest process identity reported over the trusted worker IPC channel.
+   * Used to quiesce legacy unconfined CLIs before device credentials exist. */
+  localProcessAttestation?: {
+    backendType: import('../adapters/backend/types.js').BackendType;
+    credentialIsolated: boolean;
+    cliPid?: number;
+    cliProcStart?: string;
+    workerGeneration?: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
@@ -64,10 +76,33 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
+   *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
+   *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
+   *  其他用户直接读到（绕过 dashboard cookie + loopback-HMAC）。worker 每次 ready
+   *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
+  spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
+  /** One in-memory owner is preparing the pending repo's first worker. Kept
+   *  separate from worktreeCreating because plain select, skip, and /repo can
+   *  also await prompt context before the fork. */
+  pendingRepoCommitInFlight?: boolean;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
+  /**
+   * Repo-select card message ids already consumed by a successful pending→worker
+   * transition (or an explicit mid-session card switch). Stale clicks on these
+   * cards must not be treated as a new mid-session switch that kills the just-
+   * started worker — Feishu card withdraw is best-effort and may lag or fail.
+   * In-memory only; not persisted.
+   */
+  consumedRepoCardMessageIds?: string[];
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact Lark message id whose user input is waiting for the first worker
+   *  spawn. This is intentionally in-memory and must come from the accepted
+   *  inbound event: restoring a session must never recover per-turn authority
+   *  from an older persisted quote target. */
+  pendingTurnId?: string;
   /** Clean Codex App text/context retained alongside pendingPrompt while repo
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
@@ -82,31 +117,33 @@ export interface DaemonSession {
    *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
    *  daemon restart. */
   pendingRawInput?: string;
-  /** Codex-only /compact migration. While set, the next transcript-backed
-   * final output is the requested Handoff Summary and is consumed by the
-   * daemon to seed a brand-new Codex session in the same Lark topic. Its serializable
-   * fields mirror Session.codexFreshHandoff so daemon restart can recover the
-   * migration without resuming the exhausted native Codex thread. */
+  /** Exact accepted turn for pendingRawInput. Kept until prompt_ready delivers
+   *  the literal command. Raw cold-start workers deliberately spawn without
+   *  human turn authority; the worker rotates this turn immediately before
+   *  the command is written to the CLI. */
+  pendingRawTurnId?: string;
+  /** In-memory owner of a durable Codex fresh-session handoff. */
   pendingCodexFreshHandoff?: {
     requestedAt: number;
-    reason: CodexFreshHandoffReason;
+    reason: import('../types.js').CodexFreshHandoffReason;
     requestId: string;
     interruptedTurnId?: string;
     interruptedUserGoal?: string;
     summaryTurnId: string;
     phase: 'collecting' | 'migrating' | 'completed';
     selectedSummary?: string;
-    /** Same as Session.codexFreshHandoff.newTopicAnchor. New handoffs retain
-     * the source Lark topic; legacy values are repaired to that topic. */
     newTopicAnchor?: string;
     newSessionId?: string;
-    /** Mirrors Session.codexFreshHandoff.sourceTopicNoticeSentAt. */
     sourceTopicNoticeSentAt?: string;
     migrationInFlight?: boolean;
     retryCount?: number;
     failureNotified?: boolean;
     timeout?: NodeJS.Timeout;
   };
+  /** One terminal conversation-stop notice per session lifetime. */
+  stopNoticeSent?: boolean;
+  stopNoticeInFlight?: Promise<void>;
+  stopNoticeLifecycleId?: string;
   /** Wrapped prompt for messages buffered while a pendingRawInput session
    *  waited for repo selection (pendingFollowUps / attachments). Built at the
    *  fork site (where prompt-building context lives) and delivered right
@@ -116,6 +153,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: {
     userPrompt: string;
     cliInput: string;
+    turnId?: string;
     codexAppInput?: CodexAppTurnInput;
     /** The clean-input feature gate was evaluated when this follow-up was
      * staged; prompt_ready must not re-read a later config value. */
@@ -129,6 +167,9 @@ export interface DaemonSession {
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
+  /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
+   *  mixed callers so the combined prompt fails closed instead of borrowing. */
+  pendingFollowUpTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
@@ -143,6 +184,18 @@ export interface DaemonSession {
    *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
+  /** Turn-exact ids for silent scheduled fires. Every worker→Lark output path
+   *  checks its own turn id against this bounded in-memory registry, so a
+   *  queued normal user turn cannot un-hush the schedule (or inherit its hush).
+   *  Entries outlive turn_terminal briefly to cover trailing worker events and
+   *  are pruned by age/size when new silent turns are armed. */
+  silentScheduledTurns?: Map<string, number>;
+  /** Turn-exact ids for loud external triggers whose connector opted into
+   *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
+   *  (the streaming card / start notice still show); keyed on the trigger turn
+   *  id so a normal user turn on the same session is unaffected. Bounded +
+   *  age-pruned like silentScheduledTurns. */
+  suppressedTriggerFinalTurns?: Map<string, number>;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
@@ -159,21 +212,6 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
-  /** Successfully delivered structured progress UUIDs (bounded, in-memory
-   * fast path; the durable outbox + provider UUID are authoritative). */
-  progressOutputUuids?: Set<string>;
-  /** Structured progress records currently owned by this daemon process. */
-  progressOutputInFlight?: Set<string>;
-  /** Per-session promise chain keeps separate commentary cards in model order. */
-  progressDeliveryTail?: Promise<void>;
-  /** One terminal conversation-stop notice per session lifetime.  This is an
-   * in-memory fast path; the Lark request UUID is the cross-race dedupe fence. */
-  stopNoticeSent?: boolean;
-  stopNoticeInFlight?: Promise<void>;
-  stopNoticeLifecycleId?: string;
-  /** Set before close teardown starts so retry timers cannot post after the
-   * topic is closed, without mutating the persisted Session status early. */
-  progressDeliveryClosed?: boolean;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
@@ -183,6 +221,10 @@ export interface DaemonSession {
   riffAccessUrl?: string;
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Interval that re-PATCHes the live streaming card with fresh Context/Token
+   *  usage while a turn is executing (streaming display mode). Armed on the
+   *  working edge, cleared on idle/turn-end/card removal. */
+  usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;
@@ -210,6 +252,7 @@ export interface DaemonSession {
     createdAt: number;
     completedAt?: number;
     content?: string;
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
@@ -228,6 +271,37 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
+  /** turnId of the last stuck_warning posted — dedup so we don't spam the
+   *  thread with repeated warnings for the same unresolved turn. */
+  stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
+  /** Daemon-side monotonic counter for stuck_warning nonces. NEVER cleared —
+   *  even when the active warning authority is dropped, the counter keeps
+   *  climbing so a late POST result / ACK from a previous warning (nonce=N)
+   *  can never match a newer warning that happened to reuse N after a clear.
+   *  stuckWarningNonce (below) is the active warning's nonce and may clear. */
+  stuckWarningNonceCounter?: number;
+  /** Daemon-side monotonic nonce for the active stuck_warning. Bumped on every
+   *  new warning so a late POST result or stale card click from a previous
+   *  warning (or a previous worker generation) cannot resurrect authority. */
+  stuckWarningNonce?: number;
+  /** Page type of the active stuck-warning card ('hook review level 1' or
+   *  'hook review level 2') — forwarded to the worker on card click so it can
+   *  re-verify the current screen before injecting keys. */
+  stuckWarningPageType?: string;
+  /** When true, a card click has been dispatched to the worker and we are
+   *  waiting for the tui_keys_delivered / stuck_warning_expired ACK. Blocks
+   *  duplicate clicks from injecting keys twice. */
+  stuckWarningProcessing?: boolean;
+  /** Worker's cliLifetimeNonce at the time the stuck_warning was posted.
+   *  Forwarded back to the worker in tui_keys so it can verify the backend
+   *  hasn't been replaced within the same worker process. */
+  stuckWarningCliLifetime?: number;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
@@ -293,11 +367,77 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
   return `${anchorId}::${larkAppId}`;
 }
 
+const CONSUMED_REPO_CARD_CAP = 16;
+
+/** Record a repo-select card as already consumed. Correctness for stale clicks
+ *  depends on this local mark — not on Feishu deleteMessage succeeding. */
+export function markRepoCardConsumed(ds: DaemonSession, cardMessageId: string | undefined): void {
+  if (!cardMessageId) return;
+  const ids = ds.consumedRepoCardMessageIds ?? (ds.consumedRepoCardMessageIds = []);
+  if (!ids.includes(cardMessageId)) ids.push(cardMessageId);
+  if (ids.length > CONSUMED_REPO_CARD_CAP) ids.splice(0, ids.length - CONSUMED_REPO_CARD_CAP);
+}
+
+export function isRepoCardConsumed(ds: DaemonSession, cardMessageId: string | undefined): boolean {
+  return !!cardMessageId && !!ds.consumedRepoCardMessageIds?.includes(cardMessageId);
+}
+
+/**
+ * Whether a card callback may drive repo selection for this session.
+ * Only the currently posted card (`ds.repoCardMessageId`) is valid — after it
+ * is claimed/cleared, or after a daemon restart (field is in-memory), stale
+ * Feishu cards must not mid-session-switch. Previously-consumed ids are also
+ * rejected while the process is still up.
+ */
+export function isActiveRepoCard(ds: DaemonSession, cardMessageId: string | undefined): boolean {
+  if (!cardMessageId) return false;
+  if (isRepoCardConsumed(ds, cardMessageId)) return false;
+  return ds.repoCardMessageId === cardMessageId;
+}
+
+/**
+ * Atomically claim the session's current repo-select card for this action.
+ * Succeeds only when `cardMessageId` is the live `ds.repoCardMessageId` (or
+ * `cardMessageId` is omitted and a current card exists — text path withdrawing
+ * the open card). On success: clears `repoCardMessageId` and marks consumed
+ * BEFORE any killWorker / network await so concurrent callbacks cannot
+ * double-switch. Returns the claimed id, or undefined if the action must not
+ * proceed as a card-driven selection.
+ */
+export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | undefined): string | undefined {
+  const current = ds.repoCardMessageId;
+  if (!current) {
+    // No live card — reject any card id (restart / already claimed). Text path
+    // with no cardMessageId also gets undefined (caller proceeds without card).
+    return undefined;
+  }
+  if (cardMessageId && cardMessageId !== current) return undefined;
+  if (isRepoCardConsumed(ds, current)) {
+    ds.repoCardMessageId = undefined;
+    return undefined;
+  }
+  ds.repoCardMessageId = undefined;
+  markRepoCardConsumed(ds, current);
+  return current;
+}
+
 /** Resolve the routing anchor for an active session — chatId for chat-scope
  *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
+  const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
+  if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** Resolve a persisted session's daemon routing anchor without first building
+ * a DaemonSession. Deferred schedule runs are isolated even though their
+ * visible delivery surface is a chat. */
+export function storedSessionAnchorId(
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun'>,
+): string {
+  return session.deferredScheduleRun?.routingAnchor
+    ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
 /** Storage key for the daemon-owned activeSessions map. A VC receiver is a
@@ -316,4 +456,29 @@ export function activeSessionKey(ds: DaemonSession): string {
  * cards and other chat API calls must never target it. */
 export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
   return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
+}
+
+/** A session created by the HTTP control API (`waitForFinalOutput` /
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
+ * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * targeting it (sendMessage / card / reply / roster probe) would fail — these
+ * sessions are request/response only and must never touch Lark transport. */
+export function isHttpVirtualSession(chatId: string): boolean {
+  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+}
+
+/** Central Lark-transport capability gate for a live session. Returns false —
+ * meaning "no Feishu side effects are permitted for this session" — when either
+ * the owning bot is core-only (`apiOnly`, never connected to Feishu) OR the
+ * session's surface is a synthetic HTTP virtual chat. Every auxiliary-UI /
+ * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
+ * instead of re-deriving the condition, so a new no-Feishu surface is covered
+ * everywhere by construction. `doc:` sessions keep their own dedicated routing
+ * (comment API), so they are intentionally NOT folded in here. */
+export function larkTransportEnabled(
+  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+): boolean {
+  if (ds.apiOnly === true) return false;
+  if (isHttpVirtualSession(ds.chatId)) return false;
+  return true;
 }

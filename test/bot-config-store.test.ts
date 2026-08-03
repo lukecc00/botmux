@@ -25,14 +25,16 @@ vi.mock('../src/im/lark/client.js', () => ({
   resolveAllowedUsersWithMap: async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
     const resolved: string[] = [];
+    const entryStatus = new Map<string, 'resolved' | 'transient' | 'definitive'>();
     for (const v of raw) {
       let id: string | undefined;
       if (v.startsWith('ou_')) id = v;
       else if (v.startsWith('on_')) id = 'ou_' + v.slice(3);
       else if (v.includes('@')) id = 'ou_' + v.split('@')[0];
-      if (id) { resolved.push(id); map.set(v, id); }
+      if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
+      else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map };
+    return { resolved, map, entryStatus };
   },
 }));
 
@@ -50,8 +52,11 @@ describe('bot-config store', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-cfgstore-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    // Isolate the allowedUsers sidecar (setBotAllowedUsers writes it) into the
+    // same tmp dir so tests don't pollute the real ~/.botmux/data.
+    process.env.SESSION_DATA_DIR = dir;
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
 
   function writeConfig(entry: Record<string, unknown> = {}) {
     writeFileSync(configPath, JSON.stringify([{
@@ -383,6 +388,33 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('usageDisplay')!;
+    expect(spec.effect).toBe('immediate');
+    expect(spec.kind).toBe('enum');
+    expect(spec.clearable).toBe(true);
+    expect(spec.enumValues).toEqual(['streaming', 'footer', 'off']);
+
+    // coerce validates the enum (case-insensitive) and rejects nonsense.
+    expect(store.coerceConfigValue(spec, 'footer')).toEqual({ ok: true, value: 'footer' });
+    expect(store.coerceConfigValue(spec, 'nonsense')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const toFooter = await store.applyConfigField('app_default', spec, 'footer');
+    expect(toFooter).toMatchObject({ ok: true, newText: 'footer', effect: 'immediate' });
+    expect(readConfig().usageDisplay).toBe('footer');
+    expect(registry.getBot('app_default').config.usageDisplay).toBe('footer');
+
+    const toOff = await store.applyConfigField('app_default', spec, 'off');
+    expect(toOff).toMatchObject({ ok: true, newText: 'off' });
+    expect(readConfig().usageDisplay).toBe('off');
+
+    // Clearing (unset) drops the key → back to the default 'streaming'.
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().usageDisplay).toBeUndefined();
+    expect(registry.getBot('app_default').config.usageDisplay).toBeUndefined();
   });
 
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {

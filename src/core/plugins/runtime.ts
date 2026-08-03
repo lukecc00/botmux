@@ -29,7 +29,12 @@ export interface PluginServiceDefinition {
     args?: string[];
     env?: Record<string, string>;
     autorestart?: boolean;
+    killTimeoutMs?: number;
+    watchDelayMs?: number;
   };
+  /** Build the plugin's advertised URLs. `host` is already URL-ready — an IPv6
+   *  literal arrives bracketed (`[::1]`) — so interpolate it straight into a URL
+   *  (`http://${host}:${port}/`) without re-formatting. */
   urls?(ctx: { host: string; env: Record<string, string>; port?: number }): {
     openUrl?: string;
     healthUrl?: string;

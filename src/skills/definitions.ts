@@ -48,12 +48,12 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--deliver origin|local] [--new-topic]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--silent]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
-可选 \`--deliver local\` 表示只记录不推送（适合"每小时检查一次，没事就别打扰我"）。
-可选 \`--new-topic\`（等价 \`--deliver new-topic\`）：每次触发都在同群开一个**全新话题**、起一个独立 CLI 会话，多次执行互不串扰（适合日报这类"每天一篇、各自独立"的任务）。斜杠命令里也可在 prompt 前加"新话题"关键字，如 \`/schedule 每日9:00 新话题 生成日报\`。
+可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
+执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 
 ### 查看
 
@@ -90,9 +90,9 @@ botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看�
 
 ## 到点会发生什么
 
-- botmux daemon 每 30 秒 tick 一次，到点会在**原话题**里自动续一条消息并把 prompt 喂给一个新的 CLI 会话
+- botmux daemon 每 30 秒 tick 一次，到点会在任务绑定的**群消息顶层、原话题或每次新建的话题**里执行 prompt
 - 工作目录与创建任务时一致
-- 如果原话题的会话还活着，prompt 会直接注入现有会话（不会开新会话）
+- 固定话题或群顶层已有可复用会话时会直接注入；显式「每次新话题」始终创建独立会话
 
 ## 跨群发布场景（changelog 群、动态频道等）
 
@@ -109,6 +109,36 @@ botmux schedule add "每日11:00" "
 \`\`\`
 
 详见 \`botmux-send\` 技能的"顶层广播 / 跨群发布"章节。
+`;
+
+const CHAT_RENAME_SKILL = `---
+name: botmux-chat-rename
+description: 在当前飞书/Lark 群运转过程中修改群名称。用户明确要求改群名，或 AI 判断群目标/关键阶段已明显变化且群名需要同步时触发。只能修改当前会话所在群，执行改名的 bot 必须在群内。
+---
+
+# botmux-chat-rename — 修改当前群名称
+
+用受控命令修改当前会话所在的飞书群名称：
+
+\`\`\`bash
+# 用户明确要求改名
+botmux chat rename "新的群名称"
+
+# AI 根据任务关键阶段主动改名（有 10 分钟防抖）
+botmux chat rename "支付链路排障｜待验证" --proactive
+\`\`\`
+
+规则：
+
+1. 只能修改当前会话所在群，不能指定 chat-id 或切换其他 bot 身份。
+2. 用户明确要求时直接执行；AI 主动改名只用于群目标或关键阶段发生明显变化。
+3. 保持核心主题稳定，优先只调整阶段后缀；不要因细小进度反复改名。
+4. 群名应简短、稳定、可读，不写精确百分比、敏感或评价性措辞。
+5. 不确定群的主要目标、只有临时支线话题、或用户要求不要自动改名时，不主动改名。
+6. 命令输出 JSON。成功后简短告知用户最终名称；失败时说明 error 及可行动的修复方式。
+
+常见错误：\`not_group_chat\`、\`bot_not_in_chat\`、\`invalid_chat_name\`、
+\`permission_denied\`、\`rate_limited\`、\`lark_api_error\`。
 `;
 
 const HISTORY_SKILL = `---
@@ -246,6 +276,8 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 # botmux-send — 向飞书话题发送消息
 
 **核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
+
+**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
 
 **格式自动处理**：内容含 markdown 语法时自动用飞书卡片（schema 2.0）发送，原生渲染；纯文本走普通消息。**该用 md 就用 md**——结构化内容（列表、表格、代码块）不要手撸成纯文本。
 
@@ -1474,6 +1506,7 @@ export const ASK_SKILL_NAME = 'botmux-ask';
 export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
+  { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

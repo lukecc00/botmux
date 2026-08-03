@@ -5,8 +5,11 @@ import type {
   GlobalConfig,
   MaintenanceConfig,
 } from '../src/global-config.js';
+import { GROUP_NAME_PREFIX_MAX_LENGTH } from '../src/global-config.js';
 import {
   applySettingsWrite,
+  hasResolvedCodexNotifierRecipient,
+  resolveCodexNotifierRecipientView,
   type ResolvedDashboardSettingsView,
   type SettingsWriteApplierDeps,
 } from '../src/dashboard/settings-write-applier.js';
@@ -16,12 +19,27 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const storedMaintenance: MaintenanceConfig = {};
   const storedGlobal: GlobalConfig = {};
   const settingsView: ResolvedDashboardSettingsView = {
+    groupNamePrefix: '',
     publicReadOnly: false,
     openTerminalInFeishu: false,
     enableLocalCliOpen: false,
     localCliOpenMode: 'attach',
     chatBotDiscovery: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
+    codexRpcInput: false,
+    codexNotifier: {
+      enabled: false,
+      targetBotAppId: null,
+      notifyWhen: 'locked_only',
+      platformSupported: true,
+      hookInstalled: false,
+    },
+    hostOverloadAlert: {
+      enabled: false,
+      targetBotAppId: null,
+      enterLoadRatio: 1.5,
+      enterMemUsedFrac: 0.92,
+    },
     vcMeetingAgent: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -34,6 +52,12 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     }),
     mergeGlobalConfig: vi.fn((patch) => {
       Object.assign(storedGlobal, patch);
+    }),
+    writeCodexNotifierConfig: vi.fn((config) => {
+      storedGlobal.codexNotifier = config;
+    }),
+    writeHostOverloadAlertConfig: vi.fn((config) => {
+      storedGlobal.hostOverloadAlert = config;
     }),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
@@ -50,11 +74,66 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
     syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
     validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
+    validateCodexNotifierTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
+    validateHostOverloadAlertTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
+    installCodexNotifierHook: vi.fn(),
+    isCodexNotifierPlatformSupported: vi.fn(() => true),
     ...overrides,
   };
 }
 
+describe('hasResolvedCodexNotifierRecipient', () => {
+  it('accepts the first usable administrator without requiring every configured entry to resolve', () => {
+    expect(hasResolvedCodexNotifierRecipient(['ou_owner'])).toBe(true);
+    expect(hasResolvedCodexNotifierRecipient(['invalid', 'ou_owner', 'ou_owner'])).toBe(true);
+  });
+
+  it('rejects an offline or unresolved administrator list', () => {
+    expect(hasResolvedCodexNotifierRecipient(undefined)).toBe(false);
+    expect(hasResolvedCodexNotifierRecipient([])).toBe(false);
+    expect(hasResolvedCodexNotifierRecipient(['on_owner', 'owner@example.com'])).toBe(false);
+  });
+});
+
+describe('resolveCodexNotifierRecipientView', () => {
+  it('shows the same resolved open_id that daemon will actually receive', () => {
+    expect(resolveCodexNotifierRecipientView(
+      ['unresolved@example.com', 'second@example.com'],
+      ['ou_actual_recipient'],
+    )).toEqual({
+      recipientConfigured: true,
+      recipientVerified: true,
+      recipientHint: 'ou_actua…ient',
+    });
+  });
+
+  it('does not present an unresolved configured account as the recipient', () => {
+    expect(resolveCodexNotifierRecipientView(
+      ['unresolved@example.com'],
+      [],
+    )).toEqual({
+      recipientConfigured: true,
+      recipientVerified: false,
+      recipientHint: null,
+    });
+  });
+});
+
 describe('applySettingsWrite happy paths', () => {
+  it('preserves separator whitespace in groupNamePrefix', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: '[AI] ' });
+  });
+
+  it('clears groupNamePrefix when the dashboard saves an empty value', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: null });
+  });
+
   it('writes publicReadOnly toggle and echoes the resolved snapshot', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: true }, deps);
@@ -90,6 +169,28 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ chatBotDiscovery: false }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
+  });
+
+  it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
+  it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: false }, deps);
+    expect(r.ok).toBe(true);
+    // Must persist the explicit false so the default-ON getter (`!== false`) sees it.
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: false });
+  });
+
+  it('writes bypassCodexHookTrust=true (re-enable) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: true });
   });
 
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
@@ -165,9 +266,147 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith(null, 'cli_listener');
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
+
+  it('merges a partial codexNotifier patch without revalidating an unchanged target', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        codexNotifier: {
+          enabled: false,
+          targetBotAppId: 'cli_notify',
+          notifyWhen: 'locked_only',
+        },
+      })),
+    });
+
+    const r = await applySettingsWrite({ codexNotifier: { notifyWhen: 'always' } }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(deps.validateCodexNotifierTargetBotAppId).not.toHaveBeenCalled();
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.writeCodexNotifierConfig).toHaveBeenCalledWith({
+      enabled: false,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+  });
+
+  it('can disable codexNotifier while the persisted target daemon is offline', async () => {
+    const validate = vi.fn(async () => ({
+      ok: false as const,
+      error: 'codexNotifier_target_daemon_offline',
+    }));
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        codexNotifier: {
+          enabled: true,
+          targetBotAppId: 'cli_notify',
+          notifyWhen: 'locked_only',
+        },
+      })),
+      validateCodexNotifierTargetBotAppId: validate,
+    });
+
+    const r = await applySettingsWrite({ codexNotifier: { enabled: false } }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(validate).not.toHaveBeenCalled();
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.writeCodexNotifierConfig).toHaveBeenCalledWith({
+      enabled: false,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'locked_only',
+    });
+  });
+
+  it('saves an offline target while notifications remain disabled', async () => {
+    const validate = vi.fn(async (
+      _appId: string,
+      options?: { requireReady?: boolean },
+    ) => options?.requireReady
+      ? { ok: false as const, error: 'codexNotifier_target_daemon_offline' }
+      : { ok: true as const });
+    const deps = makeDeps({
+      validateCodexNotifierTargetBotAppId: validate,
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        targetBotAppId: 'cli_notify',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(validate).toHaveBeenCalledWith('cli_notify', { requireReady: false });
+    expect(deps.writeCodexNotifierConfig).toHaveBeenCalledWith({
+      targetBotAppId: 'cli_notify',
+    });
+  });
+
+  it('validates the target and installs the Hook before enabling codexNotifier', async () => {
+    const deps = makeDeps();
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: ' cli_notify ',
+        notifyWhen: 'locked_only',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(deps.validateCodexNotifierTargetBotAppId).toHaveBeenCalledWith(
+      'cli_notify',
+      { requireReady: true },
+    );
+    expect(deps.installCodexNotifierHook).toHaveBeenCalledOnce();
+    expect(vi.mocked(deps.validateCodexNotifierTargetBotAppId!).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(deps.installCodexNotifierHook!).mock.invocationCallOrder[0]);
+    expect(vi.mocked(deps.installCodexNotifierHook!).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(deps.writeCodexNotifierConfig!).mock.invocationCallOrder[0]);
+    expect(deps.writeCodexNotifierConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'locked_only',
+    });
+  });
 });
 
 describe('applySettingsWrite — validation errors', () => {
+  it('rejects invalid groupNamePrefix payloads without writing', async () => {
+    for (const groupNamePrefix of [
+      42,
+      '   ',
+      'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ groupNamePrefix }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('expected failure');
+      expect(r.error).toBe('invalid_groupNamePrefix');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does not persist a valid prefix when another dashboard field is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: 'AI讨论·', publicReadOnly: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('does not persist a valid prefix when a later global field is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '[AI] ', repoPickerMode: 'invalid' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_repoPickerMode');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects non-boolean publicReadOnly → invalid_publicReadOnly', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: 'yes' }, deps);
@@ -183,6 +422,24 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_chatBotDiscovery');
+  });
+
+  it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean bypassCodexHookTrust → invalid_bypassCodexHookTrust', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: 'no' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_bypassCodexHookTrust');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects invalid herdrTraexPlugin payloads', async () => {
@@ -302,6 +559,148 @@ describe('applySettingsWrite — validation errors', () => {
     expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_missing');
     expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing', null);
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit target before enabling codexNotifier', async () => {
+    const deps = makeDeps();
+
+    const r = await applySettingsWrite({ codexNotifier: { enabled: true } }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_target_required');
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown codexNotifier target before installing the Hook', async () => {
+    const deps = makeDeps({
+      validateCodexNotifierTargetBotAppId: vi.fn(async () => ({
+        ok: false as const,
+        error: 'codexNotifier_target_unknown',
+      })),
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_missing',
+        notifyWhen: 'always',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_target_unknown');
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a target without an administrator before installing the Hook', async () => {
+    const deps = makeDeps({
+      validateCodexNotifierTargetBotAppId: vi.fn(async () => ({
+        ok: false as const,
+        error: 'codexNotifier_target_owner_missing',
+      })),
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_without_owner',
+        notifyWhen: 'always',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_target_owner_missing');
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects locked_only on a platform without reliable lock detection', async () => {
+    const deps = makeDeps({
+      isCodexNotifierPlatformSupported: vi.fn(() => false),
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_notify',
+        notifyWhen: 'locked_only',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_platform_unsupported');
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('allows always notifications on a platform without lock detection', async () => {
+    const deps = makeDeps({
+      isCodexNotifierPlatformSupported: vi.fn(() => false),
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_notify',
+        notifyWhen: 'always',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(deps.installCodexNotifierHook).toHaveBeenCalledOnce();
+    expect(deps.writeCodexNotifierConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+  });
+
+  it('does not persist codexNotifier when Hook installation fails', async () => {
+    const deps = makeDeps({
+      installCodexNotifierHook: vi.fn(() => {
+        throw new Error('write failed');
+      }),
+    });
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_notify',
+        notifyWhen: 'always',
+      },
+    }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_hook_install_failed');
+    expect(deps.writeCodexNotifierConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects mixed notifier writes before any partial persistence', async () => {
+    const deps = makeDeps();
+
+    const r = await applySettingsWrite({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_notify',
+        notifyWhen: 'always',
+      },
+      repoPickerMode: 'invalid',
+    }, deps);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('codexNotifier_mixed_patch_unsupported');
+    expect(deps.installCodexNotifierHook).not.toHaveBeenCalled();
+    expect(deps.writeCodexNotifierConfig).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects non-boolean whiteboard.enabled → invalid_whiteboard_enabled', async () => {
@@ -479,5 +878,104 @@ describe('applySettingsWrite — IO surface', () => {
     const deps = makeDeps();
     await applySettingsWrite({ publicReadOnly: true }, deps);
     expect(deps.readGlobalConfig).not.toHaveBeenCalled(); // only called for autoUpdate cross-check
+  });
+});
+
+describe('applySettingsWrite — hostOverloadAlert', () => {
+  it('validates the target (requireReady) and persists on enable', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: true, targetBotAppId: ' cli_notify ' },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    // Trimmed + validated with requireReady=true (must be online to deliver).
+    expect(deps.validateHostOverloadAlertTargetBotAppId).toHaveBeenCalledWith('cli_notify', { requireReady: true });
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+    });
+  });
+
+  it('validates a target-only change with requireReady=false (not enabling yet)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { targetBotAppId: 'cli_notify' },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(deps.validateHostOverloadAlertTargetBotAppId).toHaveBeenCalledWith('cli_notify', { requireReady: false });
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ targetBotAppId: 'cli_notify' });
+  });
+
+  it('rejects enabling with no target selected', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ hostOverloadAlert: { enabled: true } }, deps);
+    expect(r).toEqual({ ok: false, error: 'hostOverloadAlert_target_required' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the validator error for an illegal target (apiOnly / unknown / offline)', async () => {
+    const validate = vi.fn(async () => ({ ok: false as const, error: 'hostOverloadAlert_target_apiOnly' }));
+    const deps = makeDeps({ validateHostOverloadAlertTargetBotAppId: validate });
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_api_only' },
+    }, deps);
+    expect(r).toEqual({ ok: false, error: 'hostOverloadAlert_target_apiOnly' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ hostOverloadAlert: { enabled: 'yes' } } as any, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enabled' });
+  });
+
+  it('rejects a non-positive enterLoadRatio and out-of-range enterMemUsedFrac', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ hostOverloadAlert: { enterLoadRatio: 0 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enterLoadRatio' });
+    expect(await applySettingsWrite({ hostOverloadAlert: { enterMemUsedFrac: 1.5 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enterMemUsedFrac' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-object / empty patch', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ hostOverloadAlert: null } as any, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert' });
+    expect(await applySettingsWrite({ hostOverloadAlert: {} }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert' });
+  });
+
+  it('merges a threshold-only change onto the persisted config without revalidating an unchanged target', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_notify', enterLoadRatio: 1.5 },
+      })) as any,
+    });
+    const r = await applySettingsWrite({ hostOverloadAlert: { enterLoadRatio: 2.0 } }, deps);
+    expect(r.ok).toBe(true);
+    // Neither enabling nor changing target → no target revalidation.
+    expect(deps.validateHostOverloadAlertTargetBotAppId).not.toHaveBeenCalled();
+    // The persisted enabled/target survive; only the threshold changes.
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      enterLoadRatio: 2.0,
+    });
+  });
+
+  it('can clear the target (null) and disable without requiring a target', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        hostOverloadAlert: { enabled: false, targetBotAppId: 'cli_notify' },
+      })) as any,
+    });
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: false, targetBotAppId: null },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
   });
 });

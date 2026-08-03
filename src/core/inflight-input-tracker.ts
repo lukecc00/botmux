@@ -24,7 +24,7 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export type InflightItem = {
   content: string;
-  userGoal?: string;
+  logicalContent?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -34,13 +34,19 @@ export type InflightItem = {
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
   private carryOver: InflightItem[] = [];
-  private recent: InflightItem[] = [];
 
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);
-    this.recent.push(item);
-    if (this.recent.length > 32) this.recent.splice(0, this.recent.length - 32);
+  }
+
+  /** Retire one exact write whose transport outcome is ambiguous and must not
+   * be replayed automatically. Other type-ahead items remain tracked. */
+  retire(item: InflightItem): boolean {
+    const index = this.unacked.indexOf(item);
+    if (index < 0) return false;
+    this.unacked.splice(index, 1);
+    return true;
   }
 
   /** CLI is back at its idle prompt — everything written has been consumed
@@ -48,17 +54,6 @@ export class InflightInputTracker {
    *  type-ahead queue). Nothing is in flight anymore. */
   onTurnComplete(): void {
     this.unacked.length = 0;
-  }
-
-  /** Freeze every ordinary input already written into the current CLI batch
-   * for a cross-thread handoff. Type-ahead CLIs may have accepted follow-ups
-   * that are no longer in the pending queue but have not reached a terminal;
-   * those goals must move to the fresh thread instead of disappearing. */
-  takeForHandoff(turnId: string): InflightItem[] {
-    const inFlight = this.unacked.splice(0);
-    if (inFlight.length > 0) return inFlight;
-    const lastMatchingIndex = this.recent.map(item => item.turnId).lastIndexOf(turnId);
-    return lastMatchingIndex >= 0 ? this.recent.slice(lastMatchingIndex) : [];
   }
 
   /** CLI process died. Stash whatever was in flight for the next spawn.
@@ -69,29 +64,6 @@ export class InflightInputTracker {
     const exiting = this.unacked.splice(0);
     const carried = exiting.filter(shouldCarry);
     if (carried.length > 0) this.carryOver.push(...carried);
-    return carried.length;
-  }
-
-  /** A transcript terminal says the turn failed even though the CLI process
-   *  stayed alive. Stage the interrupted input for a fresh-process replay.
-   *  Prefer the still-unacked batch (preserving type-ahead order); if a screen
-   *  idle heuristic cleared it a moment too early, recover the exact turn from
-   *  the small recent-write window. */
-  onTurnFailed(
-    turnId: string,
-    transform: (item: InflightItem) => InflightItem = item => item,
-    shouldCarry: (item: InflightItem) => boolean = () => true,
-  ): number {
-    const exiting = this.unacked.splice(0).filter(shouldCarry);
-    let carried = exiting;
-    if (!carried.some(item => item.turnId === turnId)) {
-      const recent = [...this.recent].reverse().find(item =>
-        item.turnId === turnId && shouldCarry(item),
-      );
-      if (recent) carried = [...carried, recent];
-    }
-    if (carried.length === 0) return 0;
-    this.carryOver.push(...carried.map(item => item.turnId === turnId ? transform(item) : item));
     return carried.length;
   }
 

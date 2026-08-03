@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/session-adopt.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,10 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildAdoptSelectCard: vi.fn(() => JSON.stringify({ type: 'adopt_select' })),
   buildCodexAppThreadSelectCard: vi.fn(() => JSON.stringify({ type: 'codex_app_thread_select' })),
+  buildAdoptBlockedCard: vi.fn((rootId: string, sessionId: string, cliId?: string) => JSON.stringify({
+    type: 'adopt_blocked',
+    elements: [{ tag: 'action', actions: [{ tag: 'button', value: { action: 'close', root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' } }] }],
+  })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -57,6 +61,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -334,6 +341,9 @@ describe('Adopt card actions', () => {
       // Mock discoverAdoptableSessions to return empty (target gone)
       vi.doMock('../src/core/session-discovery.js', () => ({
         discoverAdoptableSessions: vi.fn(() => []),
+        // 单 pane 快路径同样解析不到（pane 已经没了），card-handler 会回落全量扫描。
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
+        excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
         // card-handler now also pulls adoptTargetKey to disambiguate herdr
         // vs. tmux targets in the dropdown's selected-value. The empty
         // session list short-circuits before adoptTargetKey is invoked, so
@@ -417,6 +427,41 @@ describe('Adopt card actions', () => {
       expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
     });
 
+    it('refuses a Codex App thread takeover while the session is still on the pendingRepo gate', async () => {
+      vi.mocked(getBot).mockReturnValue({
+        config: {
+          larkAppId: APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'codex-app',
+          cliPathOverride: '/opt/codex',
+        },
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: 'thread-1',
+          name: 'Existing Codex App thread',
+          preview: 'preview',
+          cwd: '/repo/codex-app',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: 'buffered' });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCodexAppThreadSelectEvent(ROOT_ID, JSON.stringify({ threadId: 'thread-1' })), deps, APP_ID);
+      await flush();
+
+      // Refused: no takeover, pending gate untouched.
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.session.cliSessionId).not.toBe('thread-1');
+    });
+
     it('should return early when rootId is missing', async () => {
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
@@ -434,6 +479,58 @@ describe('Adopt card actions', () => {
 
       // Should silently return without error
       expect(killWorker).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── blocker #3: startAdoptSession fail-closes at the ENTRY for sandbox bots ──
+  // Both real host-process adopt entries (/adopt <pane> and the adopt_select
+  // card) route through startAdoptSession, so guarding it covers both. The
+  // guard fires FIRST — before target validation or any state mutation — so
+  // `adoptedFrom` is never persisted and "adopted" is never replied.
+  describe('startAdoptSession sandbox guard (entry point)', () => {
+    const target = {
+      source: 'tmux' as const,
+      tmuxTarget: '0:1.0',
+      cliPid: 4242,
+      sessionId: 'host-cli',
+      cliId: 'claude-code' as const,
+      cwd: '/repo',
+      paneCols: 80,
+      paneRows: 24,
+    };
+
+    it('sandbox:true bot → replies the sandbox-blocked notice, never persists adoptedFrom', async () => {
+      vi.mocked(getBot).mockReturnValue({
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
+        resolvedAllowedUsers: [], botOpenId: 'ou_bot',
+      } as any);
+      const { startAdoptSession } = await import('../src/core/command-handler.js');
+      const ds = makeDaemonSession();
+      const deps = makeDeps(new Map());
+
+      await startAdoptSession(target, ds, deps as any, APP_ID);
+
+      // guard fired before validation/mutation
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.session.adoptedFrom).toBeUndefined();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      const replies = (deps.sessionReply as any).mock.calls.map((c: any[]) => c[1]).join('\n');
+      expect(replies).toContain('文件沙盒'); // the sandbox_blocked notice
+      expect(replies).not.toContain('已接入'); // never the success message
+    });
+
+    it('readIsolation / global BOTMUX_SANDBOX / session frozen decision all block via the shared predicate (union)', async () => {
+      const { adoptSandboxBlocked } = await import('../src/core/worker-pool.js');
+      expect(adoptSandboxBlocked({ readIsolation: true })).toBe(true);
+      expect(adoptSandboxBlocked({ sandbox: true })).toBe(true);
+      expect(adoptSandboxBlocked({})).toBe(false);
+      // session's FROZEN decision blocks even when the live bot flag is OFF
+      // (forkWorker treats the frozen decision as authoritative).
+      expect(adoptSandboxBlocked({ sandbox: false }, { sandbox: true })).toBe(true);
+      expect(adoptSandboxBlocked({}, { sandbox: false })).toBe(false);
+      vi.stubEnv('BOTMUX_SANDBOX', '1');
+      expect(adoptSandboxBlocked({})).toBe(true);
+      vi.unstubAllEnvs();
     });
   });
 });

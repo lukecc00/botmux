@@ -2,8 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, classifyCodexTerminalDiagnostic, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -25,26 +24,33 @@ function userResponseItem(text: string, ts = '2026-04-29T07:00:00.000Z') {
 }
 
 function assistantFinalResponseItem(text: string, ts = '2026-04-29T07:00:01.000Z') {
+  // The turn terminal is now event_msg/task_complete, NOT the assistant
+  // response_item. Codex >=0.146 dropped phase:'final_answer', so this helper
+  // emits the task_complete record that actually closes the turn. `text`
+  // becomes last_agent_message. Kept named "assistantFinal…" so existing
+  // call sites read naturally.
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: `turn-${ts}`,
+      last_agent_message: text,
+    },
+  };
+}
+
+/** An assistant `response_item` message — mid-turn OR final, both phase-less in
+ *  codex >=0.146. The reader must NOT treat any of these as a turn boundary. */
+function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-04-29T07:00:01.000Z') {
   return {
     timestamp: ts,
     type: 'response_item',
     payload: {
       type: 'message',
       role: 'assistant',
-      phase: 'final_answer',
+      ...(phase !== undefined ? { phase } : {}),
       content: [{ type: 'output_text', text }],
-    },
-  };
-}
-
-function taskComplete(text: string | null, ts = '2026-04-29T07:00:02.000Z') {
-  return {
-    timestamp: ts,
-    type: 'event_msg',
-    payload: {
-      type: 'task_complete',
-      turn_id: 'native-turn',
-      last_agent_message: text,
     },
   };
 }
@@ -73,133 +79,6 @@ describe('codexSessionIdFromRolloutPath', () => {
   it('returns undefined when filename is malformed', () => {
     expect(codexSessionIdFromRolloutPath('/root/.codex/sessions/foo/bar.jsonl')).toBeUndefined();
     expect(codexSessionIdFromRolloutPath('rollout-no-suffix-just-text.jsonl')).toBeUndefined();
-  });
-});
-
-describe('Codex empty task completion', () => {
-  it('emits an ambiguous candidate boundary when task_complete has no final message', () => {
-    writeFileSync(path,
-      ev(userResponseItem('keep working'))
-      + ev({
-        timestamp: '2026-04-29T07:00:02.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: 'native-turn', last_agent_message: null },
-      }),
-    );
-    const out = drainCodexRollout(path, 0).events;
-    expect(out.at(-1)).toMatchObject({
-      kind: 'assistant_final',
-      text: '',
-      terminalStatus: 'ambiguous',
-      terminalErrorCode: 'codex_task_complete_without_final_candidate',
-    });
-  });
-
-  it('preserves a structured context-window failure from task_complete', () => {
-    writeFileSync(path,
-      ev(userResponseItem('keep working'))
-      + ev({
-        timestamp: '2026-04-29T07:00:02.000Z',
-        type: 'event_msg',
-        payload: {
-          type: 'task_complete',
-          turn_id: 'native-turn',
-          last_agent_message: null,
-          error: {
-            message: "Codex ran out of room in the model's context window.",
-            codex_error_info: 'context_window_exceeded',
-          },
-        },
-      }),
-    );
-    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
-      kind: 'assistant_final',
-      text: '',
-      terminalStatus: 'failed',
-      terminalErrorCode: 'codex_context_window_exceeded',
-    });
-  });
-
-  it('accepts the legacy PascalCase context-window error discriminator', () => {
-    writeFileSync(path,
-      ev(userResponseItem('keep working'))
-      + ev({
-        timestamp: '2026-04-29T07:00:02.000Z',
-        type: 'event_msg',
-        payload: {
-          type: 'task_complete',
-          last_agent_message: null,
-          error: { codex_error_info: 'ContextWindowExceeded' },
-        },
-      }),
-    );
-    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
-      terminalStatus: 'failed',
-      terminalErrorCode: 'codex_context_window_exceeded',
-    });
-  });
-
-  it('preserves an independent structured context-window error event', () => {
-    writeFileSync(path,
-      ev(userResponseItem('keep working'))
-      + ev({
-        timestamp: '2026-04-29T07:00:02.000Z',
-        type: 'event_msg',
-        payload: {
-          type: 'error',
-          message: "Codex ran out of room in the model's context window.",
-          codex_error_info: 'context_window_exceeded',
-        },
-      }),
-    );
-    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({
-      kind: 'assistant_final',
-      terminalStatus: 'failed',
-      terminalErrorCode: 'codex_context_window_exceeded',
-      terminalOnly: true,
-    });
-  });
-
-  it('classifies known recoverable Codex terminal diagnostics', () => {
-    expect(isCodexAbnormalTerminationOutput(
-      '■ stream disconnected before completion: stream closed before response.completed',
-    )).toBe(true);
-    expect(classifyCodexTerminalDiagnostic('Stream closed before response.completed'))
-      .toBe('stream_disconnected');
-    expect(classifyCodexTerminalDiagnostic('Stream closed before response.completed', {
-      requireTerminalLine: true,
-    })).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic('› stream disconnected before completion', {
-      requireTerminalLine: true,
-    })).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic(
-      '■ stream disconnected before completion: stream closed before response.completed',
-      { requireTerminalLine: true },
-    )).toBe('stream_disconnected');
-    expect(classifyCodexTerminalDiagnostic(
-      "■ Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
-    )).toBe('context_window_exceeded');
-    const pasted = "Codex ran out of room in the model's context window. Start a new thread before retrying.";
-    expect(classifyCodexTerminalDiagnostic(`› ${pasted}`)).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic(`› ${pasted}\n■ ${pasted}`))
-      .toBe('context_window_exceeded');
-    expect(classifyCodexTerminalDiagnostic(`■ ${pasted}`, { ignoreContext: true })).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic('• Context compacted')).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic('Please explain the model context window')).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic('已发送结果，等待下一条消息')).toBeUndefined();
-    expect(classifyCodexTerminalDiagnostic('')).toBeUndefined();
-  });
-
-  it('uses task_complete as the sole normal final boundary', () => {
-    writeFileSync(path,
-      ev(userResponseItem('keep working'))
-      + ev(assistantFinalResponseItem('done'))
-      + ev(taskComplete('done')),
-    );
-    expect(drainCodexRollout(path, 0).events).toEqual([
-      expect.objectContaining({ kind: 'user', text: 'keep working' }),
-      expect.objectContaining({ kind: 'assistant_final', text: 'done', terminalStatus: 'completed' }),
-    ]);
   });
 });
 
@@ -364,11 +243,10 @@ describe('drainCodexRollout', () => {
     expect(r.newOffset).toBe(0);
   });
 
-  it('extracts user + assistant_final from task_complete', () => {
+  it('extracts user (response_item) + assistant_final (task_complete)', () => {
     writeFileSync(path,
       ev(userResponseItem('hello there')) +
-      ev(assistantFinalResponseItem('hi back')) +
-      ev(taskComplete('hi back')));
+      ev(assistantFinalResponseItem('hi back')));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(2);
     expect(r.events[0].kind).toBe('user');
@@ -390,78 +268,84 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('real user prompt');
   });
 
-  it('extracts assistant phase=commentary as clean progress, separate from final output', () => {
+  // Regression for the codex >=0.146 phase-drift bug: mid-turn AND final
+  // assistant response_item messages are both phase-less and must NOT be a
+  // turn boundary. Only task_complete closes the turn. Keying on a phase-less
+  // assistant message would close the turn on the first mid-turn preamble
+  // ("I'll run the commands…") and truncate the real answer.
+  it('never treats an assistant response_item message as terminal (mid-turn preamble + phase-less final)', () => {
     writeFileSync(path,
-      ev({
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          phase: 'commentary',
-          content: [{ type: 'output_text', text: '已完成修复，正在跑边界测试。' }],
-        },
-      }) +
-      ev(assistantFinalResponseItem('done')) +
-      ev(taskComplete('done')));
+      ev(userResponseItem('do two things')) +
+      ev(assistantMessageResponseItem("I'll run the commands.")) +   // mid-turn preamble, phase:undefined
+      ev(assistantMessageResponseItem('step1 step2 DONE')) +          // final answer, ALSO phase:undefined (0.146)
+      ev(assistantFinalResponseItem('step1 step2 DONE')));            // the real terminal
+    const r = drainCodexRollout(path, 0);
+    // Exactly one user + one assistant_final (from task_complete). Neither
+    // assistant response_item produced an event.
+    expect(r.events).toHaveLength(2);
+    expect(r.events[0].kind).toBe('user');
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].text).toBe('step1 step2 DONE');
+  });
+
+  // Old codex (0.139 / 0.145) still tags the final message phase:'final_answer'
+  // AND emits task_complete. We take ONLY task_complete → exactly one
+  // assistant_final, no double-close (the queue would buffer a stray second
+  // final and could mis-close a later turn).
+  it('old-codex final_answer response_item + task_complete → single assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('hi')) +
+      ev(assistantMessageResponseItem('legacy final', 'final_answer')) +  // old phase-tagged final
+      ev(assistantFinalResponseItem('legacy final')));                    // task_complete for same turn
+    const r = drainCodexRollout(path, 0);
+    const finals = r.events.filter(e => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('legacy final');
+  });
+
+  // A task_complete with empty last_agent_message still closes the turn (a
+  // silent successful turn must release its durable delivery).
+  it('empty last_agent_message still yields an assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: '' } }));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(2);
-    expect(r.events[0]).toMatchObject({
-      kind: 'assistant_progress',
-      text: '已完成修复，正在跑边界测试。',
-    });
-    expect(r.events[1]).toMatchObject({ kind: 'assistant_final', text: 'done' });
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].text).toBe('');
   });
 
-  it('keeps commentary on both sides of a tool call as two ordered progress events', () => {
+  // task_complete without a turn_id is a malformed/partial record — ignored
+  // (belt-and-suspenders on top of the newline-completeness guard).
+  it('task_complete without turn_id is ignored', () => {
     writeFileSync(path,
-      ev(userResponseItem('修复新闻页并构建验证'))
-      + ev({
-        timestamp: '2026-04-29T07:00:01.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message', role: 'assistant', phase: 'commentary',
-          content: [{ type: 'output_text', text: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。' }],
-        },
-      })
-      + ev({
-        timestamp: '2026-04-29T07:00:02.000Z',
-        type: 'response_item',
-        payload: { type: 'function_call', name: 'apply_patch', call_id: 'tool-1' },
-      })
-      + ev({
-        timestamp: '2026-04-29T07:00:03.000Z',
-        type: 'response_item',
-        payload: { type: 'function_call_output', call_id: 'tool-1', output: 'Success. Updated NewsChannelPage.kt' },
-      })
-      + ev({
-        timestamp: '2026-04-29T07:00:04.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message', role: 'assistant', phase: 'commentary',
-          content: [{ type: 'output_text', text: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。' }],
-        },
-      })
-      + ev(assistantFinalResponseItem('done', '2026-04-29T07:00:05.000Z'))
-      + ev(taskComplete('done', '2026-04-29T07:00:06.000Z')),
-    );
-
-    const events = drainCodexRollout(path, 0).events;
-    expect(events.map(event => event.kind)).toEqual([
-      'user', 'assistant_progress', 'assistant_progress', 'assistant_final',
-    ]);
-    expect(events.filter(event => event.kind === 'assistant_progress').map(event => event.text)).toEqual([
-      '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。',
-      '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。',
-    ]);
-    expect(events.map(event => event.text).join('\n')).not.toContain('Success. Updated');
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'no turn id' } }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].kind).toBe('user');
   });
 
-  it('skips reasoning / function_call / function_call_output / unrelated event_msg', () => {
+  // A cancelled turn writes turn_aborted (no task_complete) → ambiguous
+  // terminal so the durable delivery releases instead of wedging as running.
+  it('turn_aborted yields an ambiguous assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 't1', reason: 'user interrupt' } }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(2);
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].terminalStatus).toBe('ambiguous');
+    expect(r.events[1].terminalErrorCode).toBe('codex_turn_aborted:user_interrupt');
+  });
+
+  it('skips reasoning / function_call / function_call_output / non-terminal event_msg', () => {
     writeFileSync(path,
       ev({ type: 'response_item', payload: { type: 'reasoning' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call_output' } }) +
-      ev({ type: 'event_msg', payload: { type: 'token_count' } }) +
+      ev({ type: 'event_msg', payload: { type: 'token_count', total: 42 } }) +
+      ev({ type: 'event_msg', payload: { type: 'agent_message', message: 'mid-turn chatter' } }) +
       ev(userResponseItem('actual prompt')));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(1);
@@ -493,83 +377,21 @@ describe('drainCodexRollout', () => {
   it('byte-offset stable: re-drain from newOffset returns no events', () => {
     writeFileSync(path,
       ev(userResponseItem('first')) +
-      ev(assistantFinalResponseItem('reply')) +
-      ev(taskComplete('reply')));
+      ev(assistantFinalResponseItem('reply')));
     const first = drainCodexRollout(path, 0);
     const second = drainCodexRollout(path, first.newOffset);
     expect(second.events).toEqual([]);
     expect(second.newOffset).toBe(first.newOffset);
   });
 
-  it('waits for an incrementally appended task_complete before emitting final output', () => {
+  it('appended events drain incrementally', () => {
     writeFileSync(path, ev(userResponseItem('first')));
     const r1 = drainCodexRollout(path, 0);
     expect(r1.events).toHaveLength(1);
     appendFileSync(path, ev(assistantFinalResponseItem('reply')));
     const r2 = drainCodexRollout(path, r1.newOffset);
-    expect(r2.events).toEqual([]);
-
-    appendFileSync(path, ev(taskComplete('reply')));
-    const r3 = drainCodexRollout(path, r2.newOffset);
-    expect(r3.events).toEqual([
-      expect.objectContaining({ kind: 'assistant_final', text: 'reply', terminalStatus: 'completed' }),
-    ]);
-  });
-
-  it('delivers compaction Handoff Summary records as progress without closing the bridge turn', () => {
-    const q = new CodexBridgeQueue();
-    q.mark('long-turn', 'long dashboard fix', Date.parse('2026-04-29T07:00:00.000Z'));
-
-    writeFileSync(path,
-      ev(userResponseItem('long dashboard fix'))
-      + ev(assistantFinalResponseItem('Handoff Summary\n\nPartial progress only.', '2026-04-29T07:10:00.000Z'))
-      + ev({ timestamp: '2026-04-29T07:10:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } })
-      + ev(assistantFinalResponseItem('Handoff Summary\n\nStill not final.', '2026-04-29T07:20:00.000Z'))
-      + ev({ timestamp: '2026-04-29T07:20:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
-    );
-    const beforeFinal = drainCodexRollout(path, 0);
-    q.ingest(beforeFinal.events);
-
-    expect(beforeFinal.events.map(event => event.kind)).toEqual([
-      'user',
-      'assistant_progress',
-      'assistant_progress',
-    ]);
-    expect(beforeFinal.events.filter(event => event.kind === 'assistant_progress')).toEqual([
-      expect.objectContaining({
-        text: 'Handoff Summary\n\nPartial progress only.',
-        progressKind: 'compaction_summary',
-      }),
-      expect.objectContaining({
-        text: 'Handoff Summary\n\nStill not final.',
-        progressKind: 'compaction_summary',
-      }),
-    ]);
-    expect(q.drainProgressOutputs()).toEqual([
-      expect.objectContaining({
-        turnId: 'long-turn',
-        content: 'Handoff Summary\n\nPartial progress only.',
-      }),
-      expect.objectContaining({
-        turnId: 'long-turn',
-        content: 'Handoff Summary\n\nStill not final.',
-      }),
-    ]);
-    expect(q.drainEmittable()).toEqual([]);
-
-    appendFileSync(path,
-      ev(assistantFinalResponseItem('真正最终结果', '2026-04-29T07:30:00.000Z'))
-      + ev(taskComplete('真正最终结果', '2026-04-29T07:30:00.010Z')),
-    );
-    const afterFinal = drainCodexRollout(path, beforeFinal.newOffset);
-    q.ingest(afterFinal.events);
-
-    expect(afterFinal.events).toEqual([
-      expect.objectContaining({ kind: 'assistant_final', text: '真正最终结果', terminalStatus: 'completed' }),
-    ]);
-    expect(q.drainEmittable()).toEqual([
-      expect.objectContaining({ turnId: 'long-turn', finalText: '真正最终结果' }),
-    ]);
+    expect(r2.events).toHaveLength(1);
+    expect(r2.events[0].kind).toBe('assistant_final');
   });
 
   it('partial trailing line is held back as pendingTail', () => {
@@ -596,8 +418,7 @@ describe('drainCodexRollout', () => {
   it('truncated file (size < fromOffset) re-drains from top', () => {
     writeFileSync(path,
       ev(userResponseItem('original message that is reasonably long for offset')) +
-      ev(assistantFinalResponseItem('long original answer to take up bytes')) +
-      ev(taskComplete('long original answer to take up bytes')));
+      ev(assistantFinalResponseItem('long original answer to take up bytes')));
     const r1 = drainCodexRollout(path, 0);
     // Simulate truncation: rewrite with strictly shorter content so the new
     // size is below r1.newOffset and the re-drain branch fires.

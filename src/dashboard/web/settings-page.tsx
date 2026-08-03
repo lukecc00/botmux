@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
@@ -10,6 +11,7 @@ interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
 
 interface DashboardSettings {
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -22,6 +24,44 @@ interface DashboardSettings {
     recommendedSource: string;
     recommendedRef: string;
   };
+  codexRpcInput: boolean;
+  bypassCodexHookTrust: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+    pendingCount: number;
+    workerOnline: boolean;
+    lastError: { at: string; message: string; retryAt: string } | null;
+  };
+  hostOverloadAlert: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    enterLoadRatio: number;
+    enterMemUsedFrac: number;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      apiOnly: boolean;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+  };
+  noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -104,6 +144,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 
 function parseSettings(s: any): DashboardSettings {
   return {
+    groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -116,6 +157,43 @@ function parseSettings(s: any): DashboardSettings {
       recommendedSource: typeof s?.herdrTraexPlugin?.recommendedSource === 'string' ? s.herdrTraexPlugin.recommendedSource : '',
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
+    codexRpcInput: s?.codexRpcInput === true,
+    // default ON — only an explicit persisted false disables (matches server snapshot)
+    bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
+    codexNotifier: {
+      enabled: s?.codexNotifier?.enabled === true,
+      targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
+        ? s.codexNotifier.targetBotAppId
+        : null,
+      notifyWhen: s?.codexNotifier?.notifyWhen === 'always' ? 'always' : 'locked_only',
+      platformSupported: s?.codexNotifier?.platformSupported === true,
+      hookInstalled: s?.codexNotifier?.hookInstalled === true,
+      botOptions: Array.isArray(s?.codexNotifier?.botOptions) ? s.codexNotifier.botOptions : [],
+      targetDaemonOnline: s?.codexNotifier?.targetDaemonOnline === true,
+      pendingCount: Number.isSafeInteger(s?.codexNotifier?.pendingCount)
+        ? Math.max(0, s.codexNotifier.pendingCount)
+        : 0,
+      workerOnline: s?.codexNotifier?.workerOnline === true,
+      lastError: s?.codexNotifier?.lastError
+        && typeof s.codexNotifier.lastError.message === 'string'
+        ? s.codexNotifier.lastError
+        : null,
+    },
+    hostOverloadAlert: {
+      enabled: s?.hostOverloadAlert?.enabled === true,
+      targetBotAppId: typeof s?.hostOverloadAlert?.targetBotAppId === 'string'
+        ? s.hostOverloadAlert.targetBotAppId
+        : null,
+      enterLoadRatio: typeof s?.hostOverloadAlert?.enterLoadRatio === 'number'
+        ? s.hostOverloadAlert.enterLoadRatio
+        : 1.5,
+      enterMemUsedFrac: typeof s?.hostOverloadAlert?.enterMemUsedFrac === 'number'
+        ? s.hostOverloadAlert.enterMemUsedFrac
+        : 0.92,
+      botOptions: Array.isArray(s?.hostOverloadAlert?.botOptions) ? s.hostOverloadAlert.botOptions : [],
+      targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
+    },
+    noVisibleOutputHint: s?.noVisibleOutputHint === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -365,11 +443,15 @@ function SettingsPage() {
     setUpBusy(true);
     setUpMsg({ text: tr('update.restarting') });
     try {
-      await fetch('/api/update/restart', {
+      const response = await fetch('/api/update/restart', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(updatePayload ? { update: updatePayload } : {}),
       });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body.ok === false) {
+        throw new Error(String(body.detail ?? body.error ?? `HTTP ${response.status}`));
+      }
       if (!mountedRef.current) return;
     } catch (e) {
       if (!mountedRef.current) return;
@@ -510,7 +592,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -518,6 +600,20 @@ function SettingsBody(props: {
       'herdrTraexPlugin',
       { herdrTraexPlugin: patch },
       s => ({ ...s, herdrTraexPlugin: { ...s.herdrTraexPlugin, ...patch } }),
+    );
+  };
+  const saveCodexNotifier = (patch: Partial<Pick<DashboardSettings['codexNotifier'], 'enabled' | 'targetBotAppId' | 'notifyWhen'>>) => {
+    return props.onSave(
+      'codexNotifier',
+      { codexNotifier: patch },
+      s => ({ ...s, codexNotifier: { ...s.codexNotifier, ...patch } }),
+    );
+  };
+  const saveHostOverloadAlert = (patch: Partial<Pick<DashboardSettings['hostOverloadAlert'], 'enabled' | 'targetBotAppId' | 'enterLoadRatio' | 'enterMemUsedFrac'>>) => {
+    return props.onSave(
+      'hostOverloadAlert',
+      { hostOverloadAlert: patch },
+      s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
     );
   };
   const repoModeOptions = useMemo(() => [
@@ -541,7 +637,6 @@ function SettingsBody(props: {
       return { value: bot.larkAppId, label: `${label}${detail}${suffix}` };
     }),
   ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
-
   return (
     <div className="settings-layout">
       {canWrite ? null : (
@@ -549,6 +644,10 @@ function SettingsBody(props: {
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
         </article>
       )}
+      <SettingsModule
+        title={tr('settings.moduleGeneral')}
+        description={tr('settings.moduleGeneralHelp')}
+      >
       <SettingsGroup className="settings-group-main">
         <SettingsBlock title={tr('settings.sectionAccess')}>
           <ToggleRow
@@ -598,6 +697,17 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+          <GroupNamePrefixRow
+            value={settings.groupNamePrefix}
+            disabled={dis || savingKey === 'groupNamePrefix'}
+            onSave={value => props.onSave(
+              'groupNamePrefix',
+              { groupNamePrefix: value },
+              s => ({ ...s, groupNamePrefix: value }),
+            )}
+          />
+        </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
@@ -620,6 +730,41 @@ function SettingsBody(props: {
               onSave={patch => saveHerdrTraexPlugin(patch)}
             />
           ) : null}
+          <ToggleRow
+            title={tr('settings.codexRpcInput')}
+            help={tr('settings.codexRpcInputHelp')}
+            checked={settings.codexRpcInput}
+            disabled={dis || savingKey === 'codexRpcInput'}
+            onChange={value => saveBoolean('codexRpcInput', value)}
+          />
+          <ToggleRow
+            title={tr('settings.bypassCodexHookTrust')}
+            help={tr('settings.bypassCodexHookTrustHelp')}
+            checked={settings.bypassCodexHookTrust}
+            disabled={dis || savingKey === 'bypassCodexHookTrust'}
+            onChange={value => saveBoolean('bypassCodexHookTrust', value)}
+          />
+          <CodexNotifierSettingsEditor
+            value={settings.codexNotifier}
+            disabled={dis}
+            saving={savingKey === 'codexNotifier'}
+            onSave={saveCodexNotifier}
+          />
+          <ToggleRow
+            title={tr('settings.noVisibleOutputHint')}
+            help={tr('settings.noVisibleOutputHintHelp')}
+            checked={settings.noVisibleOutputHint}
+            disabled={dis || savingKey === 'noVisibleOutputHint'}
+            onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionHostOverloadAlert')}>
+          <HostOverloadAlertSettingsEditor
+            value={settings.hostOverloadAlert}
+            disabled={dis}
+            saving={savingKey === 'hostOverloadAlert'}
+            onSave={saveHostOverloadAlert}
+          />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
@@ -663,6 +808,14 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
+      </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        className="settings-module-meeting"
+        title={tr('settings.moduleMeeting')}
+        description={tr('settings.moduleMeetingHelp')}
+      >
+      <SettingsGroup className="settings-group-meeting">
         <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
@@ -718,6 +871,11 @@ function SettingsBody(props: {
           ) : null}
         </SettingsBlock>
       </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        title={tr('settings.moduleSystem')}
+        description={tr('settings.moduleSystemHelp')}
+      >
       <SettingsGroup className="settings-group-ops">
         <SettingsBlock
           title={tr('settings.sectionMaintenance')}
@@ -779,10 +937,29 @@ function SettingsBody(props: {
         </SettingsBlock>
         {props.updateBlock}
       </SettingsGroup>
+      </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
     </div>
+  );
+}
+
+function SettingsModule(props: {
+  className?: string;
+  title: string;
+  description: string;
+  children: ReactNode;
+}): React.JSX.Element {
+  const cls = ['settings-module', props.className].filter(Boolean).join(' ');
+  return (
+    <section className={cls}>
+      <header className="settings-module-heading">
+        <h2>{props.title}</h2>
+        <p>{props.description}</p>
+      </header>
+      {props.children}
+    </section>
   );
 }
 
@@ -808,7 +985,7 @@ function LarkCliStatus(props: { settings: DashboardSettings['vcMeetingAgent'] })
 function SettingsGroup(props: {
   className?: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-group', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -824,7 +1001,7 @@ function SettingsBlock(props: {
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -836,6 +1013,257 @@ function SettingsBlock(props: {
         {props.children}
       </article>
     </section>
+  );
+}
+
+export function CodexNotifierSettingsEditor(props: {
+  value: DashboardSettings['codexNotifier'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Partial<Pick<DashboardSettings['codexNotifier'], 'enabled' | 'targetBotAppId' | 'notifyWhen'>>,
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [enableRequested, setEnableRequested] = useState(false);
+  const autoEnableStartedRef = useRef(false);
+  const botOptions = useMemo(() => [
+    { value: '', label: tr('settings.codexNotifierTargetPlaceholder') },
+    ...props.value.botOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [
+        bot.botName || bot.larkAppId,
+        bot.cliId,
+      ].filter(Boolean).join(' · '),
+    })),
+  ], [props.value.botOptions, tr]);
+  const timingOptions = useMemo(() => [
+    { value: 'locked_only' as const, label: tr('settings.codexNotifierLockedOnly') },
+    { value: 'always' as const, label: tr('settings.codexNotifierAlways') },
+  ], [tr]);
+  const selectedBot = props.value.botOptions
+    .find(bot => bot.larkAppId === props.value.targetBotAppId);
+  const enableBlocked = !props.value.targetBotAppId
+    || selectedBot?.recipientConfigured !== true
+    || selectedBot?.recipientVerified !== true
+    || !props.value.targetDaemonOnline
+    || (!props.value.platformSupported && props.value.notifyWhen === 'locked_only');
+  const showDetails = props.value.enabled || enableRequested;
+  const controlsDisabled = props.disabled || props.saving;
+
+  useEffect(() => {
+    if (!enableRequested || props.value.enabled || enableBlocked) {
+      autoEnableStartedRef.current = false;
+      return;
+    }
+    if (controlsDisabled || autoEnableStartedRef.current) return;
+    autoEnableStartedRef.current = true;
+    void props.onSave({ enabled: true });
+  }, [
+    controlsDisabled,
+    enableBlocked,
+    enableRequested,
+    props.onSave,
+    props.value.enabled,
+  ]);
+
+  useEffect(() => {
+    if (props.value.enabled && enableRequested) setEnableRequested(false);
+  }, [enableRequested, props.value.enabled]);
+
+  const setEnabled = (enabled: boolean) => {
+    if (!enabled) {
+      autoEnableStartedRef.current = false;
+      setEnableRequested(false);
+      if (props.value.enabled) void props.onSave({ enabled: false });
+      return;
+    }
+    if (enableBlocked) {
+      setEnableRequested(true);
+      return;
+    }
+    void props.onSave({ enabled: true });
+  };
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.codexNotifier')}
+        help={tr('settings.codexNotifierHelp')}
+        checked={props.value.enabled || enableRequested}
+        disabled={controlsDisabled}
+        onChange={setEnabled}
+      />
+      {showDetails ? (
+        <div className="settings-codex-notifier-details">
+          {!props.value.enabled ? (
+            <p className="settings-subfield-hint">{tr('settings.codexNotifierEnablePending')}</p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.codexNotifierTargetHelp')}>{tr('settings.codexNotifierTarget')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.codexNotifierTarget')}
+              disabled={controlsDisabled}
+              searchable
+              value={props.value.targetBotAppId ?? ''}
+              label={dropdownLabel(botOptions, props.value.targetBotAppId ?? '')}
+              options={botOptions}
+              onChange={value => { void props.onSave({ targetBotAppId: value || null }); }}
+            />
+          </div>
+          {selectedBot?.recipientHint ? (
+            <p className="settings-subfield-hint">
+              {tr('settings.codexNotifierRecipient', { recipient: selectedBot.recipientHint })}
+            </p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.codexNotifierNotifyWhenHelp')}>{tr('settings.codexNotifierNotifyWhen')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.codexNotifierNotifyWhen')}
+              disabled={controlsDisabled}
+              value={props.value.notifyWhen}
+              label={dropdownLabel(timingOptions, props.value.notifyWhen)}
+              options={timingOptions}
+              onChange={value => { void props.onSave({ notifyWhen: value }); }}
+            />
+          </div>
+          {!props.value.targetBotAppId ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierTargetRequired')}</p>
+          ) : selectedBot?.recipientConfigured !== true ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierRecipientMissing')}</p>
+          ) : !props.value.targetDaemonOnline ? (
+            <p className="hint-warn-inline">
+              {tr(props.value.enabled
+                ? 'settings.codexNotifierDaemonOffline'
+                : 'settings.codexNotifierTargetOffline')}
+            </p>
+          ) : selectedBot?.recipientVerified !== true ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierRecipientUnverified')}</p>
+          ) : !props.value.platformSupported && props.value.notifyWhen === 'locked_only' ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierUnsupported')}</p>
+          ) : props.value.enabled ? (
+            !props.value.hookInstalled ? (
+              <p className="hint-warn-inline">{tr('settings.codexNotifierHookPending')}</p>
+            ) : !props.value.workerOnline ? (
+              <p className="hint-warn-inline">{tr('settings.codexNotifierWorkerPending')}</p>
+            ) : props.value.lastError ? (
+              <p className="hint-warn-inline">
+                {tr('settings.codexNotifierLastError', { error: props.value.lastError.message })}
+              </p>
+            ) : props.value.pendingCount > 0 ? (
+              <p className="hint-warn-inline">
+                {tr('settings.codexNotifierPending', { count: props.value.pendingCount })}
+              </p>
+            ) : null
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+export function HostOverloadAlertSettingsEditor(props: {
+  value: DashboardSettings['hostOverloadAlert'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Partial<Pick<DashboardSettings['hostOverloadAlert'], 'enabled' | 'targetBotAppId' | 'enterLoadRatio' | 'enterMemUsedFrac'>>,
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const controlsDisabled = props.disabled || props.saving;
+  const botOptions = useMemo(() => [
+    { value: '', label: tr('settings.hostOverloadAlertTargetPlaceholder') },
+    ...props.value.botOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [bot.botName || bot.larkAppId, bot.cliId].filter(Boolean).join(' · '),
+    })),
+  ], [props.value.botOptions, tr]);
+  const selectedBot = props.value.botOptions.find(bot => bot.larkAppId === props.value.targetBotAppId);
+  // Always show the target/threshold editor — even in the fresh default state
+  // (disabled + no target). Gating it behind enabled||target would deadlock a
+  // brand-new install: the dropdown would be hidden AND the toggle disabled
+  // (see below), leaving no way to pick a target. The toggle stays disabled
+  // until a target is chosen; the editor is how you choose one.
+  // Local draft for the threshold inputs so typing doesn't fire a save per keystroke.
+  const [loadDraft, setLoadDraft] = useState(String(props.value.enterLoadRatio));
+  const [memDraft, setMemDraft] = useState(String(Math.round(props.value.enterMemUsedFrac * 100)));
+  useEffect(() => { setLoadDraft(String(props.value.enterLoadRatio)); }, [props.value.enterLoadRatio]);
+  useEffect(() => { setMemDraft(String(Math.round(props.value.enterMemUsedFrac * 100))); }, [props.value.enterMemUsedFrac]);
+
+  const commitLoad = () => {
+    const n = Number(loadDraft);
+    if (Number.isFinite(n) && n > 0 && n !== props.value.enterLoadRatio) void props.onSave({ enterLoadRatio: n });
+    else setLoadDraft(String(props.value.enterLoadRatio));
+  };
+  const commitMem = () => {
+    const pct = Number(memDraft);
+    const frac = pct / 100;
+    if (Number.isFinite(pct) && pct > 0 && pct <= 100 && frac !== props.value.enterMemUsedFrac) void props.onSave({ enterMemUsedFrac: frac });
+    else setMemDraft(String(Math.round(props.value.enterMemUsedFrac * 100)));
+  };
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.hostOverloadAlert')}
+        help={tr('settings.hostOverloadAlertHelp')}
+        checked={props.value.enabled}
+        disabled={controlsDisabled || (!props.value.enabled && !props.value.targetBotAppId)}
+        onChange={value => { void props.onSave({ enabled: value }); }}
+      />
+      <div className="settings-codex-notifier-details">
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertTargetHelp')}>{tr('settings.hostOverloadAlertTarget')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.hostOverloadAlertTarget')}
+              disabled={controlsDisabled}
+              searchable
+              value={props.value.targetBotAppId ?? ''}
+              label={dropdownLabel(botOptions, props.value.targetBotAppId ?? '')}
+              options={botOptions}
+              onChange={value => { void props.onSave({ targetBotAppId: value || null }); }}
+            />
+          </div>
+          {selectedBot?.recipientHint ? (
+            <p className="settings-subfield-hint">
+              {tr('settings.hostOverloadAlertRecipient', { recipient: selectedBot.recipientHint })}
+            </p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertEnterLoadHelp')}>{tr('settings.hostOverloadAlertEnterLoad')}</FieldTitle>
+            <input
+              type="number" min={0.1} step={0.1} className="settings-text-input"
+              value={loadDraft} disabled={controlsDisabled}
+              onChange={e => setLoadDraft(e.currentTarget.value)}
+              onBlur={commitLoad}
+              onKeyDown={e => { if (e.key === 'Enter') commitLoad(); }}
+            />
+          </div>
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertEnterMemHelp')}>{tr('settings.hostOverloadAlertEnterMem')}</FieldTitle>
+            <input
+              type="number" min={1} max={100} step={1} className="settings-text-input"
+              value={memDraft} disabled={controlsDisabled}
+              onChange={e => setMemDraft(e.currentTarget.value)}
+              onBlur={commitMem}
+              onKeyDown={e => { if (e.key === 'Enter') commitMem(); }}
+            />
+          </div>
+          {!props.value.targetBotAppId ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertTargetRequired')}</p>
+          ) : selectedBot?.recipientConfigured !== true ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertRecipientMissing')}</p>
+          ) : !props.value.targetDaemonOnline ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertTargetOffline')}</p>
+          ) : selectedBot?.recipientVerified !== true ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertRecipientUnverified')}</p>
+          ) : null}
+        </div>
+    </>
   );
 }
 
@@ -895,6 +1323,59 @@ function ToggleRow(props: {
         <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
       </span>
     </label>
+  );
+}
+
+const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+export function GroupNamePrefixRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const hasVisibleContent = draft.trim().length > 0;
+  const valid = draft === '' || hasVisibleContent;
+  const dirty = draft !== props.value;
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(draft);
+  };
+
+  return (
+    <div className="settings-subfield settings-group-prefix-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.groupNamePrefixHelp')}>{tr('settings.groupNamePrefix')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          maxLength={GROUP_NAME_PREFIX_INPUT_MAX_LENGTH}
+          placeholder={tr('settings.groupNamePrefixPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-group-name-prefix-preview>
+        {hasVisibleContent
+          ? tr('settings.groupNamePrefixPreview', { name: `${draft}${tr('settings.groupNamePrefixPreviewName')}` })
+          : tr('settings.groupNamePrefixDisabled')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
   );
 }
 

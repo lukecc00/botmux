@@ -1,19 +1,115 @@
 import { describe, it, expect } from 'vitest';
-import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import {
+  BRIDGE_NO_REPLY_SENTINEL,
+  buildBridgeSendMarkerContent,
+  buildBridgeSendPreviewText,
+  shouldEmitEmptyCompletedBridgeFallback,
+  shouldSuppressBridgeEmit,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
 
 const normalise = (text: string) => text.replace(/\s+/g, ' ').trim();
 const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker => {
-  const normalized = normalise(content);
   return {
     sentAtMs,
-    contentLength: normalized.length,
+    ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
 
+describe('buildBridgeSendMarkerContent', () => {
+  it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
+    // contentLength stays fingerprint-normalized (gate compares against
+    // normalise(final).length); previewText keeps line breaks AND leading
+    // indentation for display (indented code / nested markdown).
+    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
+      contentLength: normalise('  hello\n  bot  ').length,
+      previewText: '  hello\n  bot',
+    });
+  });
+
+  it('bounds preview storage without changing the full normalized length', () => {
+    const content = ` ${'x'.repeat(5_000)} `;
+    const marker = buildBridgeSendMarkerContent(content)!;
+    expect(marker.contentLength).toBe(5_000);
+    expect(marker.previewText).toHaveLength(4_000);
+    expect(marker.previewText?.endsWith('…')).toBe(true);
+  });
+
+  it('preserves paragraph / list / code-block structure for Markdown rendering', () => {
+    const reply = 'intro line\n\n- item one\n- item two\n\n```bash\nls -la\n```\n\ndone';
+    const preview = buildBridgeSendPreviewText(reply)!;
+    // Blank-line paragraph breaks, list rows and fenced code all survive so the
+    // dashboard overlay can render them; only fingerprint length is flattened.
+    expect(preview).toContain('\n\n- item one\n- item two');
+    expect(preview).toContain('```bash\nls -la\n```');
+    expect(preview.split('\n').length).toBe(reply.split('\n').length);
+  });
+
+  it('trims trailing line whitespace and boundary blank lines but keeps FIRST-line indentation', () => {
+    // Trailing spaces before a newline go, boundary blank lines collapse, but a
+    // leading indent on the FIRST line survives (indented code / nested list) —
+    // a plain .trim() used to eat it. A lone newline is kept (breaks:true → <br>).
+    expect(buildBridgeSendPreviewText('  spoken   \nreply  ')).toBe('  spoken\nreply');
+    expect(buildBridgeSendPreviewText('    indented code\n    line two')).toBe('    indented code\n    line two');
+    expect(buildBridgeSendPreviewText('\n\n  body\n')).toBe('  body');
+    expect(buildBridgeSendPreviewText('a\n\n\n\nb')).toBe('a\n\nb');
+  });
+
+});
+
 describe('shouldSuppressBridgeEmit', () => {
+  it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL}\n` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: prose then a standalone sentinel LINE suppresses the whole turn', () => {
+    // The real-world shape: the model explains the silence, then appends the
+    // token on its own trailing line. Full-string exact match let this leak.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: token inline in a prose sentence is not guessed away', () => {
+    // Last non-empty line is a full sentence (token mid-line), not a bare
+    // sentinel — a normal answer that merely mentions the token.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: sentinel followed by more prose still posts (not a terminator)', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${BRIDGE_NO_REPLY_SENTINEL}\n\nActually, here is the answer you asked for.` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('adopt mode does not interpret the no-reply sentinel', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: BRIDGE_NO_REPLY_SENTINEL },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+  });
+
   it('adopt mode never suppresses, even with markers in window', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 150 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, true)).toBe(false);
@@ -91,58 +187,6 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(false);
   });
 
-  it('non-adopt: a long mirrored commentary marker never suppresses the later final', () => {
-    const commentary = '从代码看还有第二层开关：groupMentionMode 决定已有话题内的后续回复是否免 @。因此完整配置需要同时设置新话题自动开工和话题内免 @，我会继续确认面板名称与命令格式。';
-    const finalText = '问题不是飞书后台没开，而是 botmux 运行配置还没开到正确字段。请开启新话题自动开工，并把群聊 @ 策略设为仅话题内不需要 @。设置后一定要新建全新话题测试；已有话题不能验证新话题自动开工。';
-    const marker = { sentAtMs: 150, ...buildBridgeSendMarkerContent(commentary) };
-    expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText, progressTexts: [commentary] },
-      200,
-      [marker],
-      false,
-    )).toBe(false);
-  });
-
-  it('non-adopt: a real final send still suppresses when commentary was mirrored too', () => {
-    const commentary = '正在核对配置字段与后台名称。';
-    const finalText = '请开启 autoStartOnNewTopic，并把 regularGroupMentionMode 设为 topic。';
-    const markers = [
-      { sentAtMs: 140, ...buildBridgeSendMarkerContent(commentary) },
-      { sentAtMs: 150, ...buildBridgeSendMarkerContent(finalText) },
-    ];
-    expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText, progressTexts: [commentary] },
-      200,
-      markers,
-      false,
-    )).toBe(true);
-  });
-
-  it('non-adopt: legacy length-only commentary marker does not suppress during rolling upgrade', () => {
-    const commentary = '正在核对配置字段与后台名称。';
-    const finalText = '请开启 autoStartOnNewTopic，并把 regularGroupMentionMode 设为 topic。';
-    const marker = markerForContent(150, commentary);
-    delete marker.contentHash;
-    expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText, progressTexts: [commentary] },
-      200,
-      [marker],
-      false,
-    )).toBe(false);
-  });
-
-  it('non-adopt: unmatched legacy marker remains conservative', () => {
-    const commentary = '正在核对配置字段与后台名称。';
-    const marker = markerForContent(150, '最终答案已经通过 botmux send 发出。');
-    delete marker.contentHash;
-    expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: '简短最终答案', progressTexts: [commentary] },
-      200,
-      [marker],
-      false,
-    )).toBe(true);
-  });
-
   it('non-adopt: short transcript follow-up remains suppressed when a structured marker exists', () => {
     const markers: BridgeSendMarker[] = [markerForContent(150, 'full answer was sent through botmux send')];
     expect(shouldSuppressBridgeEmit(
@@ -194,5 +238,100 @@ describe('shouldSuppressBridgeEmit', () => {
   it('non-adopt: multiple markers — any one inside window triggers suppress', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 50 }, { sentAtMs: 175 }, { sentAtMs: 500 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, false)).toBe(true);
+  });
+});
+
+describe('shouldEmitEmptyCompletedBridgeFallback', () => {
+  it('emits a visible diagnostic when a completed turn has empty final text and no send marker', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('does not emit when the completed empty turn already has a botmux send marker', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      200,
+      [markerForContent(150, 'already sent visible result')],
+      false,
+    )).toBe(false);
+  });
+
+  it('does not emit for failed, ambiguous, local, adopt, or non-empty turns', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'ambiguous' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100, true), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: 'real answer', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('treats legacy empty assistant_final as completed for fallback purposes', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  // Cross-CLI coverage: the two shipping producers of an empty-final turn that
+  // reach this shared gate. Traex -> empty task_complete with no terminalStatus
+  // (undefined); Grok -> empty end_turn with terminalStatus 'completed'. Both
+  // must surface the diagnostic when no send marker covers the window.
+  it('emits for a Traex-shaped empty task_complete (terminalStatus undefined)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('emits for a Grok-shaped empty end_turn (terminalStatus completed)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  // Dependency guard: a Traex cancel is encoded as turn_aborted -> 'ambiguous',
+  // which must NOT surface a "completed but empty" diagnostic.
+  it('does not emit for a Traex-shaped abort (terminalStatus ambiguous)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'ambiguous' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
   });
 });

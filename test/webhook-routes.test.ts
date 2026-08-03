@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
+import { connectorTriggerPresentation, verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';
 
 let server: Server | null = null;
@@ -199,6 +199,22 @@ describe('webhook route verification helpers', () => {
     expect(verifyWebhookToken('s3cret', '')).toBe(false);
     expect(verifyWebhookToken('s3cret', 's3cret-longer')).toBe(false);
   });
+
+  it('resolves connector-owned custom and disabled topic presentation', () => {
+    const connector = {
+      name: 'Deploy alerts',
+      promptEnvelope: { sourceName: 'production' },
+    } as ConnectorDefinition;
+    expect(connectorTriggerPresentation(connector)).toBeUndefined();
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'custom', text: '发布异常：{source}' },
+    })).toEqual({ topicMessage: '发布异常：production' });
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'none' },
+    })).toEqual({ topicMessage: null });
+  });
 });
 
 describe('webhook token mode', () => {
@@ -270,6 +286,28 @@ describe('webhook token mode', () => {
     });
     expect(res.status).toBe(200);
     expect((await res.json()).ok).toBe(true);
+  });
+
+  it('forwards topic presentation from connector config, never from request data', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered' }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, topicMessage: { mode: 'custom', text: 'Alert from {source}' } });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ presentation: { topicMessage: 'untrusted override' } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(captured[0].presentation).toEqual({ topicMessage: 'Alert from simple' });
+    expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
   });
 
   it('rejects a wrong path token with 401', async () => {
@@ -616,6 +654,83 @@ describe('webhook new-group lifecycle', () => {
     expect(createLifecycleGroup).toHaveBeenCalledTimes(2);
     expect(proxyToDaemon).toHaveBeenCalledTimes(2);
     expect((await a.json()).lifecycle).toMatchObject({ action: 'create', chatId: 'oc_fresh' });
+  });
+});
+
+describe('webhook suppressFinalOutput passthrough', () => {
+  it('passes suppressFinalOutput onto a loud fixed-chat turn trigger', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, suppressFinalOutput: true });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBe(true);
+  });
+
+  it('passes suppressFinalOutput onto a loud new-group turn trigger', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new', creatorLarkAppId: 'app1' }));
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      captured.push(body);
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: body.target.chatId } }) };
+    }) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNewGroupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, suppressFinalOutput: true });
+
+    const res = await postWebhook('conn_new_group', 'nonce_suppress', { alert: { id: 'cpu-high', status: 'firing' } });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBe(true);
+  });
+
+  it('does not pass suppressFinalOutput onto a wait-mode trigger', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'completed', output: { content: 'answer' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_suppress',
+      name: 'Wait Suppress',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      suppressFinalOutput: true,
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-07-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_suppress/tok_plain_value?wait=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBeUndefined();
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true });
   });
 });
 
