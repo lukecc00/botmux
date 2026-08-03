@@ -2409,7 +2409,7 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
  *  对齐 maybeEmitAdoptPreamble；区别只在事件取出方式（codex/coco 是结构化
  *  event，不需要走 claude 那套 jsonl turn assembly）。 */
 function maybeEmitCodexAdoptPreamble(
-  history: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  history: readonly { kind: 'user' | 'assistant_progress' | 'assistant_final'; text: string }[],
 ): void {
   if (!lastInitConfig?.adoptMode) return;
   if (lastInitConfig?.adoptRestoredFromMetadata) return;

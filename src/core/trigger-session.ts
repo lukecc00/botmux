@@ -14,6 +14,7 @@ import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setAct
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
+import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 import type { DaemonSession } from './types.js';
 import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
@@ -246,7 +247,7 @@ async function validateRootMessageTarget(
   return { ok: true, chatId };
 }
 
-function buildExistingSessionContent(
+async function buildExistingSessionContent(
   ds: DaemonSession,
   prompt: string,
   larkAppId: string,
@@ -257,6 +258,7 @@ function buildExistingSessionContent(
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
+  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
     cliId: ds.session.cliId ?? botCfg.cliId,
@@ -265,6 +267,7 @@ function buildExistingSessionContent(
     larkAppId,
     chatId,
     whiteboardId: ds.session.whiteboardId,
+    topicGroupMemoryBlock,
     codexAppText,
     codexAppApplicationContext,
     // Only data enters untrusted structured context; connector-owner task and
@@ -441,7 +444,7 @@ export async function triggerSessionTurn(
   }
 
   if (ds?.worker && !ds.worker.killed) {
-    const content = buildExistingSessionContent(
+    const content = await buildExistingSessionContent(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
@@ -507,7 +510,7 @@ export async function triggerSessionTurn(
   // through to createSession for chat-scope sessions, which is unsafe for a
   // durable meeting receiver whose projection pins one receiverSessionId.
   if (ds) {
-    const content = buildExistingSessionContent(
+    const content = await buildExistingSessionContent(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
@@ -703,6 +706,7 @@ export async function triggerSessionTurn(
   const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
     ? await getAvailableBots(larkAppId, chatId)
     : [];
+  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -719,6 +723,7 @@ export async function triggerSessionTurn(
       larkAppId,
       chatId,
       whiteboardId: newDs.session.whiteboardId,
+      topicGroupMemoryBlock,
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,

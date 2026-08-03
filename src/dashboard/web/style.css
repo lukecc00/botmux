@@ -10641,6 +10641,10 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   box-shadow: var(--shadow);
   padding: 4px 18px 16px;
 }
+.bd-tile-wide {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
 :root[data-theme="dark"] .bd-tile {
   background: rgba(255, 255, 255, 0.04);
   backdrop-filter: blur(18px);
@@ -25634,3 +25638,443 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   color: var(--danger, #e5484d) !important;
   border-color: color-mix(in srgb, var(--danger, #e5484d) 48%, var(--border-soft)) !important;
 }
+
+/* Topic-group shared-memory maintenance table. */
+.bot-defaults-page .bd-topic-group-memory-tile,
+.bot-defaults-page .tgm-memory-section {
+  min-width: 0;
+}
+
+.bot-defaults-page .tgm-memory-help {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .tgm-memory-help > summary {
+  width: fit-content;
+  max-width: 100%;
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.bot-defaults-page .tgm-memory-help > p {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.bot-defaults-page .bd-body .tgm-memory-settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 10px;
+}
+
+.bot-defaults-page .tgm-memory-management {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.bot-defaults-page .tgm-memory-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.bot-defaults-page .tgm-memory-status-strip > span {
+  min-width: 0;
+  padding: 4px 8px;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.bot-defaults-page .tgm-memory-management > .actions {
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+
+.bot-defaults-page .tgm-memory-empty {
+  padding: 14px;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+.bot-defaults-page .tgm-memory-table-shell {
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.bot-defaults-page .tgm-memory-table-wrap {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+
+.bot-defaults-page .tgm-memory-table-wrap:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: -2px;
+}
+
+.bot-defaults-page .tgm-memory-table {
+  width: 100%;
+  min-width: 620px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.bot-defaults-page .tgm-memory-table th:first-child { width: 24%; }
+.bot-defaults-page .tgm-memory-table th:nth-child(2) { width: 12%; }
+.bot-defaults-page .tgm-memory-table th:nth-child(3) { width: 34%; }
+.bot-defaults-page .tgm-memory-table th:nth-child(4) { width: 30%; }
+
+.bot-defaults-page .tgm-memory-table th,
+.bot-defaults-page .tgm-memory-table td {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.bot-defaults-page .tgm-memory-table th {
+  color: var(--muted);
+  font-weight: 700;
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--surface-muted) 58%, var(--surface));
+}
+
+.bot-defaults-page .tgm-memory-table tbody tr:last-child td { border-bottom: 0; }
+.bot-defaults-page .tgm-memory-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--accent) 3%, var(--surface));
+}
+.bot-defaults-page .tgm-memory-table td > small { display: block; margin-top: 4px; }
+
+.bot-defaults-page .tgm-memory-chat {
+  min-width: 0;
+}
+
+.bot-defaults-page .tgm-memory-chat strong {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.bot-defaults-page .tgm-memory-entry-counts {
+  display: block;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.bot-defaults-page .tgm-memory-row-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  white-space: normal;
+}
+
+.bot-defaults-page .tgm-memory-row-actions button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 9px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .tgm-memory-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface));
+}
+
+.bot-defaults-page .tgm-memory-pagination-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.bot-defaults-page .tgm-memory-pagination-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bot-defaults-page .tgm-memory-pagination-actions button {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .tgm-memory-pagination-actions button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--accent-strong);
+}
+
+.bot-defaults-page .tgm-memory-pagination-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tgm-memory-detail-dialog {
+  width: min(920px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow);
+}
+
+.tgm-memory-detail-dialog::backdrop {
+  background: var(--modal-backdrop);
+  backdrop-filter: blur(3px);
+}
+
+.tgm-memory-detail-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0;
+  max-height: calc(100dvh - 32px);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.tgm-memory-detail-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.tgm-memory-detail-title {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tgm-memory-detail-title h3 {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.tgm-memory-detail-title span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.tgm-memory-detail-head button {
+  min-height: 32px;
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+
+.tgm-memory-detail-body {
+  min-height: 0;
+  padding: 14px 18px 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.tgm-memory-editor {
+  display: grid;
+  gap: 14px;
+}
+
+.tgm-memory-editor-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-muted) 62%, var(--surface));
+}
+
+.tgm-memory-editor-section h4 {
+  margin: 0;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.tgm-memory-summary-input,
+.tgm-memory-edit-item textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.tgm-memory-editor-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tgm-memory-edit-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.tgm-memory-edit-item-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.tgm-memory-edit-item-actions button {
+  min-height: 30px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+.tgm-memory-resource-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.tgm-memory-resource-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.6fr) minmax(0, 1.4fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.tgm-memory-resource-fields label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.tgm-memory-resource-fields label > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tgm-memory-resource-url,
+.tgm-memory-resource-description {
+  grid-column: 1 / -1;
+}
+
+.tgm-memory-raw-detail {
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.tgm-memory-raw-detail > summary {
+  width: fit-content;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.tgm-memory-raw-detail > p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+
+.tgm-memory-detail-body pre {
+  box-sizing: border-box;
+  max-width: 100%;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font: 12px/1.55 var(--mono);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.tgm-memory-detail-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface);
+}
+
+.tgm-memory-detail-footer .oncall-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tgm-memory-detail-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tgm-memory-detail-footer-actions button {
+  min-height: 32px;
+  padding: 6px 12px;
+}
+
+@media (max-width: 720px) {
+  .bot-defaults-page .bd-body .tgm-memory-settings-grid {
+    grid-template-columns: 1fr;
+  }

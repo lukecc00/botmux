@@ -23,7 +23,11 @@ import * as backendTypeStore from '../services/backend-type-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
+import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import * as topicGroupMemoryStore from '../services/topic-group-memory-store.js';
+import { compactTopicGroupMemoryWithHttp, resolveTopicGroupMemoryHttpContext } from '../services/topic-group-memory-http-distiller.js';
+import { resolveTopicGroupMemoryConfig } from '../services/topic-group-memory-config.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -1170,7 +1174,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
   const activeDs = findActiveBySessionId(params.sessionId);
   if (column === 'in_progress' && activeDs?.session.queued) {
-    await activateQueuedSession(activeDs);
+    await activateQueuedSession(activeDs, { preserveManualColumn: true });
   } else if (column) {
     session.kanbanColumn = column;
   }
@@ -1198,7 +1202,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => 
   sessionStore.updateSession(ds.session);
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId: params.sessionId, patch: { kanbanColumn: ds.session.kanbanColumn, queued: false } },
+    // `undefined` is omitted on the SSE wire, so explicitly send null when
+    // activation released the system-authored backlog placement.
+    body: { sessionId: params.sessionId, patch: { kanbanColumn: ds.session.kanbanColumn ?? null, queued: false } },
   });
   jsonRes(res, 200, { ok: true });
 });
@@ -2963,6 +2969,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
+    topicGroupMemory: cardPrefs.topicGroupMemory,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
@@ -2987,6 +2994,110 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   });
 });
 
+// Topic-group shared-memory maintenance is deliberately daemon-local: this
+// process can only inspect the current bot's larkAppId partition. The outer
+// dashboard proxies these routes to the selected bot daemon.
+ipcRoute('GET', '/api/topic-group-memory', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const memoryConfig = cardPrefsStore.getBotCardPrefs(cachedLarkAppId).topicGroupMemory;
+  const memories = await topicGroupMemoryStore.listTopicGroupMemories(cachedLarkAppId, {
+    limits: { maxSummaryChars: memoryConfig.maxSummaryChars },
+  });
+  jsonRes(res, 200, { ok: true, larkAppId: cachedLarkAppId, config: memoryConfig, count: memories.length, memories });
+});
+
+ipcRoute('POST', '/api/topic-group-memory/clear', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const cleared = await topicGroupMemoryStore.clearAllTopicGroupMemories(cachedLarkAppId);
+    const failed = cleared.filter(item => item.error).length;
+    logger.info(`[topic-group-memory:${cachedLarkAppId}] clear-all count=${cleared.length} failed=${failed}`);
+    jsonRes(res, 200, { ok: failed === 0, cleared, count: cleared.length, failed });
+  } catch (error) {
+    jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('GET', '/api/topic-group-memory/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const memoryConfig = cardPrefsStore.getBotCardPrefs(cachedLarkAppId).topicGroupMemory;
+    const options = { limits: { maxSummaryChars: memoryConfig.maxSummaryChars } };
+    const memory = await topicGroupMemoryStore.readTopicGroupMemory(cachedLarkAppId, p.chatId, options);
+    const stats = await topicGroupMemoryStore.statTopicGroupMemory(cachedLarkAppId, p.chatId, options);
+    jsonRes(res, 200, { ok: true, memory, stats });
+  } catch (error) {
+    jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('PUT', '/api/topic-group-memory/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { revision?: unknown; content?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Number.isSafeInteger(body.revision) || Number(body.revision) < 0) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_revision' });
+  }
+  try {
+    const memoryConfig = cardPrefsStore.getBotCardPrefs(cachedLarkAppId).topicGroupMemory;
+    const options = { limits: { maxSummaryChars: memoryConfig.maxSummaryChars } };
+    const result = await topicGroupMemoryStore.replaceTopicGroupMemoryContent(
+      cachedLarkAppId,
+      p.chatId,
+      Number(body.revision),
+      body.content,
+      options,
+    );
+    if (!result.ok) {
+      if (result.reason === 'revision_mismatch') {
+        return jsonRes(res, 409, { ok: false, reason: result.reason, memory: result.doc });
+      }
+      return jsonRes(res, 400, { ok: false, reason: result.reason, error: result.error, memory: result.doc });
+    }
+    const stats = await topicGroupMemoryStore.statTopicGroupMemory(cachedLarkAppId, p.chatId, options);
+    logger.info(`[topic-group-memory:${cachedLarkAppId}:${p.chatId}] manually-updated revision=${result.doc.revision}`);
+    jsonRes(res, 200, { ok: true, memory: result.doc, stats });
+  } catch (error) {
+    jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('POST', '/api/topic-group-memory/:chatId/compact', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const botConfig = getBot(cachedLarkAppId).config;
+    const memoryConfig = resolveTopicGroupMemoryConfig(botConfig.topicGroupMemory);
+    const result = await topicGroupMemoryStore.compactTopicGroupMemory(cachedLarkAppId, p.chatId, {
+      limits: { maxSummaryChars: memoryConfig.maxSummaryChars },
+      httpContext: resolveTopicGroupMemoryHttpContext(memoryConfig.httpLlm, {
+        model: botConfig.model,
+        env: botConfig.env,
+      }),
+      compactWithHttp: compactTopicGroupMemoryWithHttp,
+    });
+    logger.info(
+      `[topic-group-memory:${cachedLarkAppId}:${p.chatId}] compacted=${result.compacted} revision=${result.doc?.revision ?? 0} size=${result.stats.sizeBytes}`
+      + ` source=${result.source ?? 'none'}`
+      + (result.fallbackReason ? ` fallback=${result.fallbackReason}` : ''),
+    );
+    jsonRes(res, 200, { ok: true, ...result });
+  } catch (error) {
+    jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('DELETE', '/api/topic-group-memory/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const cleared = await topicGroupMemoryStore.clearTopicGroupMemory(cachedLarkAppId, p.chatId);
+    logger.info(`[topic-group-memory:${cachedLarkAppId}:${p.chatId}] cleared=${cleared}`);
+    jsonRes(res, 200, { ok: true, cleared, larkAppId: cachedLarkAppId, chatId: p.chatId });
+  } catch (error) {
+    jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
@@ -2998,6 +3109,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown;
+    topicGroupMemory?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -3010,6 +3122,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean;
+    topicGroupMemory?: import('../bot-registry.js').TopicGroupMemoryConfig;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -3031,6 +3144,27 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   }
   if (body.docSubscribeDefaultMode === 'mention-only' || body.docSubscribeDefaultMode === 'all') {
     patch.docSubscribeDefaultMode = body.docSubscribeDefaultMode;
+  }
+  if (body.topicGroupMemory && typeof body.topicGroupMemory === 'object' && !Array.isArray(body.topicGroupMemory)) {
+    const raw = body.topicGroupMemory as Record<string, unknown>;
+    const memory: import('../bot-registry.js').TopicGroupMemoryConfig = {};
+    if (typeof raw.enabled === 'boolean') memory.enabled = raw.enabled;
+    if (raw.injectMode === 'off' || raw.injectMode === 'summary' || raw.injectMode === 'summary-and-facts') memory.injectMode = raw.injectMode;
+    if (raw.updateMode === 'off' || raw.updateMode === 'manual' || raw.updateMode === 'auto') memory.updateMode = raw.updateMode;
+    if (typeof raw.maxPromptChars === 'number' && Number.isInteger(raw.maxPromptChars) && raw.maxPromptChars > 0 && raw.maxPromptChars <= 8_000) memory.maxPromptChars = raw.maxPromptChars;
+    if (typeof raw.maxSummaryChars === 'number' && Number.isInteger(raw.maxSummaryChars) && raw.maxSummaryChars > 0 && raw.maxSummaryChars <= 10_000) memory.maxSummaryChars = raw.maxSummaryChars;
+    if (raw.httpLlm && typeof raw.httpLlm === 'object' && !Array.isArray(raw.httpLlm)) {
+      const input = raw.httpLlm as Record<string, unknown>;
+      const http: import('../bot-registry.js').TopicGroupMemoryHttpLlmConfig = {};
+      if (typeof input.enabled === 'boolean') http.enabled = input.enabled;
+      if (typeof input.autoDiscoverCodex === 'boolean') http.autoDiscoverCodex = input.autoDiscoverCodex;
+      if (typeof input.baseUrl === 'string') http.baseUrl = input.baseUrl.trim();
+      if (typeof input.model === 'string') http.model = input.model.trim();
+      if (input.api === 'auto' || input.api === 'responses' || input.api === 'chat-completions') http.api = input.api;
+      if (typeof input.timeoutMs === 'number' && Number.isInteger(input.timeoutMs) && input.timeoutMs >= 1_000 && input.timeoutMs <= 300_000) http.timeoutMs = input.timeoutMs;
+      if (Object.keys(http).length > 0) memory.httpLlm = http;
+    }
+    if (Object.keys(memory).length > 0) patch.topicGroupMemory = memory;
   }
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 

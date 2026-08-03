@@ -28,9 +28,11 @@ import {
   normalizeUsageDisplay,
   DEFAULT_USAGE_DISPLAY,
   type ChatReplyMode,
+  type TopicGroupMemoryConfig,
   type UsageDisplayMode,
 } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import { resolveTopicGroupMemoryConfig } from './topic-group-memory-config.js';
 
 export interface BotCardPrefs {
   /** Where to show native Context / Token usage:
@@ -65,13 +67,25 @@ export interface BotCardPrefs {
   regularGroupMentionMode: 'always' | 'topic' | 'never' | 'ambient';
   /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
   docSubscribeDefaultMode: 'mention-only' | 'all';
+  topicGroupMemory: TopicGroupMemoryConfig & {
+    enabled: boolean;
+    injectMode: 'off' | 'summary' | 'summary-and-facts';
+    updateMode: 'off' | 'manual' | 'auto';
+    maxPromptChars: number;
+    maxSummaryChars: number;
+  };
 }
+
+export type BotCardPrefsPatch = Omit<Partial<BotCardPrefs>, 'topicGroupMemory'> & {
+  topicGroupMemory?: TopicGroupMemoryConfig;
+};
 
 /** Current card prefs for a bot (`usageDisplay` defaults to 'streaming';
  * `botToBotSameDir` defaults true; other booleans default false). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
+    const topicGroupMemory = resolveTopicGroupMemoryConfig(c.topicGroupMemory);
     return {
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
@@ -88,6 +102,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
       docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+      topicGroupMemory,
     };
   } catch {
     return {
@@ -105,6 +120,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupReplyMode: 'chat-topic',
       regularGroupMentionMode: 'always',
       docSubscribeDefaultMode: 'mention-only',
+      topicGroupMemory: resolveTopicGroupMemoryConfig(undefined),
     };
   }
 }
@@ -116,7 +132,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
  */
 export async function updateBotCardPrefs(
   larkAppId: string,
-  patch: Partial<BotCardPrefs>,
+  patch: BotCardPrefsPatch,
 ): Promise<{ ok: true; prefs: BotCardPrefs } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
@@ -167,6 +183,34 @@ export async function updateBotCardPrefs(
     if (val === 'footer' || val === 'off') entry[key] = val;
     else delete entry[key];
   };
+  const applyTopicGroupMemory = (entry: any, val: TopicGroupMemoryConfig | undefined) => {
+    if (val === undefined) return;
+    const current = entry.topicGroupMemory && typeof entry.topicGroupMemory === 'object'
+      ? { ...entry.topicGroupMemory }
+      : {};
+    if (typeof val.enabled === 'boolean') current.enabled = val.enabled;
+    if (val.injectMode === 'off' || val.injectMode === 'summary' || val.injectMode === 'summary-and-facts') current.injectMode = val.injectMode;
+    if (val.updateMode === 'off' || val.updateMode === 'manual' || val.updateMode === 'auto') current.updateMode = val.updateMode;
+    if (typeof val.maxPromptChars === 'number' && Number.isInteger(val.maxPromptChars) && val.maxPromptChars > 0) current.maxPromptChars = val.maxPromptChars;
+    if (typeof val.maxSummaryChars === 'number' && Number.isInteger(val.maxSummaryChars) && val.maxSummaryChars > 0) current.maxSummaryChars = val.maxSummaryChars;
+    if (val.httpLlm && typeof val.httpLlm === 'object') {
+      const http = current.httpLlm && typeof current.httpLlm === 'object' ? { ...current.httpLlm } : {};
+      if (typeof val.httpLlm.enabled === 'boolean') http.enabled = val.httpLlm.enabled;
+      if (typeof val.httpLlm.autoDiscoverCodex === 'boolean') http.autoDiscoverCodex = val.httpLlm.autoDiscoverCodex;
+      if (typeof val.httpLlm.baseUrl === 'string') {
+        if (val.httpLlm.baseUrl.trim()) http.baseUrl = val.httpLlm.baseUrl.trim();
+        else delete http.baseUrl;
+      }
+      if (typeof val.httpLlm.model === 'string') {
+        if (val.httpLlm.model.trim()) http.model = val.httpLlm.model.trim();
+        else delete http.model;
+      }
+      if (val.httpLlm.api === 'auto' || val.httpLlm.api === 'responses' || val.httpLlm.api === 'chat-completions') http.api = val.httpLlm.api;
+      if (typeof val.httpLlm.timeoutMs === 'number' && Number.isInteger(val.httpLlm.timeoutMs) && val.httpLlm.timeoutMs > 0) http.timeoutMs = val.httpLlm.timeoutMs;
+      current.httpLlm = http;
+    }
+    entry.topicGroupMemory = current;
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
@@ -183,6 +227,8 @@ export async function updateBotCardPrefs(
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
     applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
+    applyTopicGroupMemory(entry, patch.topicGroupMemory);
+    const topicGroupMemory = resolveTopicGroupMemoryConfig(entry.topicGroupMemory);
     return {
       write: true,
       result: {
@@ -204,6 +250,7 @@ export async function updateBotCardPrefs(
           ? entry.regularGroupMentionMode
           : 'always',
         docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+        topicGroupMemory,
       },
     };
   });
@@ -260,6 +307,12 @@ export async function updateBotCardPrefs(
   if (patch.docSubscribeDefaultMode !== undefined) {
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
+  if (patch.topicGroupMemory !== undefined) {
+    bot.config.topicGroupMemory = {
+      ...(bot.config.topicGroupMemory ?? {}),
+      ...patch.topicGroupMemory,
+    };
+  }
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
@@ -270,6 +323,7 @@ export async function updateBotCardPrefs(
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
+    `topicGroupMemory=${r.result.topicGroupMemory.enabled}/${r.result.topicGroupMemory.injectMode}/${r.result.topicGroupMemory.updateMode} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

@@ -55,6 +55,18 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
   };
 }
 
+function taskComplete(text: string | null, ts = '2026-04-29T07:00:02.000Z') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: 'native-turn',
+      last_agent_message: text,
+    },
+  };
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
@@ -246,7 +258,8 @@ describe('drainCodexRollout', () => {
   it('extracts user (response_item) + assistant_final (task_complete)', () => {
     writeFileSync(path,
       ev(userResponseItem('hello there')) +
-      ev(assistantFinalResponseItem('hi back')));
+      ev(assistantFinalResponseItem('hi back')) +
+      ev(taskComplete('hi back')));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(2);
     expect(r.events[0].kind).toBe('user');
@@ -377,21 +390,83 @@ describe('drainCodexRollout', () => {
   it('byte-offset stable: re-drain from newOffset returns no events', () => {
     writeFileSync(path,
       ev(userResponseItem('first')) +
-      ev(assistantFinalResponseItem('reply')));
+      ev(assistantFinalResponseItem('reply')) +
+      ev(taskComplete('reply')));
     const first = drainCodexRollout(path, 0);
     const second = drainCodexRollout(path, first.newOffset);
     expect(second.events).toEqual([]);
     expect(second.newOffset).toBe(first.newOffset);
   });
 
-  it('appended events drain incrementally', () => {
+  it('waits for an incrementally appended task_complete before emitting final output', () => {
     writeFileSync(path, ev(userResponseItem('first')));
     const r1 = drainCodexRollout(path, 0);
     expect(r1.events).toHaveLength(1);
     appendFileSync(path, ev(assistantFinalResponseItem('reply')));
     const r2 = drainCodexRollout(path, r1.newOffset);
-    expect(r2.events).toHaveLength(1);
-    expect(r2.events[0].kind).toBe('assistant_final');
+    expect(r2.events).toEqual([]);
+
+    appendFileSync(path, ev(taskComplete('reply')));
+    const r3 = drainCodexRollout(path, r2.newOffset);
+    expect(r3.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: 'reply', terminalStatus: 'completed' }),
+    ]);
+  });
+
+  it('delivers compaction Handoff Summary records as progress without closing the bridge turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('long-turn', 'long dashboard fix', Date.parse('2026-04-29T07:00:00.000Z'));
+
+    writeFileSync(path,
+      ev(userResponseItem('long dashboard fix'))
+      + ev(assistantFinalResponseItem('Handoff Summary\n\nPartial progress only.', '2026-04-29T07:10:00.000Z'))
+      + ev({ timestamp: '2026-04-29T07:10:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } })
+      + ev(assistantFinalResponseItem('Handoff Summary\n\nStill not final.', '2026-04-29T07:20:00.000Z'))
+      + ev({ timestamp: '2026-04-29T07:20:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
+    );
+    const beforeFinal = drainCodexRollout(path, 0);
+    q.ingest(beforeFinal.events);
+
+    expect(beforeFinal.events.map(event => event.kind)).toEqual([
+      'user',
+      'assistant_progress',
+      'assistant_progress',
+    ]);
+    expect(beforeFinal.events.filter(event => event.kind === 'assistant_progress')).toEqual([
+      expect.objectContaining({
+        text: 'Handoff Summary\n\nPartial progress only.',
+        progressKind: 'compaction_summary',
+      }),
+      expect.objectContaining({
+        text: 'Handoff Summary\n\nStill not final.',
+        progressKind: 'compaction_summary',
+      }),
+    ]);
+    expect(q.drainProgressOutputs()).toEqual([
+      expect.objectContaining({
+        turnId: 'long-turn',
+        content: 'Handoff Summary\n\nPartial progress only.',
+      }),
+      expect.objectContaining({
+        turnId: 'long-turn',
+        content: 'Handoff Summary\n\nStill not final.',
+      }),
+    ]);
+    expect(q.drainEmittable()).toEqual([]);
+
+    appendFileSync(path,
+      ev(assistantFinalResponseItem('真正最终结果', '2026-04-29T07:30:00.000Z'))
+      + ev(taskComplete('真正最终结果', '2026-04-29T07:30:00.010Z')),
+    );
+    const afterFinal = drainCodexRollout(path, beforeFinal.newOffset);
+    q.ingest(afterFinal.events);
+
+    expect(afterFinal.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: '真正最终结果', terminalStatus: 'completed' }),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'long-turn', finalText: '真正最终结果' }),
+    ]);
   });
 
   it('partial trailing line is held back as pendingTail', () => {
@@ -418,7 +493,8 @@ describe('drainCodexRollout', () => {
   it('truncated file (size < fromOffset) re-drains from top', () => {
     writeFileSync(path,
       ev(userResponseItem('original message that is reasonably long for offset')) +
-      ev(assistantFinalResponseItem('long original answer to take up bytes')));
+      ev(assistantFinalResponseItem('long original answer to take up bytes')) +
+      ev(taskComplete('long original answer to take up bytes')));
     const r1 = drainCodexRollout(path, 0);
     // Simulate truncation: rewrite with strictly shorter content so the new
     // size is below r1.newOffset and the re-drain branch fires.

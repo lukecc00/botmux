@@ -167,6 +167,32 @@ export type TopicGroupMemoryUpdateResult =
   | { ok: true; doc: TopicGroupMemoryDoc }
   | { ok: false; reason: 'revision_mismatch'; doc: TopicGroupMemoryDoc | null };
 
+export interface TopicGroupMemoryEditableTextEntry {
+  id: string;
+  text: string;
+}
+
+export interface TopicGroupMemoryEditableResource {
+  id: string;
+  kind: TopicGroupMemoryResourceKind;
+  title: string;
+  url: string;
+  description?: string;
+}
+
+/** User-editable memory content. Source metadata and recent-contribution
+ * de-duplication records are intentionally excluded and preserved by the store. */
+export interface TopicGroupMemoryEditableContent {
+  summary: string;
+  facts: TopicGroupMemoryEditableTextEntry[];
+  decisions: TopicGroupMemoryEditableTextEntry[];
+  openQuestions: TopicGroupMemoryEditableTextEntry[];
+  resources: TopicGroupMemoryEditableResource[];
+}
+
+export type TopicGroupMemoryManualUpdateResult = TopicGroupMemoryUpdateResult
+  | { ok: false; reason: 'invalid_content'; error: string; doc: TopicGroupMemoryDoc | null };
+
 export const TOPIC_GROUP_MEMORY_DEFAULT_LIMITS: Readonly<Required<TopicGroupMemoryLimits>> = {
   maxSummaryChars: 10_000,
   maxFacts: 100,
@@ -422,6 +448,152 @@ export async function mutateTopicGroupMemory(
   const result = await updateTopicGroupMemory(larkAppId, chatId, null, updater, options);
   if (!result.ok) throw new Error(result.reason);
   return result.doc;
+}
+
+function editableContentJson(doc: TopicGroupMemoryDoc): string {
+  return JSON.stringify({
+    summary: doc.summary,
+    facts: doc.facts.map(({ id, text: body }) => ({ id, text: body })),
+    decisions: doc.decisions.map(({ id, text: body }) => ({ id, text: body })),
+    openQuestions: doc.openQuestions.map(({ id, text: body }) => ({ id, text: body })),
+    resources: doc.resources.map(({ id, kind, title, url, description }) => ({
+      id, kind, title, url, ...(description ? { description } : {}),
+    })),
+  });
+}
+
+function invalidEditableContent(
+  error: string,
+  doc: TopicGroupMemoryDoc | null,
+): TopicGroupMemoryManualUpdateResult {
+  return { ok: false, reason: 'invalid_content', error, doc };
+}
+
+/** Replace only the content exposed by the dashboard editor. Every id must
+ * already exist in the current document; omitting an id deletes that specific
+ * item. Source metadata and recentContributions survive unchanged. */
+export async function replaceTopicGroupMemoryContent(
+  larkAppId: string,
+  chatId: string,
+  expectedRevision: number,
+  value: unknown,
+  options: TopicGroupMemoryStoreOptions = {},
+): Promise<TopicGroupMemoryManualUpdateResult> {
+  const current = await readTopicGroupMemory(larkAppId, chatId, options);
+  if (!current || current.revision !== expectedRevision) {
+    return { ok: false, reason: 'revision_mismatch', doc: current };
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return invalidEditableContent('content_must_be_an_object', current);
+  }
+  const input = value as Record<string, unknown>;
+  const limits = { ...TOPIC_GROUP_MEMORY_DEFAULT_LIMITS, ...options.limits };
+  if (typeof input.summary !== 'string' || input.summary.length > limits.maxSummaryChars) {
+    return invalidEditableContent('invalid_summary', current);
+  }
+  const summary = input.summary.trim();
+  if (containsTopicGroupMemorySensitiveText(summary)) {
+    return invalidEditableContent('sensitive_summary', current);
+  }
+
+  const parseTextEntries = <T extends { id: string; text: string }>(
+    raw: unknown,
+    existing: T[],
+    section: string,
+  ): TopicGroupMemoryEditableTextEntry[] | string => {
+    if (!Array.isArray(raw)) return `invalid_${section}`;
+    const byId = new Map(existing.map(entry => [entry.id, entry]));
+    const seen = new Set<string>();
+    const parsed: TopicGroupMemoryEditableTextEntry[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return `invalid_${section}_entry`;
+      const entry = item as Record<string, unknown>;
+      if (typeof entry.id !== 'string' || !byId.has(entry.id) || seen.has(entry.id)) return `invalid_${section}_id`;
+      if (typeof entry.text !== 'string') return `invalid_${section}_text`;
+      const body = entry.text.trim();
+      if (!body || body.length > limits.maxItemChars) return `invalid_${section}_text`;
+      if (containsTopicGroupMemorySensitiveText(body)) return `sensitive_${section}_text`;
+      seen.add(entry.id);
+      parsed.push({ id: entry.id, text: body });
+    }
+    return parsed;
+  };
+
+  const facts = parseTextEntries(input.facts, current.facts, 'facts');
+  if (typeof facts === 'string') return invalidEditableContent(facts, current);
+  const decisions = parseTextEntries(input.decisions, current.decisions, 'decisions');
+  if (typeof decisions === 'string') return invalidEditableContent(decisions, current);
+  const openQuestions = parseTextEntries(input.openQuestions, current.openQuestions, 'open_questions');
+  if (typeof openQuestions === 'string') return invalidEditableContent(openQuestions, current);
+  if (!Array.isArray(input.resources)) return invalidEditableContent('invalid_resources', current);
+
+  const resourcesById = new Map(current.resources.map(entry => [entry.id, entry]));
+  const seenResourceIds = new Set<string>();
+  const resources: TopicGroupMemoryEditableResource[] = [];
+  for (const item of input.resources) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return invalidEditableContent('invalid_resource_entry', current);
+    }
+    const entry = item as Record<string, unknown>;
+    if (typeof entry.id !== 'string' || !resourcesById.has(entry.id) || seenResourceIds.has(entry.id)) {
+      return invalidEditableContent('invalid_resource_id', current);
+    }
+    if (typeof entry.kind !== 'string' || !TOPIC_GROUP_MEMORY_RESOURCE_KINDS.includes(entry.kind as TopicGroupMemoryResourceKind)) {
+      return invalidEditableContent('invalid_resource_kind', current);
+    }
+    if (typeof entry.title !== 'string' || typeof entry.url !== 'string'
+      || (entry.description !== undefined && typeof entry.description !== 'string')) {
+      return invalidEditableContent('invalid_resource_content', current);
+    }
+    const title = entry.title.trim();
+    const description = typeof entry.description === 'string' ? entry.description.trim() : '';
+    const url = safeTopicGroupMemoryUrl(entry.url);
+    if (!title || title.length > 300 || !url || entry.url.length > 2_048 || description.length > limits.maxItemChars) {
+      return invalidEditableContent('invalid_resource_content', current);
+    }
+    if (containsTopicGroupMemorySensitiveText(title) || containsTopicGroupMemorySensitiveText(description)) {
+      return invalidEditableContent('sensitive_resource_content', current);
+    }
+    seenResourceIds.add(entry.id);
+    resources.push({
+      id: entry.id,
+      kind: entry.kind as TopicGroupMemoryResourceKind,
+      title,
+      url,
+      ...(description ? { description } : {}),
+    });
+  }
+
+  return updateTopicGroupMemory(larkAppId, chatId, expectedRevision, doc => {
+    const now = new Date().toISOString();
+    const factById = new Map(doc.facts.map(entry => [entry.id, entry]));
+    const decisionById = new Map(doc.decisions.map(entry => [entry.id, entry]));
+    const questionById = new Map(doc.openQuestions.map(entry => [entry.id, entry]));
+    const resourceById = new Map(doc.resources.map(entry => [entry.id, entry]));
+    const next: TopicGroupMemoryDoc = {
+      ...doc,
+      summary,
+      facts: facts.map(entry => {
+        const old = factById.get(entry.id)!;
+        return { ...old, text: entry.text, updatedAt: old.text === entry.text ? old.updatedAt : now };
+      }),
+      decisions: decisions.map(entry => ({ ...decisionById.get(entry.id)!, text: entry.text })),
+      openQuestions: openQuestions.map(entry => ({ ...questionById.get(entry.id)!, text: entry.text })),
+      resources: resources.map(entry => {
+        const old = resourceById.get(entry.id)!;
+        const changed = old.kind !== entry.kind || old.title !== entry.title
+          || old.url !== entry.url || (old.description ?? '') !== (entry.description ?? '');
+        const { description: _oldDescription, ...oldWithoutDescription } = old;
+        return {
+          ...oldWithoutDescription,
+          ...entry,
+          ...(entry.description ? { description: entry.description } : {}),
+          updatedAt: changed ? now : old.updatedAt,
+        };
+      }),
+    };
+    return editableContentJson(next) === editableContentJson(doc) ? false : next;
+  }, options);
 }
 
 export async function clearTopicGroupMemory(

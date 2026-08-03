@@ -69,6 +69,7 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
+import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
@@ -1099,6 +1100,7 @@ export function buildReforkPrompt(
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
     sender?: ResolvedSender;
+    topicGroupMemoryBlock?: string;
   },
 ): string {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -1121,6 +1123,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    topicGroupMemoryBlock: opts?.topicGroupMemoryBlock,
   });
 }
 
@@ -2487,7 +2490,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
     }
   }
 
-  const buildPrompt = () => buildNewTopicCliInput(
+  const buildPrompt = async () => buildNewTopicCliInput(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
     ds.pendingAttachments, undefined, undefined, undefined,
     { name: bot.botName, openId: bot.botOpenId }, locale, undefined,
@@ -2495,6 +2498,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       larkAppId,
       chatId: ds.chatId,
       whiteboardId: ds.session.whiteboardId,
+      topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds),
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
@@ -2529,7 +2533,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   }
 
   ensureSessionWhiteboard(ds);
-  const prompt = buildPrompt();
+  const prompt = await buildPrompt();
   rememberLastCliInput(ds, userContent, prompt);
   forkWorker(ds, prompt);
   ds.pendingCodexAppText = undefined;
@@ -2695,7 +2699,10 @@ export async function spawnDashboardSession(
 /** 激活一条 parked（待办池）会话：把暂存的 queuedPrompt 当首轮发给 CLI，清掉 queued
  *  标记。供「拖到进行中」「点开始」「群里来第一条消息」三个入口复用。已起过的会话
  *  （worker 在或 hasHistory）直接返回 already_active，幂等。 */
-export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: boolean; error?: string }> {
+export async function activateQueuedSession(
+  ds: DaemonSession,
+  options: { preserveManualColumn?: boolean } = {},
+): Promise<{ ok: boolean; error?: string }> {
   if (!ds.session.queued) {
     return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
   }
@@ -2722,8 +2729,13 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
   ds.session.queuedCodexAppMessageContext = undefined;
   ds.session.queuedAttachments = undefined;
   ds.pendingPrompt = undefined;
-  // 激活即视为开始：从待办池挪到进行中，让卡片归位。
-  if (ds.session.kanbanColumn === 'backlog') ds.session.kanbanColumn = 'in_progress';
+  // `backlog` is a system-authored parked marker. Starting from the button or
+  // inbound message must release it back to runtime-derived placement, or the
+  // card stays pinned in-progress forever after the turn becomes idle. A real
+  // drag into in_progress opts into preserving the user's manual placement.
+  if (ds.session.kanbanColumn === 'backlog') {
+    ds.session.kanbanColumn = options.preserveManualColumn ? 'in_progress' : undefined;
+  }
   sessionStore.updateSession(ds.session);
   // 起会话或弹 /repo 卡片（没钉目录时）。content 已是包装好的首轮内容。
   await forkOrShowRepoCard(ds, content);

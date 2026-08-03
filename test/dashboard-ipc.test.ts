@@ -23,6 +23,7 @@ import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot, getBot } from
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { mutateTopicGroupMemory } from '../src/services/topic-group-memory-store.js';
 import {
   _allAskIds,
   _resetForTest as resetAskBrokerForTest,
@@ -390,6 +391,106 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('topic-group memory dashboard maintenance API', () => {
+  it('lists, reads, compacts, edits, and clears only the current bot partition', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-topic-memory-'));
+    const configPath = join(dir, 'bots.json');
+    const dataDir = join(dir, 'data');
+    const appId = 'test-topic-memory-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        topicGroupMemory: { enabled: true, maxSummaryChars: 6000, httpLlm: { enabled: false } },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      await mutateTopicGroupMemory(appId, 'oc_topic', doc => {
+        doc.summary = 'duplicate\n\nduplicate';
+        doc.facts.push(
+          { id: 'old', text: 'same fact', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', confidence: 'confirmed' },
+          { id: 'new', text: ' same  fact ', createdAt: '2026-01-02T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z', confidence: 'confirmed' },
+        );
+      });
+      await mutateTopicGroupMemory('another-bot', 'oc_topic', doc => { doc.summary = 'must stay isolated'; });
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const listed = await (await fetch(`${base}/api/topic-group-memory`)).json() as any;
+      expect(listed).toMatchObject({ ok: true, larkAppId: appId, count: 1 });
+      expect(listed.memories[0]).toMatchObject({ chatId: 'oc_topic', facts: 2, exists: true });
+
+      const detail = await (await fetch(`${base}/api/topic-group-memory/oc_topic`)).json() as any;
+      expect(detail.memory.facts).toHaveLength(2);
+      expect(detail.stats.sizeBytes).toBeGreaterThan(0);
+
+      const compacted = await (await fetch(`${base}/api/topic-group-memory/oc_topic/compact`, { method: 'POST' })).json() as any;
+      expect(compacted).toMatchObject({ ok: true, compacted: true, source: 'local' });
+      expect(compacted.doc.facts.map((item: any) => item.id)).toEqual(['new']);
+
+      const edited = await (await fetch(`${base}/api/topic-group-memory/oc_topic`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: compacted.doc.revision,
+          content: {
+            summary: 'manually edited',
+            facts: [{ id: 'new', text: 'edited fact' }],
+            decisions: [],
+            openQuestions: [],
+            resources: [],
+          },
+        }),
+      })).json() as any;
+      expect(edited).toMatchObject({
+        ok: true,
+        memory: { summary: 'manually edited', facts: [{ id: 'new', text: 'edited fact' }] },
+        stats: { facts: 1 },
+      });
+
+      const staleEditResponse = await fetch(`${base}/api/topic-group-memory/oc_topic`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: compacted.doc.revision,
+          content: {
+            summary: 'stale',
+            facts: [],
+            decisions: [],
+            openQuestions: [],
+            resources: [],
+          },
+        }),
+      });
+      expect(staleEditResponse.status).toBe(409);
+      expect(await staleEditResponse.json()).toMatchObject({ ok: false, reason: 'revision_mismatch' });
+
+      await mutateTopicGroupMemory(appId, 'oc_second', doc => { doc.summary = 'second'; });
+      const clearedAll = await (await fetch(`${base}/api/topic-group-memory/clear`, { method: 'POST' })).json() as any;
+      expect(clearedAll).toMatchObject({ ok: true, count: 2, failed: 0 });
+      expect((await (await fetch(`${base}/api/topic-group-memory`)).json() as any).count).toBe(0);
+
+      await mutateTopicGroupMemory(appId, 'oc_topic', doc => { doc.summary = 'delete one'; });
+      const deleted = await (await fetch(`${base}/api/topic-group-memory/oc_topic`, { method: 'DELETE' })).json() as any;
+      expect(deleted).toMatchObject({ ok: true, cleared: true, larkAppId: appId, chatId: 'oc_topic' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
       rmSync(dir, { recursive: true, force: true });
     }
   });

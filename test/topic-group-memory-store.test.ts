@@ -10,6 +10,7 @@ import {
   listTopicGroupMemories,
   mutateTopicGroupMemory,
   readTopicGroupMemory,
+  replaceTopicGroupMemoryContent,
   statTopicGroupMemory,
   topicGroupMemoryPath,
   updateTopicGroupMemory,
@@ -99,6 +100,86 @@ describe('topic-group memory store', () => {
     const second = await mutateTopicGroupMemory('cli_a', 'oc_one', () => false, { dataDir: dir });
     expect(second.revision).toBe(first.revision);
     expect(second.updatedAt).toBe(first.updatedAt);
+  });
+
+  it('manually edits and deletes specific content while preserving source metadata', async () => {
+    const dir = await dataDir();
+    const created = await mutateTopicGroupMemory('cli_a', 'oc_one', doc => {
+      doc.summary = 'old summary';
+      doc.facts.push({
+        id: 'fact_keep', text: 'old fact', sourceRootMessageId: 'root_1', sourceSessionId: 'session_1',
+        createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', confidence: 'inferred',
+      });
+      doc.decisions.push({ id: 'decision_delete', text: 'delete me', createdAt: '2026-01-01T00:00:00.000Z' });
+      doc.openQuestions.push({ id: 'question_keep', text: 'old question', createdAt: '2026-01-01T00:00:00.000Z' });
+      doc.resources.push({
+        id: 'resource_keep', kind: 'document', title: 'Old title', url: 'https://example.com/old', description: 'old description',
+        sourceRootMessageId: 'root_2', sourceSessionId: 'session_2', createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z', confidence: 'inferred',
+      });
+      doc.recentContributions.push({
+        turnId: 'turn_1', sessionId: 'session_1', rootMessageId: 'root_1', summary: 'system metadata', createdAt: '2026-01-01T00:00:00.000Z',
+      });
+    }, { dataDir: dir });
+
+    const result = await replaceTopicGroupMemoryContent('cli_a', 'oc_one', created.revision, {
+      summary: 'new summary',
+      facts: [{ id: 'fact_keep', text: 'new fact' }],
+      decisions: [],
+      openQuestions: [{ id: 'question_keep', text: 'new question' }],
+      resources: [{
+        id: 'resource_keep', kind: 'prd', title: 'New title', url: 'https://example.com/new#fragment', description: '',
+      }],
+    }, { dataDir: dir });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.doc).toMatchObject({ summary: 'new summary', revision: created.revision + 1 });
+    expect(result.doc.decisions).toEqual([]);
+    expect(result.doc.facts[0]).toMatchObject({
+      id: 'fact_keep', text: 'new fact', sourceRootMessageId: 'root_1', sourceSessionId: 'session_1', confidence: 'inferred',
+    });
+    expect(result.doc.facts[0].updatedAt).not.toBe('2026-01-01T00:00:00.000Z');
+    expect(result.doc.openQuestions[0]).toMatchObject({ id: 'question_keep', text: 'new question' });
+    expect(result.doc.resources[0]).toMatchObject({
+      id: 'resource_keep', kind: 'prd', title: 'New title', url: 'https://example.com/new',
+      sourceRootMessageId: 'root_2', sourceSessionId: 'session_2', confidence: 'inferred',
+    });
+    expect(result.doc.resources[0].description).toBeUndefined();
+    expect(result.doc.recentContributions).toEqual(created.recentContributions);
+  });
+
+  it('rejects stale, invented, and sensitive manual memory edits', async () => {
+    const dir = await dataDir();
+    const created = await mutateTopicGroupMemory('cli_a', 'oc_one', doc => {
+      doc.facts.push({ id: 'fact_1', text: 'safe', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), confidence: 'confirmed' });
+    }, { dataDir: dir });
+    const content = {
+      summary: '', decisions: [], openQuestions: [], resources: [],
+      facts: [{ id: 'fact_1', text: 'safe' }],
+    };
+
+    await mutateTopicGroupMemory('cli_a', 'oc_one', doc => { doc.summary = 'concurrent'; }, { dataDir: dir });
+    expect(await replaceTopicGroupMemoryContent('cli_a', 'oc_one', created.revision, content, { dataDir: dir }))
+      .toMatchObject({ ok: false, reason: 'revision_mismatch' });
+
+    const latest = await readTopicGroupMemory('cli_a', 'oc_one', { dataDir: dir });
+    expect(await replaceTopicGroupMemoryContent('cli_a', 'oc_one', latest!.revision, {
+      ...content, facts: [{ id: 'fact_invented', text: 'invented' }],
+    }, { dataDir: dir })).toMatchObject({ ok: false, reason: 'invalid_content', error: 'invalid_facts_id' });
+    expect(await replaceTopicGroupMemoryContent('cli_a', 'oc_one', latest!.revision, {
+      ...content, facts: [{ id: 'fact_1', text: 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz' }],
+    }, { dataDir: dir })).toMatchObject({ ok: false, reason: 'invalid_content', error: 'sensitive_facts_text' });
+    expect((await readTopicGroupMemory('cli_a', 'oc_one', { dataDir: dir }))?.summary).toBe('concurrent');
+  });
+
+  it('does not bump revision for an unchanged manual edit', async () => {
+    const dir = await dataDir();
+    const created = await mutateTopicGroupMemory('cli_a', 'oc_one', doc => { doc.summary = 'same'; }, { dataDir: dir });
+    const result = await replaceTopicGroupMemoryContent('cli_a', 'oc_one', created.revision, {
+      summary: 'same', facts: [], decisions: [], openQuestions: [], resources: [],
+    }, { dataDir: dir });
+    expect(result).toMatchObject({ ok: true, doc: { revision: created.revision, updatedAt: created.updatedAt } });
   });
 
   it('clear is safe before and after a document exists', async () => {

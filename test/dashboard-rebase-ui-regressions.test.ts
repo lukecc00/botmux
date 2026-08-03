@@ -113,17 +113,23 @@ describe('dashboard master feature integration', () => {
 
     expect(page).toContain('const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10');
     expect(page).toContain('chatDisplayTitle({ chatId })');
-    expect(page).toContain('topicGroupMemoryForDisplay');
+    expect(page).toContain('topicGroupMemoryEditableContent');
     expect(page).toContain('className="tgm-memory-chat"');
     expect(page).toContain('className="tgm-memory-table-wrap"');
     expect(page).toContain('className="tgm-memory-pagination"');
-    expect(page).toContain('className="bd-tile bd-topic-group-memory-tile"');
+    expect(page).toContain('className="bd-section tgm-memory-section"');
     expect(page).toContain('className="tgm-memory-help"');
     expect(page).toContain("tr('botDefaults.topicGroupMemoryHelpSummary')");
     expect(page).toContain('className="tgm-memory-status-strip"');
     expect(page).toContain('data-topic-group-memory-detail-dialog');
     expect(page).toContain('dialog.showModal()');
     expect(page).toContain("tr('botDefaults.topicGroupMemoryDetailClose')");
+    expect(page).toContain("'PUT',");
+    expect(page).toContain("tr('botDefaults.topicGroupMemorySave')");
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryDeleteEntry')");
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryRevisionConflict')");
+    expect(page).toContain('className="tgm-memory-resource-fields"');
+    expect(page).toContain('className="tgm-memory-raw-detail"');
     expect(page).toContain("tr('botDefaults.topicGroupMemoryDelete')");
     expect(page).toContain("tr('botDefaults.topicGroupMemoryClearAll')");
     expect(page).not.toContain('<code>{memory.chatId}</code>');
@@ -140,12 +146,18 @@ describe('dashboard master feature integration', () => {
     expect(css).not.toMatch(/\.bot-defaults-page \.tgm-memory-entry-counts\s*\{[^}]*-webkit-line-clamp:/);
     expect(css).toContain('.tgm-memory-detail-dialog::backdrop');
     expect(css).toMatch(/\.tgm-memory-detail-body\s*\{[\s\S]*?overflow:\s*auto;/);
+    expect(css).toContain('.tgm-memory-editor-section');
+    expect(css).toContain('.tgm-memory-edit-item-actions');
+    expect(css).toContain('.tgm-memory-detail-footer-actions');
 
     expect(messages).toContain("'botDefaults.topicGroupMemoryChatId': '话题群'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryHelpSummary': '适用范围说明'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryDelete': '删除'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryClearAll': '清空全部记忆'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryDetailClose': '收起'");
+    expect(messages).toContain("'botDefaults.topicGroupMemorySave': '保存更改'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryDeleteEntry': '删除此条'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryRawDetailHelp': '来源信息与近期贡献仅供排查和去重，由系统维护，不支持手动修改。'");
     expect(messages).not.toContain("'botDefaults.topicGroupMemoryUpdatedAt': '最后更新'");
     expect(messages).not.toContain("'botDefaults.topicGroupMemoryRevision': '版本'");
   });

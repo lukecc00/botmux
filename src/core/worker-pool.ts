@@ -59,6 +59,7 @@ import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBa
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scheduleTopicGroupMemoryUpdate } from '../services/topic-group-memory-update.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -6232,6 +6233,9 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      // Only persist shared memory after the user-visible final has been
+      // acknowledged. The update is fire-and-forget and never delays delivery.
+      scheduleTopicGroupMemoryUpdate(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (!stillCurrent()) return;

@@ -134,6 +134,45 @@ export type TopicGroupMemoryStats = {
   error?: string;
 };
 
+export type TopicGroupMemoryTextEntry = {
+  id: string;
+  text: string;
+  sourceRootMessageId?: string;
+  sourceSessionId?: string;
+  createdAt: string;
+  updatedAt?: string;
+  confidence?: 'confirmed' | 'inferred';
+};
+
+export type TopicGroupMemoryResource = {
+  id: string;
+  kind: 'prd' | 'experiment' | 'ppe' | 'config' | 'document' | 'design' | 'api' | 'repository' | 'dashboard' | 'other';
+  title: string;
+  url: string;
+  description?: string;
+  sourceRootMessageId?: string;
+  sourceSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+  confidence: 'confirmed' | 'inferred';
+};
+
+export type TopicGroupMemoryContribution = {
+  turnId: string;
+  sessionId: string;
+  rootMessageId: string;
+  summary: string;
+  createdAt: string;
+};
+
+export type TopicGroupMemoryEditableContent = {
+  summary: string;
+  facts: Array<Pick<TopicGroupMemoryTextEntry, 'id' | 'text'>>;
+  decisions: Array<Pick<TopicGroupMemoryTextEntry, 'id' | 'text'>>;
+  openQuestions: Array<Pick<TopicGroupMemoryTextEntry, 'id' | 'text'>>;
+  resources: Array<Pick<TopicGroupMemoryResource, 'id' | 'kind' | 'title' | 'url' | 'description'>>;
+};
+
 export type TopicGroupMemoryDocument = {
   schemaVersion: number;
   larkAppId: string;
@@ -141,11 +180,11 @@ export type TopicGroupMemoryDocument = {
   updatedAt: string;
   revision: number;
   summary: string;
-  facts: unknown[];
-  decisions: unknown[];
-  openQuestions: unknown[];
-  resources: unknown[];
-  recentContributions: unknown[];
+  facts: TopicGroupMemoryTextEntry[];
+  decisions: TopicGroupMemoryTextEntry[];
+  openQuestions: TopicGroupMemoryTextEntry[];
+  resources: TopicGroupMemoryResource[];
+  recentContributions: TopicGroupMemoryContribution[];
 };
 
 export type LoadBotsResult = {

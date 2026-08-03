@@ -93,6 +93,7 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 

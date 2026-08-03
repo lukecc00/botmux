@@ -181,6 +181,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
+import { loadTopicGroupMemoryBlockForSession } from './services/topic-group-memory-runtime.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
@@ -4039,6 +4040,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
 
   if (ds.worker && !ds.worker.killed) {
     ensureSessionWhiteboard(ds);
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
     const { promptContent, cliInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -4046,6 +4048,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botCliPathOverride: botCfg.cliPathOverride,
       sender,
       mode: 'live',
+      topicGroupMemoryBlock,
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
@@ -4053,6 +4056,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
     const { promptContent, cliInput: wrappedInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -4061,6 +4065,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botIdentity: { name: bot.botName, openId: bot.botOpenId },
       sender,
       mode: 'refork',
+      topicGroupMemoryBlock,
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
@@ -16121,7 +16126,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt, { turnId: messageId });
@@ -16154,7 +16160,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt, { turnId: messageId });
@@ -16522,7 +16529,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
       undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, codexAppText },
+      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds), codexAppText },
     );
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
@@ -17411,7 +17418,8 @@ async function handleThreadReply(
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt, { turnId: parsed.messageId });
@@ -17444,7 +17452,8 @@ async function handleThreadReply(
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt, { turnId: parsed.messageId });
@@ -17478,6 +17487,7 @@ async function handleThreadReply(
     // degrades to an ordinary follow-up in queue order.
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds);
     const turnSender = await getThreadSender();
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
@@ -17503,6 +17513,7 @@ async function handleThreadReply(
             larkAppId,
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
+            topicGroupMemoryBlock,
             substituteTrigger,
             codexAppText: parsed.content,
             codexAppApplicationContext,
@@ -17519,6 +17530,7 @@ async function handleThreadReply(
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
+          topicGroupMemoryBlock,
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,
