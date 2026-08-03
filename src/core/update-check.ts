@@ -1,14 +1,17 @@
 /**
- * Update check: query the published "latest" botmux version and the GitHub
- * release notes accumulated since the running version. Powers the Settings
+ * Update check: query the personal GitHub release/branch and release notes
+ * accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
  * Every network call is best-effort: timeout-bounded and returns null / [] on
- * failure (offline, rate-limited, registry hiccup) so the card degrades to
+ * failure (offline, rate-limited, network hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
-import { GITHUB_REPO } from './restart-report.js';
+import { defaultGithubGitFallback, type GithubGitFallback } from './github-source.js';
+import { PERSONAL_UPDATE_REF, PERSONAL_UPDATE_REPO } from '../utils/install-info.js';
+
+const GITHUB_REPO = PERSONAL_UPDATE_REPO;
 
 export interface ReleaseNote {
   /** Semver without leading 'v' (e.g. "2.85.1"). */
@@ -102,25 +105,26 @@ function vtag(v: string): string {
   return v.startsWith('v') ? v : `v${v}`;
 }
 
-const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
+const PERSONAL_VERSION_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${PERSONAL_UPDATE_REF}/dev-version.json`;
+const LATEST_RELEASE_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 const REGISTRY_PACKUMENT_URL = 'https://registry.npmjs.org/botmux';
 
 export interface FetchOpts {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   auth?: GithubAuthResolveOptions;
+  /** null disables the SSH fallback (mainly a unit-test seam). */
+  gitFallback?: GithubGitFallback | null;
 }
 
-/**
- * The npm registry's `latest` dist-tag version — the authoritative target for
- * both npm and pnpm updates. null on any failure (offline, non-200,
- * malformed body, or a version string we can't parse).
- */
-export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
-  const fetchImpl = opts?.fetchImpl ?? fetch;
+async function latestFromManifest(fetchImpl: typeof fetch, opts?: FetchOpts): Promise<string | null> {
   try {
-    const res = await fetchImpl(REGISTRY_LATEST_URL, {
-      headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
+    const res = await fetchImpl(PERSONAL_VERSION_URL, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return null;
@@ -129,6 +133,55 @@ export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | nul
   } catch {
     return null;
   }
+}
+
+async function latestFromReleaseApi(fetchImpl: typeof fetch, opts?: FetchOpts): Promise<string | null> {
+  try {
+    const res = await fetchImpl(LATEST_RELEASE_URL, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as { tag_name?: unknown; draft?: unknown; prerelease?: unknown };
+    const version = typeof body?.tag_name === 'string' ? body.tag_name.replace(/^v/i, '') : '';
+    return body.draft !== true && body.prerelease !== true && isStableVersion(version) ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+function latestStableTag(tags: string[] | null): string | null {
+  if (!tags) return null;
+  const versions = tags
+    .map(tag => tag.replace(/^v/i, ''))
+    .filter(isStableVersion)
+    .sort((a, b) => compareVersions(b, a));
+  return versions[0] ?? null;
+}
+
+/**
+ * Latest stable personal release. HTTPS release metadata and the branch
+ * manifest run alongside an SSH tag lookup; the highest valid result wins.
+ */
+export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const gitFallback = opts?.gitFallback === undefined ? defaultGithubGitFallback : opts.gitFallback;
+  const candidates: Array<Promise<string | null>> = [
+    latestFromReleaseApi(fetchImpl, opts),
+    latestFromManifest(fetchImpl, opts),
+  ];
+  if (gitFallback) {
+    candidates.push(gitFallback.listTags(GITHUB_REPO, opts?.timeoutMs).then(latestStableTag));
+  }
+  const settled = await Promise.allSettled(candidates);
+  const versions = settled.flatMap(result =>
+    result.status === 'fulfilled' && result.value ? [result.value] : []);
+  versions.sort((a, b) => compareVersions(b, a));
+  return versions[0] ?? null;
 }
 
 export interface RollbackVersion {
@@ -207,6 +260,7 @@ export async function fetchReleasesSince(
   opts?: FetchOpts & { max?: number },
 ): Promise<ChangelogResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
+  const gitFallback = opts?.gitFallback === undefined ? defaultGithubGitFallback : opts.gitFallback;
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`, {
       headers: {
@@ -216,13 +270,61 @@ export async function fetchReleasesSince(
       },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
-    if (!res.ok) return { ok: false, rateLimited: res.status === 403, releases: [] };
+    if (!res.ok) {
+      const fallback = gitFallback
+        ? await fetchReleasesSinceViaGit(current, opts?.max ?? 30, gitFallback, opts?.timeoutMs)
+        : null;
+      if (fallback) return { ok: true, releases: fallback };
+      return { ok: false, rateLimited: res.status === 403, releases: [] };
+    }
     const raw = await res.json();
-    if (!Array.isArray(raw)) return { ok: false, releases: [] };
+    if (!Array.isArray(raw)) {
+      const fallback = gitFallback
+        ? await fetchReleasesSinceViaGit(current, opts?.max ?? 30, gitFallback, opts?.timeoutMs)
+        : null;
+      return fallback ? { ok: true, releases: fallback } : { ok: false, releases: [] };
+    }
     return { ok: true, releases: selectReleasesSince(raw, current, opts?.max ?? 30) };
   } catch {
+    const fallback = gitFallback
+      ? await fetchReleasesSinceViaGit(current, opts?.max ?? 30, gitFallback, opts?.timeoutMs)
+      : null;
+    if (fallback) return { ok: true, releases: fallback };
     return { ok: false, releases: [] };
   }
+}
+
+async function fetchReleasesSinceViaGit(
+  current: string,
+  max: number,
+  gitFallback: GithubGitFallback,
+  timeoutMs?: number,
+): Promise<ReleaseNote[] | null> {
+  const tags = await gitFallback.listTags(GITHUB_REPO, timeoutMs);
+  if (!tags) return null;
+  const versions = tags
+    .map(tag => tag.replace(/^v/i, ''))
+    .filter(version => isStableVersion(version) && compareVersions(version, current) > 0)
+    .sort((a, b) => compareVersions(b, a))
+    .slice(0, max);
+  if (versions.length === 0) return [];
+  const annotations = await gitFallback.readTagAnnotations(
+    GITHUB_REPO,
+    versions.map(vtag),
+    timeoutMs,
+  );
+  if (!annotations) return null;
+  return versions.map((version) => {
+    const tag = vtag(version);
+    const annotation = annotations.get(tag);
+    return {
+      version,
+      name: tag,
+      body: annotation?.body ?? '',
+      url: `https://github.com/${GITHUB_REPO}/releases/tag/${tag}`,
+      publishedAt: annotation?.createdAt ?? null,
+    };
+  });
 }
 
 /**
