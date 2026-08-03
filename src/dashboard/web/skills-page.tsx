@@ -5,6 +5,7 @@ import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from
 import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { readSkillInstallDraft, writeSkillInstallDraft } from './skill-install-draft.js';
 
 interface SkillRow {
   name: string;
@@ -784,9 +785,12 @@ function SkillsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const [installSource, setInstallSource] = useState('');
-  const [installPath, setInstallPath] = useState('');
-  const [installRef, setInstallRef] = useState('');
+  const initialInstallDraft = useMemo(() => readSkillInstallDraft(
+    typeof window === 'undefined' ? null : window.localStorage,
+  ), []);
+  const [installSource, setInstallSource] = useState(initialInstallDraft.source);
+  const [installPath, setInstallPath] = useState(initialInstallDraft.path);
+  const [installRef, setInstallRef] = useState(initialInstallDraft.ref);
   const [installHistory, setInstallHistory] = useState<SkillInstallHistoryRow[]>([]);
   const [selectedInstallHistoryId, setSelectedInstallHistoryId] = useState('');
   const [installHistoryBusy, setInstallHistoryBusy] = useState(false);
@@ -903,6 +907,13 @@ function SkillsPage() {
       clearTimers();
     };
   }, [clearTimers, refresh]);
+
+  useEffect(() => {
+    writeSkillInstallDraft(
+      typeof window === 'undefined' ? null : window.localStorage,
+      { source: installSource, path: installPath, ref: installRef },
+    );
+  }, [installSource, installPath, installRef]);
 
   useEffect(() => {
     if (!installedStatus || removingNames.size > 0) return undefined;

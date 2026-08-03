@@ -18,6 +18,7 @@ import {
   type SessionMessagePreview,
 } from './session-message-preview.js';
 import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { sessionRuntimeStatus } from './session-runtime-status.js';
 
 export interface SessionRow extends SessionMessagePreview {
   sessionId: string;
@@ -169,14 +170,10 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
-    // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
-    // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
-    // For every other session, process residency is authoritative: suspension
-    // clears ds.worker but intentionally preserves the logical active session.
-    // Never let a stale pre-suspend status make it look resident after hydrate.
-    status: ds.session.queued
-      ? 'idle'
-      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
+    // Durable bridge/handoff work can outlive one worker process, while an
+    // ordinary workerless active row is dormant. Keep this projection aligned
+    // with the daemon's lifecycle policy instead of re-deriving it here.
+    status: sessionRuntimeStatus(ds),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,

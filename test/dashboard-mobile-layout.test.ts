@@ -33,7 +33,7 @@ describe('dashboard mobile layout', () => {
 
   it('keeps the topic-group memory table scrollable and its detail modal constrained on mobile', () => {
     expect(css).toMatch(/\.bot-defaults-page \.tgm-memory-table-wrap\s*\{[\s\S]*?overflow-x:\s*auto;[\s\S]*?-webkit-overflow-scrolling:\s*touch;/);
-    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*?\.bot-defaults-page \.tgm-memory-table\s*\{[\s\S]*?min-width:\s*600px;/);
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*?\.bot-defaults-page \.tgm-memory-table\s*\{[\s\S]*?min-width:\s*620px;/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*?\.bot-defaults-page \.tgm-memory-pagination\s*\{[\s\S]*?flex-direction:\s*column;/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*?\.tgm-memory-detail-dialog\s*\{[\s\S]*?width:\s*calc\(100vw - 24px\);[\s\S]*?max-height:\s*calc\(100dvh - 24px\);/);
   });

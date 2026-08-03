@@ -212,6 +212,14 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
+  /** Successfully delivered structured progress UUIDs (bounded in-memory fast path). */
+  progressOutputUuids?: Set<string>;
+  /** Structured progress records currently owned by this daemon process. */
+  progressOutputInFlight?: Set<string>;
+  /** Per-session promise chain keeps separate commentary cards in model order. */
+  progressDeliveryTail?: Promise<void>;
+  /** Set before close teardown starts so retry timers cannot post after close. */
+  progressDeliveryClosed?: boolean;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns

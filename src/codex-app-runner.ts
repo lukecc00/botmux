@@ -46,6 +46,7 @@ interface PendingRequest {
 }
 
 const output = new RunnerControlWriter();
+const recentMarkers: Array<{ kind: string; payload: unknown }> = [];
 
 function parseArgs(argv: string[]): Args {
   const out: Args = {
@@ -71,7 +72,32 @@ function parseArgs(argv: string[]): Args {
 }
 
 function emitMarker(kind: string, payload: unknown): void {
+  recentMarkers.push({ kind, payload });
+  if (recentMarkers.length > 512) recentMarkers.splice(0, recentMarkers.length - 512);
   output.marker(kind, payload);
+}
+
+function markerReplyTurnId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const record = payload as Record<string, unknown>;
+  return typeof record.replyTurnId === 'string'
+    ? record.replyTurnId
+    : typeof record.turnId === 'string'
+      ? record.turnId
+      : undefined;
+}
+
+function replayMarkers(turns: Array<{ turnId: string; dispatchAttempt?: number }>): void {
+  const allowed = new Set(turns.map(turn => turn.turnId));
+  for (const marker of recentMarkers.slice()) {
+    const replyTurnId = markerReplyTurnId(marker.payload);
+    if (marker.kind === 'thread' || (replyTurnId && allowed.has(replyTurnId))) {
+      // Write the retained frame directly; replaying it must not append another
+      // copy to recentMarkers and grow the retention buffer on every recovery.
+      output.marker(marker.kind, marker.payload);
+    }
+  }
+  output.marker('replay_ack', { count: turns.length });
 }
 
 function writeLine(text = ''): void {
@@ -528,6 +554,30 @@ function enqueueLine(line: string): void {
   const trimmed = line.trim();
   if (!trimmed) return;
   if (trimmed.startsWith(CODEX_APP_INPUT_PREFIX)) {
+    const encoded = trimmed.slice(CODEX_APP_INPUT_PREFIX.length);
+    try {
+      const control = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')) as unknown;
+      if (control && typeof control === 'object' && !Array.isArray(control)) {
+        const record = control as Record<string, unknown>;
+        if (record.type === 'replay' && Array.isArray(record.turns)) {
+          const turns = record.turns.flatMap((turn): Array<{ turnId: string; dispatchAttempt?: number }> => {
+            if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return [];
+            const candidate = turn as Record<string, unknown>;
+            if (typeof candidate.turnId !== 'string') return [];
+            if (candidate.dispatchAttempt !== undefined && !Number.isInteger(candidate.dispatchAttempt)) return [];
+            return [{
+              turnId: candidate.turnId,
+              ...(typeof candidate.dispatchAttempt === 'number'
+                ? { dispatchAttempt: candidate.dispatchAttempt }
+                : {}),
+            }];
+          });
+          replayMarkers(turns);
+          prompt();
+          return;
+        }
+      }
+    } catch { /* ordinary decoder below owns malformed-message diagnostics */ }
     const decoded = decodeCodexAppRunnerInput(trimmed);
     if (decoded) controller.enqueue(decoded);
     else writeLine('[codex-app] bad botmux input');

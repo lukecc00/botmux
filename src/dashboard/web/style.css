@@ -26078,3 +26078,25 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   .bot-defaults-page .bd-body .tgm-memory-settings-grid {
     grid-template-columns: 1fr;
   }
+
+  .bot-defaults-page .tgm-memory-table {
+    min-width: 620px;
+  }
+
+  .bot-defaults-page .tgm-memory-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .bot-defaults-page .tgm-memory-pagination-actions {
+    justify-content: flex-end;
+  }
+
+  .tgm-memory-detail-dialog {
+    width: calc(100vw - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+
+  .tgm-memory-detail-card {
+    max-height: calc(100dvh - 24px);
+  }

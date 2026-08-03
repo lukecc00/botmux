@@ -258,6 +258,13 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Persistent runner reattach hook: ask the still-live runner to replay
+   * structured markers for exact pending turns before new prompts continue. */
+  replayPendingTurns?(
+    pty: PtyHandle,
+    turns: Array<{ turnId: string; dispatchAttempt?: number }>,
+  ): Promise<{ submitted: boolean }>;
+
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files
    *  into `{skillsDir}/<skillName>/SKILL.md`.  Undefined = this CLI does not

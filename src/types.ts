@@ -667,7 +667,7 @@ export type DaemonToWorker =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput }
+  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; followUpAfterIdle?: boolean }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -805,6 +805,22 @@ export type WorkerToDaemon =
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */
   | { type: 'steer_accepted'; appTurnId: string; turnId: string }
+  | { type: 'bridge_turn_written'; sessionId: string; turnId: string; dispatchAttempt?: number; writtenAt: number }
+  /** Codex ended an ordinary turn because its model context window is full.
+   * The daemon owns the fresh-native-thread handoff. */
+  | { type: 'codex_context_exhausted'; sessionId: string; turnId: string; interruptedUserGoal?: string }
+  /** Codex exhausted its reconnect budget before producing a final answer.
+   * The daemon owns the durable fresh-thread migration. */
+  | { type: 'codex_stream_disconnected'; sessionId: string; turnId: string; interruptedUserGoal?: string }
+  | {
+      type: 'progress_output';
+      /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */
+      sessionId: string;
+      content: string;
+      uuid: string;
+      turnId: string;
+      dispatchAttempt?: number;
+    }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */
@@ -872,6 +888,8 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** True when a final_output IPC was queued immediately before terminal. */
+      bridgeFinalEmitted?: boolean;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

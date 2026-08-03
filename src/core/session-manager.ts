@@ -1295,7 +1295,10 @@ export async function staggeredRecoveryFork(
   }
 }
 
-export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
+export async function restoreActiveSessions(
+  activeSessions: Map<string, DaemonSession>,
+  options: { recoverCodexHandoff?: (ds: DaemonSession) => void | Promise<void> } = {},
+): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
@@ -1643,6 +1646,31 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
+  }
+
+  // A persisted Codex fresh-session handoff is a durable migration intent,
+  // never a request to reattach/resume the exhausted native thread. Rehydrate
+  // the in-memory owner and let the daemon-specific recovery callback finish
+  // creating/reusing the fresh same-topic session before backend probing.
+  if (options.recoverCodexHandoff) {
+    for (const ds of [...restoredByThisInvocation]) {
+      const persisted = ds.session.codexFreshHandoff;
+      if (!persisted || persisted.phase === 'completed') continue;
+      ds.pendingCodexFreshHandoff = {
+        requestedAt: Date.parse(persisted.requestedAt) || Date.now(),
+        requestId: persisted.requestId,
+        reason: persisted.reason,
+        interruptedTurnId: persisted.interruptedTurnId,
+        interruptedUserGoal: persisted.interruptedUserGoal,
+        summaryTurnId: persisted.summaryTurnId,
+        phase: persisted.phase,
+        selectedSummary: persisted.selectedSummary,
+        newTopicAnchor: persisted.newTopicAnchor,
+        newSessionId: persisted.newSessionId,
+        sourceTopicNoticeSentAt: persisted.sourceTopicNoticeSentAt,
+      };
+      await options.recoverCodexHandoff(ds);
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session

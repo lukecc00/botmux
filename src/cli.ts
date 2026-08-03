@@ -141,6 +141,7 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
 } from './services/bridge-fallback-gate.js';
+import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
@@ -7847,6 +7848,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  // Same-thread ordinary text may also arrive through transcript commentary.
+  // Share one provider UUID with that daemon delivery so whichever path wins
+  // is the only visible card. The daemon may replace this best-effort local
+  // value below with the live worker turn UUID.
+  let ordinaryBridgeOutputUuid = shouldRecordBridgeMarker
+    && !customCardRequested
+    && !asVoice
+    && !attention.requested
+    && images.length === 0
+    && files.length === 0
+    && videoAttachments.length === 0
+    && mentionArgs.length === 0
+    && noMention
+    && currentTurnId
+      ? bridgeProgressProviderUuid(sid, currentTurnId, content)
+      : undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -7905,7 +7922,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...((prepared?.providerKey ?? ordinaryBridgeOutputUuid)
+          ? { uuid: prepared?.providerKey ?? ordinaryBridgeOutputUuid }
+          : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
@@ -7969,6 +7988,66 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (managedRenderedPayloadError) {
       console.error(`botmux send refused for a managed VC turn: ${managedRenderedPayloadError}`);
       process.exit(2);
+    }
+
+    // Ordinary progress must look like transcript-native commentary even when
+    // an explicit `botmux send --no-mention` wins the provider race. Ask the
+    // daemon to render the old two-phase progress card (Web Terminal / stop /
+    // manage, no recipient/footer) and to return the provider UUID derived
+    // from its live worker turn. A long-lived subprocess can have a stale
+    // spawn-time BOTMUX_TURN_ID, so the daemon value is authoritative.
+    let nativeProgressCardJson: string | undefined;
+    const nativeProgressEligible = noMention
+      && !customCardRequested
+      && !asVoice
+      && !attention.requested
+      && images.length === 0
+      && files.length === 0
+      && videoAttachments.length === 0
+      && mentionArgs.length === 0
+      && !sendTopLevel
+      && !overrideChatId
+      && !sendInto;
+    if (nativeProgressEligible) {
+      try {
+        const daemon = findDaemon(appId);
+        if (daemon) {
+          const originClaim = readManagedOriginCapability(
+            resolveDataDir(),
+            sid,
+            process.env.BOTMUX_SEND_RELAY,
+          );
+          const request = {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              content: text,
+              originCapability: originClaim?.capability,
+              originTurnId: originClaim?.turnId ?? currentTurnId,
+              originDispatchAttempt: originClaim?.dispatchAttempt
+                ?? trustedRelayCtx?.dispatchAttempt
+                ?? liveMarkerCtx?.dispatchAttempt
+                ?? ancestorCtx?.dispatchAttempt,
+            }),
+          } satisfies RequestInit;
+          let secret: string | undefined;
+          try { secret = loadDaemonIpcSecret(); } catch { /* isolated CLI */ }
+          const path = `/api/sessions/${encodeURIComponent(sid)}/progress-card`;
+          const response = secret
+            ? await fetchDaemonIpc(daemon.ipcPort, path, request, secret)
+            : await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, request);
+          if (response.ok) {
+            const payload = await response.json() as {
+              cardJson?: unknown;
+              providerUuid?: unknown;
+            };
+            if (typeof payload.cardJson === 'string') nativeProgressCardJson = payload.cardJson;
+            if (typeof payload.providerUuid === 'string' && payload.providerUuid) {
+              ordinaryBridgeOutputUuid = payload.providerUuid;
+            }
+          }
+        }
+      } catch { /* fall back to the ordinary card and best-effort local UUID */ }
     }
 
     // Upload images only after the final rendered payload has passed the
@@ -8128,6 +8207,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         });
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (nativeProgressCardJson) {
+      messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive');
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages

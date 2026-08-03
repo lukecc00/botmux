@@ -65,6 +65,8 @@ describe('worker ZMX logical submission recovery', () => {
     const prepare = flush.slice(prepareStart, prepareEnd);
     expect(prepare).toContain('if (durableWrite) durableTurnInFlight = true');
     expect(prepare).toContain('inflightInputs.onWrite(item)');
+    expect(prepare).toContain("type: 'bridge_turn_written'");
+    expect(prepare).toContain('writtenAt: normalWritePreparedAt');
     expect(flush.slice(0, prepareStart)).not.toContain('durableTurnInFlight = true');
     expect(flush.slice(0, prepareStart)).not.toContain('inflightInputs.onWrite(item)');
     expect(flush).not.toContain('captureAmbiguousSubmissionFence(');
@@ -107,6 +109,22 @@ describe('worker ZMX logical submission recovery', () => {
     expect(exit).toContain('handedOffDurable.includes(recoveryHeld.item)');
     expect(exit).toContain('ambiguousSubmissionRecoveryHold = null');
     expect(exit).toContain('queued durable input(s)');
+  });
+
+  it('restores live turn authority before recovered Codex commentary is ingested', () => {
+    const recovery = region(
+      'const recovered = cfg.recoverBridgeTurns ?? [];',
+      "} else if (cfg.cliId === 'traex') {",
+    );
+    const authority = recovery.indexOf('const restoredAuthority = writtenRecovered');
+    const setTurn = recovery.indexOf('currentBotmuxTurnId = restoredAuthority.turnId', authority);
+    const publish = recovery.indexOf('publishSandboxRelayCapability()', setTurn);
+    const attach = recovery.indexOf('codexBridgeAttach(', publish);
+
+    expect(authority).toBeGreaterThanOrEqual(0);
+    expect(setTurn).toBeGreaterThan(authority);
+    expect(publish).toBeGreaterThan(setTurn);
+    expect(attach).toBeGreaterThan(publish);
   });
 
   it('keeps slow authoritative transcript rechecks inside the pending journal', () => {

@@ -789,6 +789,53 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).not.toContain('ou_later_caller');
   });
 
+  it('uses the exact latest-turn caller pair for a legacy session without turnCallers', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.quoteTargetId = 'turn-1';
+    ds.session.lastCallerOpenId = 'ou_legacy_exact';
+    ds.session.quoteTargetSenderIsBot = false;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
+    expect(elements[0].content).toBe('<at id=ou_legacy_exact></at>');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_owner');
+  });
+
+  it('does not let a stale final borrow a later legacy caller', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.quoteTargetId = 'turn-2';
+    ds.session.lastCallerOpenId = 'ou_later_caller';
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
+    expect(elements[0].content).toBe('<at id=ou_owner></at>');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_later_caller');
+  });
+
   it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -2126,6 +2173,46 @@ describe('Worker turn_terminal routing', () => {
     ds.progressDeliveryClosed = true;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(calls).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('keeps an accepted progress outbox retry alive across worker replacement', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const oldWorker = ds.worker as any;
+    let attempts = 0;
+    const sessionReply = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary Lark outage');
+      return 'om_progress';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+
+    oldWorker.emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '替换前已入队的过程', uuid: 'progress-survives-replacement', turnId: 'turn-replace',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempts).toBe(1);
+
+    const replacementWorker = new EventEmitter() as any;
+    replacementWorker.killed = false;
+    replacementWorker.send = vi.fn();
+    replacementWorker.kill = vi.fn();
+    replacementWorker.pid = 100002;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    ds.worker = replacementWorker;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(attempts).toBe(2);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(new Set(sessionReply.mock.calls.map(call => call[5]?.uuid)).size).toBe(1);
     vi.useRealTimers();
   });
 

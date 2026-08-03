@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { writeRunnerInput } from './runner-input.js';
+import { writeRunnerInput, writeRunnerReplayRequest } from './runner-input.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -86,6 +86,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         codexAppInput,
         context?.turnId,
       );
+    },
+
+    replayPendingTurns(pty, turns) {
+      return writeRunnerReplayRequest(pty, '::botmux-codex-app:', turns);
     },
 
     supportsTypeAhead: true,

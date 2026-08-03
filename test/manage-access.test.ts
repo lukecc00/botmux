@@ -18,9 +18,9 @@ describe('buildManagementDashboardUrl', () => {
   });
 
   it('uses the platform machine dashboard route without embedding a dashboard token', () => {
-    vi.mocked(platformMachineBaseUrl).mockReturnValue('https://m-11585f4bd979448d.botmux.bytedance.net');
+    vi.mocked(platformMachineBaseUrl).mockReturnValue('https://m-11585f4bd979448d.botmux.example');
     expect(buildManagementDashboardUrl()).toBe(
-      'https://m-11585f4bd979448d.botmux.bytedance.net/#/bot-defaults',
+      'https://m-11585f4bd979448d.botmux.example/#/bot-defaults',
     );
   });
 

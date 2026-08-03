@@ -146,3 +146,40 @@ export async function writeRunnerInput(
   if (!sendEnterWithRetry()) return { submitted: false };
   return { submitted: true };
 }
+
+/** Ask a persistent Codex App runner to replay retained control markers for
+ * exact pending turns. This uses the same buffer-hygiene/chunking contract as
+ * ordinary input: a replay request must never merge with a partial prior line. */
+export async function writeRunnerReplayRequest(
+  pty: PtyHandle,
+  markerPrefix: string,
+  turns: Array<{ turnId: string; dispatchAttempt?: number }>,
+): Promise<{ submitted: boolean }> {
+  const encoded = Buffer.from(JSON.stringify({ type: 'replay', turns }), 'utf8').toString('base64');
+  const line = `${markerPrefix}${encoded}`;
+  if (!pty.sendText || !pty.sendSpecialKeys) {
+    try {
+      pty.write(line + '\r');
+      return { submitted: true };
+    } catch {
+      return { submitted: false };
+    }
+  }
+
+  const sendEnterWithRetry = (attempts = 3): boolean => {
+    for (let i = 0; i < attempts; i++) {
+      if (pty.sendSpecialKeys!('Enter') !== false) return true;
+    }
+    return false;
+  };
+  if (!sendEnterWithRetry()) return { submitted: false };
+  const chunks = chunkAscii(line, RUNNER_INPUT_CHUNK_BYTES);
+  for (let i = 0; i < chunks.length; i++) {
+    if (pty.sendText(chunks[i]) === false) {
+      sendEnterWithRetry();
+      return { submitted: false };
+    }
+    if (i < chunks.length - 1) await delay(RUNNER_INPUT_THROTTLE_MS);
+  }
+  return { submitted: sendEnterWithRetry() };
+}

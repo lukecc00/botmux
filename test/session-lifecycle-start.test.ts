@@ -136,7 +136,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
-import { forkAdoptWorker, forkWorker, initWorkerPool, sendWorkerInput } from '../src/core/worker-pool.js';
+import { __testOnly_legacyCodexTranscriptTurnStillActive, forkAdoptWorker, forkWorker, initWorkerPool, sendWorkerInput } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
@@ -233,6 +233,36 @@ describe('persistent backend target handoff', () => {
       backendType: 'herdr',
       persistentBackendTarget: target,
     }));
+  });
+});
+
+describe('legacy Codex active-turn transcript proof', () => {
+  const user = (timestampMs: number, text: string) => ({
+    uuid: `u-${timestampMs}`, timestampMs, kind: 'user' as const, text,
+  });
+  const progress = (timestampMs: number, text: string) => ({
+    uuid: `p-${timestampMs}`, timestampMs, kind: 'assistant_progress' as const, text,
+  });
+  const final = (timestampMs: number, text: string) => ({
+    uuid: `f-${timestampMs}`, timestampMs, kind: 'assistant_final' as const, text,
+  });
+
+  it('accepts an exact recent user start followed only by commentary', () => {
+    expect(__testOnly_legacyCodexTranscriptTurnStillActive([
+      user(10_000, '<user_message>smoke test</user_message>'),
+      progress(12_000, 'still working'),
+    ], '<user_message>smoke test</user_message>', 10_100)).toBe(true);
+  });
+
+  it('rejects a matching turn after task_complete and unrelated user history', () => {
+    expect(__testOnly_legacyCodexTranscriptTurnStillActive([
+      user(10_000, '<user_message>smoke test</user_message>'),
+      progress(12_000, 'still working'),
+      final(13_000, 'done'),
+    ], '<user_message>smoke test</user_message>', 10_100)).toBe(false);
+    expect(__testOnly_legacyCodexTranscriptTurnStillActive([
+      user(10_000, '<user_message>another turn</user_message>'),
+    ], '<user_message>smoke test</user_message>', 10_100)).toBe(false);
   });
 });
 
@@ -1781,6 +1811,71 @@ describe('forkWorker session agent config freeze', () => {
       expect.objectContaining({ turnId: 'old-turn' }),
       expect.objectContaining({ turnId: 'new-turn', content: 'new prompt' }),
     ]));
+  });
+
+  it('recovers one legacy active Codex turn before reserving the replacement generation', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+    ds.workerGeneration = 7;
+    ds.session.workerGeneration = 7;
+    ds.session.quoteTargetId = 'om_active_turn';
+    ds.session.lastUserPrompt = 'resume the smoke test';
+    ds.session.lastCliInput = '<user_message>resume the smoke test</user_message>';
+    ds.session.dispatchInputReceipts = {
+      om_active_turn: {
+        rootMessageId: 'om_root',
+        committedAt: '2026-08-03T06:08:04.021Z',
+        workerGeneration: 7,
+      },
+    };
+
+    forkWorker(ds, '', true);
+
+    expect(ds.workerGeneration).toBe(8);
+    expect(ds.session.pendingBridgeTurns).toEqual([{
+      turnId: 'om_active_turn',
+      content: '<user_message>resume the smoke test</user_message>',
+      userGoal: 'resume the smoke test',
+      startedAt: Date.parse('2026-08-03T06:08:04.021Z'),
+      writtenAt: Date.parse('2026-08-03T06:08:04.021Z'),
+    }]);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      prompt: '',
+      resume: true,
+      recoverBridgeTurns: [expect.objectContaining({
+        turnId: 'om_active_turn',
+        writtenAt: Date.parse('2026-08-03T06:08:04.021Z'),
+      })],
+    }));
+  });
+
+  it('does not recover a legacy Codex turn from a stale worker receipt', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+    ds.workerGeneration = 8;
+    ds.session.workerGeneration = 8;
+    ds.session.quoteTargetId = 'om_stale_turn';
+    ds.session.lastCliInput = 'stale input';
+    ds.session.dispatchInputReceipts = {
+      om_stale_turn: {
+        rootMessageId: 'om_root',
+        committedAt: '2026-08-03T06:08:04.021Z',
+        workerGeneration: 7,
+      },
+    };
+
+    forkWorker(ds, '', true);
+
+    expect(ds.session.pendingBridgeTurns).toBeUndefined();
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      prompt: '',
+      resume: true,
+      recoverBridgeTurns: undefined,
+    }));
   });
 
   it('back-fills wrapper/model from bot config on the first resume of a legacy (pre-freeze) session', () => {

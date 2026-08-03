@@ -72,6 +72,58 @@ export interface ReplyCardFooter {
   };
 }
 
+export type RecipientMentionMode = 'footer' | 'body';
+
+export interface MarkdownCardSessionControls {
+  terminalUrl?: string;
+  stopValue?: Record<string, unknown>;
+  manageValue?: Record<string, unknown>;
+}
+
+function footerBrandSegment(brand: string | undefined, controls?: MarkdownCardSessionControls): string | null {
+  if (controls?.terminalUrl || controls?.stopValue || controls?.manageValue) return null;
+  return brandFooterSegment(brand);
+}
+
+function sessionControlElements(controls: MarkdownCardSessionControls | undefined, locale?: Locale): any[] {
+  if (!controls?.terminalUrl && !controls?.stopValue && !controls?.manageValue) return [];
+  const columns: any[] = [];
+  if (controls.terminalUrl) {
+    columns.push({
+      tag: 'column', width: 'auto', vertical_align: 'center',
+      elements: [{
+        tag: 'button', text: { tag: 'plain_text', content: t('card.btn.reply_terminal', undefined, locale) },
+        type: 'primary_text', size: 'tiny', width: 'default',
+        behaviors: [{
+          type: 'open_url', default_url: controls.terminalUrl, pc_url: controls.terminalUrl,
+          android_url: controls.terminalUrl, ios_url: controls.terminalUrl,
+        }],
+      }],
+    });
+  }
+  if (controls.stopValue) {
+    columns.push({
+      tag: 'column', width: 'auto', vertical_align: 'center',
+      elements: [{
+        tag: 'button', text: { tag: 'plain_text', content: t('card.btn.stop_conversation', undefined, locale) },
+        type: 'danger_text', size: 'tiny', width: 'default',
+        behaviors: [{ type: 'callback', value: controls.stopValue }],
+      }],
+    });
+  }
+  if (controls.manageValue) {
+    columns.push({
+      tag: 'column', width: 'auto', vertical_align: 'center',
+      elements: [{
+        tag: 'button', text: { tag: 'plain_text', content: t('card.btn.reply_manage', undefined, locale) },
+        type: 'text', size: 'tiny', width: 'default',
+        behaviors: [{ type: 'callback', value: controls.manageValue }],
+      }],
+    });
+  }
+  return [{ tag: 'hr' }, { tag: 'column_set', flex_mode: 'flow', horizontal_spacing: 'small', columns }];
+}
+
 interface LocalHomeCandidate {
   id: number;
   start: number;
@@ -886,12 +938,34 @@ export function buildMarkdownCard(
   locale?: Locale,
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
-  usage?: CardUsageSnapshot,
+  usageOrRecipientMentionMode?: CardUsageSnapshot | RecipientMentionMode,
+  recipientMentionModeOrControls: RecipientMentionMode | MarkdownCardSessionControls = 'footer',
+  controls?: MarkdownCardSessionControls,
 ): string {
+  // The original two-phase-card fork exposed mention mode as argument 7,
+  // before upstream added the native usage snapshot in that slot. Accept both
+  // layouts so older callers keep their visual contract while current callers
+  // can pass (usage, mentionMode, controls).
+  const usage = typeof usageOrRecipientMentionMode === 'string'
+    ? undefined
+    : usageOrRecipientMentionMode;
+  const recipientMentionMode = typeof usageOrRecipientMentionMode === 'string'
+    ? usageOrRecipientMentionMode
+    : typeof recipientMentionModeOrControls === 'string'
+      ? recipientMentionModeOrControls
+      : 'footer';
+  const sessionControls = typeof recipientMentionModeOrControls === 'object'
+    ? recipientMentionModeOrControls
+    : controls;
+
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
+  if (recipientOpenId && recipientMentionMode === 'body') {
+    elements.unshift({ tag: 'markdown', content: `<at id=${recipientOpenId}></at>` });
+  }
+  elements.push(...sessionControlElements(sessionControls, locale));
   const footer = buildReplyCardFooter({
-    brand,
-    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    brand: footerBrandSegment(brand, sessionControls) ?? '',
+    recipientOpenIds: recipientOpenId && recipientMentionMode === 'footer' ? [recipientOpenId] : [],
     usage,
     locale,
   });
@@ -937,11 +1011,13 @@ export function buildContextualReplyCard(opts: {
   assistantText: string;
   assistantLabel: string;
   recipientOpenId?: string;
+  recipientMentionMode?: RecipientMentionMode;
   brand?: string;
   locale?: Locale;
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  controls?: MarkdownCardSessionControls;
 }): string {
   const {
     title,
@@ -949,11 +1025,13 @@ export function buildContextualReplyCard(opts: {
     assistantText,
     assistantLabel,
     recipientOpenId,
+    recipientMentionMode = 'footer',
     brand,
     locale,
     workingDir,
     localHomeLinkMode = 'filesystem',
     usage,
+    controls,
   } = opts;
   const elements: any[] = [];
 
@@ -962,6 +1040,10 @@ export function buildContextualReplyCard(opts: {
     text_size: 'heading_2_v2',
     content: title,
   });
+
+  if (recipientOpenId && recipientMentionMode === 'body') {
+    elements.push({ tag: 'markdown', content: `<at id=${recipientOpenId}></at>` });
+  }
 
   if (userText !== undefined) {
     const u = userText.trim();
@@ -981,10 +1063,11 @@ export function buildContextualReplyCard(opts: {
     ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
+  elements.push(...sessionControlElements(controls, locale));
 
   const footer = buildReplyCardFooter({
-    brand,
-    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    brand: footerBrandSegment(brand, controls) ?? '',
+    recipientOpenIds: recipientOpenId && recipientMentionMode === 'footer' ? [recipientOpenId] : [],
     usage,
     locale,
   });

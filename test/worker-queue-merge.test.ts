@@ -60,6 +60,16 @@ describe('mergeQueuedCliInput', () => {
     })).toBe(false);
   });
 
+  it('never merges a handoff summary that must wait for a real idle edge', () => {
+    const pending = [{ content: 'queued user turn', turnId: 'old-turn' }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'Handoff Summary request',
+      turnId: 'summary-turn',
+      requireIdle: true,
+    })).toBe(false);
+    expect(pending).toEqual([{ content: 'queued user turn', turnId: 'old-turn' }]);
+  });
+
   it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
     const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
     expect(mergeQueuedCliInput(pending, {
@@ -168,6 +178,7 @@ describe('durable turn queue boundary', () => {
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'im' })).toBe(true);
     expect(pendingInputAllowsTypeAhead(true, true, { content: 'im' })).toBe(false);
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'delivery', dispatchAttempt: 1 })).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'handoff', requireIdle: true })).toBe(false);
   });
 
   it('forces separate idle edges on both sides of a durable attempt', () => {

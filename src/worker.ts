@@ -129,7 +129,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, classifyCodexTerminalDiagnostic, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -1783,6 +1783,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   if (sent && msg.followUpContent) {
     sendToPty(msg.followUpContent, msg.followUpTurnId, {
       codexAppInput: msg.followUpCodexAppInput,
+      requireIdle: msg.followUpAfterIdle,
     });
     log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
   }
@@ -1793,11 +1794,20 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
+const CODEX_MISSING_FINAL_ERROR = 'codex_task_complete_without_final';
+const CODEX_MISSING_FINAL_CANDIDATE = 'codex_task_complete_without_final_candidate';
+const CODEX_CONTEXT_WINDOW_ERROR = 'codex_context_window_exceeded';
+const CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS = 750;
+const codexStreamHandoffTurnIds = new Set<string>();
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentCodexSubmittedInput = '';
+/** Turn-scoped Codex terminal evidence used only to classify empty completion. */
+let latestFilteredScreenContent = '';
+let currentCodexTerminalOutputTail = '';
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
@@ -2226,6 +2236,7 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+let codexAmbiguousTerminalTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -3537,6 +3548,36 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   return drainCocoEvents(path, offset);
 }
 
+/** Forward only transcript-native assistant commentary. Tool calls, command
+ * output, reasoning, and the terminal viewport never enter this path. */
+function ingestStructuredBridgeEvents(events: CodexBridgeEvent[]): void {
+  const attributedEvents = structuredBridgeIsCodex()
+    ? events.map(event => {
+        if (event.kind === 'assistant_final'
+          && event.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE) {
+          return {
+            ...event,
+            terminalEvidence: stripAnsiForLog(currentCodexTerminalOutputTail),
+            terminalViewportEvidence: renderer?.rawSnapshot() ?? latestFilteredScreenContent,
+            submittedInputAtTerminal: currentCodexSubmittedInput,
+          };
+        }
+        if (event.kind === 'assistant_progress' && event.progressKind === 'compaction_summary') {
+          return { ...event, text: `${t('worker.codex_compaction_summary')}\n\n${event.text}` };
+        }
+        return event;
+      })
+    : events;
+  codexBridgeQueue.ingest(attributedEvents);
+  for (const progress of codexBridgeQueue.drainProgressOutputs()) {
+    send({
+      type: 'progress_output', sessionId, content: progress.content,
+      uuid: progress.uuid, turnId: progress.turnId,
+      dispatchAttempt: progress.dispatchAttempt,
+    });
+  }
+}
+
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
   // Single 1s ticker that handles three jobs: late-attach (poll for the
@@ -3674,7 +3715,7 @@ function hermesBridgeIngest(): void {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(filtered.events);
+  ingestStructuredBridgeEvents(filtered.events);
   if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
@@ -3687,7 +3728,7 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     mtrBridgeOffset = result.newOffset;
     mtrBridgeBaselineDone = true;
     log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
@@ -3712,13 +3753,13 @@ function mtrBridgeIngest(): void {
   const result = drainMtrSession(mtrBridgeSource, mtrBridgeOffset);
   mtrBridgeOffset = result.newOffset;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   if (result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
 }
 
-function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
+function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'recover-active' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -3729,6 +3770,21 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge fresh-empty: ${rolloutPath}`);
+  } else if (mode === 'recover-active' && existsSync(rolloutPath)) {
+    const recovered = (lastInitConfig?.recoverBridgeTurns ?? [])
+      .filter(turn => turn.writtenAt !== undefined);
+    const result = structuredBridgeIngestPath(rolloutPath, 0);
+    // Transcript user records may precede daemon write-ahead persistence by a
+    // few milliseconds. Keep the same tolerance as normal fingerprinting so
+    // active recovered turns are ingested rather than absorbed as history.
+    const liveSince = Math.min(...recovered.map(turn => turn.writtenAt!)) - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(result.events, liveSince);
+    codexBridgeQueue.absorb(history);
+    ingestStructuredBridgeEvents(live);
+    codexBridgeOffset = result.newOffset;
+    codexBridgePendingTail = result.pendingTail;
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge recover-active: ${rolloutPath} (history=${history.length}, live=${live.length}, offset=${codexBridgeOffset})`);
   } else if (mode === 'split-live' && existsSync(rolloutPath)) {
     // Adopt mode: drain everything, then split by adoptStartMs. History
     // (pre-adopt) is `absorb()`-ed so it can't replay; live (post-adopt)
@@ -3742,7 +3798,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
@@ -4009,15 +4065,31 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
-  if (opts.signalIdle !== false && result.events.some(e => e.kind === 'assistant_final')) {
+  const sawAmbiguousTerminal = result.events.some(e =>
+    e.kind === 'assistant_final'
+    && 'terminalErrorCode' in e
+    && e.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE
+  );
+  if (opts.signalIdle !== false && result.events.some(e =>
+    e.kind === 'assistant_final'
+    && (!('terminalErrorCode' in e)
+      || e.terminalErrorCode !== CODEX_MISSING_FINAL_CANDIDATE)
+  )) {
     idleDetector?.fireIdle();
+  } else if (opts.signalIdle !== false && sawAmbiguousTerminal && !codexAmbiguousTerminalTimer) {
+    // Some builds flush task_complete before painting the terminal diagnostic.
+    codexAmbiguousTerminalTimer = setTimeout(() => {
+      codexAmbiguousTerminalTimer = null;
+      idleDetector?.fireIdle();
+    }, CODEX_AMBIGUOUS_TERMINAL_SETTLE_MS);
+    codexAmbiguousTerminalTimer.unref?.();
   }
 }
 
@@ -4028,10 +4100,20 @@ function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
+  userGoal?: string,
 ): boolean {
   if (!codexBridgeFallbackActive()) return false;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt);
+  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt, userGoal);
+  // Handles the transcript-before-mark race: mark() can replay buffered
+  // commentary immediately after attribution becomes available.
+  for (const progress of codexBridgeQueue.drainProgressOutputs()) {
+    send({
+      type: 'progress_output', sessionId, content: progress.content,
+      uuid: progress.uuid, turnId: progress.turnId,
+      dispatchAttempt: progress.dispatchAttempt,
+    });
+  }
   return true;
 }
 
@@ -4069,8 +4151,37 @@ function drainReliableTerminalBeforeInterrupt(): void {
 }
 
 function emitReadyCodexTurns(): void {
+  if (structuredBridgeIsCodex()) {
+    const terminalEvidence = stripAnsiForLog(currentCodexTerminalOutputTail);
+    const terminalViewportEvidence = renderer?.rawSnapshot() ?? latestFilteredScreenContent;
+    const directTerminalDiagnostic = classifyCodexTerminalDiagnostic(
+      terminalEvidence,
+      { requireTerminalLine: true },
+    ) ?? classifyCodexTerminalDiagnostic(
+      terminalViewportEvidence,
+      { requireTerminalLine: true },
+    );
+    if (directTerminalDiagnostic) {
+      codexBridgeQueue.failCurrentTurn({
+        turnId: currentBotmuxTurnId,
+        errorCode: directTerminalDiagnostic === 'context_window_exceeded'
+          ? CODEX_CONTEXT_WINDOW_ERROR
+          : CODEX_MISSING_FINAL_ERROR,
+        terminalEvidence,
+        terminalViewportEvidence,
+        submittedInput: currentCodexSubmittedInput,
+      });
+    }
+    codexBridgeQueue.refreshLastAmbiguousTerminalEvidence({
+      turnId: currentBotmuxTurnId ?? codexBridgeQueue.lastAmbiguousTerminalTurnId(),
+      terminalEvidence,
+      terminalViewportEvidence,
+      submittedInput: currentCodexSubmittedInput,
+    });
+  }
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  const finalEmittedTurnIds = new Set<string>();
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -4090,12 +4201,60 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    if (turn.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE) {
+      const terminalDiagnostic = classifyCodexTerminalDiagnostic(
+        turn.terminalEvidence ?? '',
+        { ignoreContext: true, requireTerminalLine: true },
+      ) ?? classifyCodexTerminalDiagnostic(
+        turn.terminalViewportEvidence ?? '',
+        { requireTerminalLine: true },
+      );
+      if (terminalDiagnostic === 'context_window_exceeded') {
+        turn.terminalStatus = 'failed';
+        turn.terminalErrorCode = CODEX_CONTEXT_WINDOW_ERROR;
+      } else if (terminalDiagnostic === 'stream_disconnected') {
+        turn.terminalStatus = 'failed';
+        turn.terminalErrorCode = CODEX_MISSING_FINAL_ERROR;
+      } else {
+        // Empty task_complete is also a valid answer-less turn (typically after
+        // an explicit send). Close it silently rather than inventing failure.
+        turn.terminalStatus = 'completed';
+        turn.terminalErrorCode = undefined;
+      }
+    }
+    if (!adoptMode
+      && turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
+      && turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR) {
+      const writtenGoals = inflightInputs.takeForHandoff(turn.turnId)
+        .map(item => item.userGoal)
+        .filter((goal): goal is string => !!goal);
+      const interruptedUserGoal = [...new Set([
+        turn.userGoal,
+        ...writtenGoals,
+        ...pendingMessages.map(item => item.userGoal).filter((goal): goal is string => !!goal),
+      ].filter((goal): goal is string => !!goal))].join('\n\n').slice(0, 4_000) || undefined;
+      pendingMessages.length = 0;
+      pendingRawInputs.length = 0;
+      codexBridgeQueue.clearPending();
+      inflightInputs.onTurnComplete();
+      send({ type: 'codex_context_exhausted', sessionId, turnId: turn.turnId, interruptedUserGoal });
+      continue;
+    }
+    if (!adoptMode
+      && turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
+      && turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR) {
+      beginCodexStreamDisconnectHandoff(turn.turnId, turn.userGoal);
+      continue;
+    }
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       finalText: turn.finalText,
+      progressTexts: turn.progressTexts,
       terminalStatus: turn.terminalStatus,
     };
     const content = turn.finalText && turn.finalText.trim()
@@ -4129,6 +4288,7 @@ function emitReadyCodexTurns(): void {
         kind: 'local-turn',
         userText: fields.userText,
       });
+      finalEmittedTurnIds.add(turn.turnId);
       continue;
     }
     send({
@@ -4139,15 +4299,45 @@ function emitReadyCodexTurns(): void {
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
+    finalEmittedTurnIds.add(turn.turnId);
   }
   for (const turn of ready) {
+    if (turn.dispatchAttempt === undefined
+      && turn.terminalStatus === 'failed'
+      && (turn.terminalErrorCode === CODEX_MISSING_FINAL_ERROR
+        || turn.terminalErrorCode === CODEX_CONTEXT_WINDOW_ERROR)) continue;
     emitTurnTerminal(
       turn.turnId,
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
+      finalEmittedTurnIds.has(turn.turnId),
     );
   }
+}
+
+/** Freeze the interrupted batch and hand ownership to daemon migration. */
+function beginCodexStreamDisconnectHandoff(turnId: string, userGoal?: string): void {
+  if (!turnId || codexStreamHandoffTurnIds.has(turnId)) return;
+  codexStreamHandoffTurnIds.add(turnId);
+  while (codexStreamHandoffTurnIds.size > 64) {
+    const oldest = codexStreamHandoffTurnIds.values().next().value;
+    if (oldest === undefined) break;
+    codexStreamHandoffTurnIds.delete(oldest);
+  }
+  const writtenGoals = inflightInputs.takeForHandoff(turnId)
+    .map(item => item.userGoal)
+    .filter((goal): goal is string => !!goal);
+  const interruptedUserGoal = [...new Set([
+    userGoal,
+    ...writtenGoals,
+    ...pendingMessages.map(item => item.userGoal).filter((goal): goal is string => !!goal),
+  ].filter((goal): goal is string => !!goal))].join('\n\n').slice(0, 4_000) || undefined;
+  pendingMessages.length = 0;
+  pendingRawInputs.length = 0;
+  codexBridgeQueue.clearPending();
+  inflightInputs.onTurnComplete();
+  send({ type: 'codex_stream_disconnected', sessionId, turnId, interruptedUserGoal });
 }
 
 function stopCodexBridge(): void {
@@ -4158,6 +4348,10 @@ function stopCodexBridge(): void {
   if (codexBridgeTimer) {
     clearInterval(codexBridgeTimer);
     codexBridgeTimer = null;
+  }
+  if (codexAmbiguousTerminalTimer) {
+    clearTimeout(codexAmbiguousTerminalTimer);
+    codexAmbiguousTerminalTimer = null;
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
@@ -5291,6 +5485,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // translate them back into worker IPC.
 const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira', 'mir']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
+let appRunnerReplayAccepted = 0;
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
 
@@ -5311,6 +5506,12 @@ function handleCodexAppMarker(body: string): void {
 
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
+    return;
+  }
+
+  if (kind === 'replay_ack') {
+    appRunnerReplayAccepted++;
+    log(`Codex App runner replay acknowledged (count=${String(payload.count ?? '?')})`);
     return;
   }
 
@@ -5765,6 +5966,9 @@ function onPtyData(data: string): void {
   if (data.length === 0) return;
   backendScreenRevision += 1;
   lastPtyActivityAtMs = Date.now();
+  if (lastInitConfig?.cliId === 'codex') {
+    currentCodexTerminalOutputTail = tailChars(currentCodexTerminalOutputTail + data, 16_000);
+  }
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
@@ -6558,7 +6762,16 @@ async function flushPending(): Promise<void> {
     if (pendingMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
   if (!isPromptReady && pendingMessages.length === 0) return;
-  if (!isPromptReady && !typeAheadAllowed) return;
+  // Reuse sendToPty's startup/type-ahead gate. An owned restart wakes this
+  // function immediately while the replacement pane can still be a transient
+  // shell wrapper; wait for its first real prompt before the bare-shell probe.
+  if (!shouldWriteNow({
+    isPromptReady,
+    isFlushing,
+    supportsTypeAhead: typeAheadAllowed,
+    awaitingFirstPrompt,
+    holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
+  })) return;
 
   isFlushing = true;
   if (isPromptReady) {
@@ -6646,10 +6859,12 @@ async function flushPending(): Promise<void> {
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
+      let normalWritePreparedAt: number | undefined;
       let submissionPreparationFailed = false;
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
+        normalWritePreparedAt = Date.now();
         renderer?.markNewTurn();
         currentBotmuxTurnId = item.turnId;
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
@@ -6681,7 +6896,20 @@ async function flushPending(): Promise<void> {
             item.dispatchAttempt,
           );
         } else if (codexBridgeActive) {
-          codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
+          currentCodexSubmittedInput = logicalMsg;
+          currentCodexTerminalOutputTail = '';
+          codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, item.userGoal);
+          if (item.turnId) {
+            send({
+              type: 'bridge_turn_written',
+              sessionId,
+              turnId: item.turnId,
+              ...(item.dispatchAttempt !== undefined
+                ? { dispatchAttempt: item.dispatchAttempt }
+                : {}),
+              writtenAt: normalWritePreparedAt,
+            });
+          }
         }
         if (durableWrite
           && cliAdapter!.reliableTurnTerminal === true
@@ -6898,6 +7126,7 @@ function sendToPty(
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    requireIdle?: boolean;
   } = {},
 ): boolean {
   if (!cliAdapter) return false;
@@ -6909,6 +7138,7 @@ function sendToPty(
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
+    ...(opts.requireIdle ? { requireIdle: true } : {}),
   };
   // During an exact lease-fenced CLI restart the worker stays alive while the
   // backend is rebuilt. Preserve incoming attempt N+1 in the worker queue; the
@@ -7051,6 +7281,7 @@ function startScreenUpdates(): void {
           return;
         }
         lastContent = content;
+        latestFilteredScreenContent = content;
       }
 
       const usageAware = classifyScreenUsageLimit(content, status);
@@ -9427,10 +9658,49 @@ async function spawnCli(
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
+    const recovered = cfg.recoverBridgeTurns ?? [];
+    const writtenRecovered = recovered.filter(turn => turn.writtenAt !== undefined);
+    const unwrittenRecovered = recovered.filter(turn => turn.writtenAt === undefined);
+    if (unwrittenRecovered.length > 0) {
+      pendingMessages.unshift(...unwrittenRecovered.map(turn => ({
+        content: turn.content,
+        userGoal: turn.userGoal,
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+      })));
+    }
+    for (const turn of writtenRecovered) {
+      codexBridgeQueue.mark(
+        turn.turnId,
+        turn.content,
+        turn.startedAt,
+        turn.dispatchAttempt,
+        turn.userGoal,
+      );
+    }
+    // An empty resume has no init turnId, but a recovered, already-written
+    // model turn is still the live authority for botmux send. Re-publish the
+    // exact latest unterminated turn before recover-active drains commentary;
+    // otherwise the progress-card IPC cannot derive the same provider UUID as
+    // transcript progress and the explicit/native race produces two cards.
+    const restoredAuthority = writtenRecovered
+      .filter(turn => turn.terminalAt === undefined)
+      .sort((a, b) => (a.writtenAt ?? a.startedAt) - (b.writtenAt ?? b.startedAt))
+      .at(-1);
+    if (restoredAuthority) {
+      currentBotmuxTurnId = restoredAuthority.turnId;
+      currentBotmuxDispatchAttempt = restoredAuthority.dispatchAttempt;
+      writeCliPidMarker();
+      publishSandboxRelayCapability();
+      log(`Restored managed turn authority for Codex recovery (${restoredAuthority.turnId.substring(0, 16)})`);
+    }
     if (effectiveCliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
-        codexBridgeAttach(rolloutPath, 'baseline-existing');
+        codexBridgeAttach(
+          rolloutPath,
+          writtenRecovered.length > 0 ? 'recover-active' : 'baseline-existing',
+        );
       } else {
         codexBridgePendingSessionId = effectiveCliSessionId;
         codexBridgeStartTimer();
@@ -9762,6 +10032,43 @@ async function spawnCli(
       send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt });
     }
   });
+
+  if (cfg.cliId === 'codex-app' && (cfg.recoverBridgeTurns?.length ?? 0) > 0) {
+    const recovered = cfg.recoverBridgeTurns!;
+    if (willReattachPersistent && cliAdapter.replayPendingTurns) {
+      const acceptedBefore = appRunnerReplayAccepted;
+      void cliAdapter.replayPendingTurns(observedBackend, recovered.map(turn => ({
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      }))).then(result => {
+        log(`Codex App runner replay requested for ${recovered.length} pending turn(s), submitted=${result.submitted}`);
+        setTimeout(() => {
+          if (backend !== observedBackend || appRunnerReplayAccepted > acceptedBefore) return;
+          log('Codex App replay produced no supported marker — cold-restarting runner and requeueing pending turns');
+          pendingMessages.unshift(...recovered.map(turn => ({
+            content: turn.content,
+            userGoal: turn.userGoal,
+            turnId: turn.turnId,
+            dispatchAttempt: turn.dispatchAttempt,
+            codexAppInput: turn.codexAppInput,
+          })));
+          void restartCliProcess('app runner replay unsupported', {
+            immediate: true,
+            preservePending: true,
+          });
+        }, 2_000).unref?.();
+      }).catch(err => log(`Codex App runner replay request failed: ${err?.message ?? err}`));
+    } else {
+      pendingMessages.unshift(...recovered.map(turn => ({
+        content: turn.content,
+        userGoal: turn.userGoal,
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+        codexAppInput: turn.codexAppInput,
+      })));
+      log(`Codex App requeued ${recovered.length} pending turn(s) after cold runner start`);
+    }
+  }
 
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
     log(`Re-attached to existing ${effectiveBackendType} session via pipe backend: ${persistentSessionName}`);
@@ -11285,6 +11592,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
+  bridgeFinalEmitted?: boolean,
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -11304,6 +11612,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(bridgeFinalEmitted ? { bridgeFinalEmitted: true } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },

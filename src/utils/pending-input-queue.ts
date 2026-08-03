@@ -6,10 +6,16 @@ export interface PendingCliInput {
    * adapter command. Transcript bridges fingerprint this value, while the PTY
    * receives `content`. */
   logicalContent?: string;
+  /** Clean user-authored goal retained separately for recovery handoff. */
+  userGoal?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** Administrative raw command followed by a real model turn (for example,
+   * Codex /compact handoff). Wait for a genuine prompt instead of steering
+   * this turn into the still-running command. */
+  requireIdle?: boolean;
 }
 
 /**
@@ -68,8 +74,10 @@ export function mergeQueuedCliInput(
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
-    || tail.logicalContent || next.logicalContent) return false;
+    || tail.logicalContent || next.logicalContent
+    || tail.requireIdle || next.requireIdle) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
+  tail.userGoal = next.userGoal ?? tail.userGoal;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
 }
@@ -85,7 +93,8 @@ export function pendingInputAllowsTypeAhead(
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
     && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin;
+    && !next?.vcMeetingImTurnOrigin
+    && !next?.requireIdle;
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL

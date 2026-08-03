@@ -25,6 +25,7 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 export type InflightItem = {
   content: string;
   logicalContent?: string;
+  userGoal?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -34,10 +35,22 @@ export type InflightItem = {
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
   private carryOver: InflightItem[] = [];
+  private recent: InflightItem[] = [];
 
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);
+    this.recent.push(item);
+    if (this.recent.length > 32) this.recent.splice(0, this.recent.length - 32);
+  }
+
+  /** Freeze every ordinary input already written into the current CLI batch
+   * for a cross-thread handoff, with a recent-write fallback for false-idle. */
+  takeForHandoff(turnId: string): InflightItem[] {
+    const inFlight = this.unacked.splice(0);
+    if (inFlight.length > 0) return inFlight;
+    const lastMatchingIndex = this.recent.map(item => item.turnId).lastIndexOf(turnId);
+    return lastMatchingIndex >= 0 ? this.recent.slice(lastMatchingIndex) : [];
   }
 
   /** Retire one exact write whose transport outcome is ambiguous and must not

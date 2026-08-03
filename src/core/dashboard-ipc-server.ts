@@ -71,7 +71,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, buildNativeProgressCard } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -451,7 +451,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename|progress-card)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -870,6 +870,33 @@ function sessionCliIpcAuth(
   });
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
+
+/** Return the daemon's canonical low-attention progress card without sending
+ * it. `botmux send --no-mention` uses this so an early explicit send has the
+ * same old first-card style and provider UUID as transcript commentary. */
+ipcRoute('POST', '/api/sessions/:sessionId/progress-card', async (req, res, params) => {
+  const body = await readJsonBody<{ content?: unknown } & Record<string, unknown>>(req)
+    .catch(() => ({} as { content?: unknown } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (typeof body.content !== 'string' || !body.content.trim() || body.content.length > 200_000) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_content' });
+  }
+  const turnId = ds.managedTurnOrigin?.turnId;
+  const dispatchAttempt = ds.managedTurnOrigin?.dispatchAttempt;
+  const providerUuid = turnId
+    ? bridgeProgressProviderUuid(params.sessionId, turnId, body.content)
+    : undefined;
+  jsonRes(res, 200, {
+    ok: true,
+    cardJson: buildNativeProgressCard(ds, body.content),
+    ...(turnId ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(providerUuid ? { providerUuid } : {}),
+  });
+});
 
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating

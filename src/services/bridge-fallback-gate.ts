@@ -38,6 +38,7 @@
  *     nextBoundaryMs) — without that, a model that's still mid-tool-use
  *     for turn N+1 could leak a send credit into turn N's window.
  */
+import { createHash } from 'node:crypto';
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
@@ -74,6 +75,9 @@ export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
   contentLength?: number;
+  /** Stable digest of the normalized body. Lets the fallback distinguish a
+   * manually mirrored progress card from a send of the final answer. */
+  contentHash?: string;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
   previewText?: string;
@@ -90,12 +94,19 @@ export interface BridgeGateInput {
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
+  /** Transcript-native commentary emitted earlier in this exact turn. A
+   * matching explicit send is progress and must not consume final fallback. */
+  progressTexts?: readonly string[];
   /** Explicit transcript terminal semantics. Undefined preserves the
    * historical "assistant_final means completed" behavior. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
 const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
+
+function bridgeContentHash(normalized: string): string {
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 32);
+}
 
 /** Bounded, newline-preserving copy of a `botmux send` body for dashboard
  *  previews. Unlike the fingerprint normaliser (which collapses ALL whitespace
@@ -119,13 +130,14 @@ export function buildBridgeSendPreviewText(content: string): string | undefined 
 
 export function buildBridgeSendMarkerContent(
   content: string,
-): Pick<BridgeSendMarker, 'contentLength' | 'previewText'> | undefined {
+): Pick<BridgeSendMarker, 'contentLength' | 'contentHash' | 'previewText'> | undefined {
   const normalized = normaliseForFingerprint(content);
   if (!normalized) return undefined;
   return {
     // Length stays fingerprint-normalized: the fallback gate compares it against
     // normalise(finalText).length, so it must not count preview-only newlines.
     contentLength: normalized.length,
+    contentHash: bridgeContentHash(normalized),
     // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
     previewText: buildBridgeSendPreviewText(content),
   };
@@ -145,17 +157,34 @@ function finalIsMateriallyLongerThanSends(finalLength: number, markers: readonly
     && finalLength - maxSentLength >= MATERIAL_FINAL_MIN_EXTRA_CHARS;
 }
 
-function markerSetCoversFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
+function markerSetCoversFinal(
+  markers: readonly BridgeSendMarker[],
+  finalText: string | undefined,
+  progressTexts: readonly string[] | undefined,
+): boolean {
   if (markers.length === 0) return false;
+
+  const normalizedProgress = (progressTexts ?? [])
+    .map(text => normaliseForFingerprint(text))
+    .filter(Boolean);
+  const progressHashes = new Set(normalizedProgress.map(bridgeContentHash));
+  const progressLengths = new Set(normalizedProgress.map(text => text.length));
+  const finalMarkers = markers.filter(marker => {
+    if (marker.contentHash) return !progressHashes.has(marker.contentHash);
+    // Rolling-upgrade compatibility: exact commentary-length matches from old
+    // structured markers are progress; unknown legacy markers stay conservative.
+    return marker.contentLength === undefined || !progressLengths.has(marker.contentLength);
+  });
+  if (finalMarkers.length === 0) return false;
 
   // Back-compat: old marker files only have sentAtMs/messageId. Keep the old
   // conservative behavior for those entries instead of risking duplicates.
-  if (markers.some(m => !hasStructuredContentMarker(m))) return true;
+  if (finalMarkers.some(m => !hasStructuredContentMarker(m))) return true;
 
   const finalNormalized = normaliseForFingerprint(finalText ?? '');
   if (!finalNormalized) return true;
 
-  const structuredMarkers = markers.filter(hasStructuredContentMarker);
+  const structuredMarkers = finalMarkers.filter(hasStructuredContentMarker);
   return !finalIsMateriallyLongerThanSends(finalNormalized.length, structuredMarkers);
 }
 
@@ -172,7 +201,7 @@ export function shouldSuppressBridgeEmit(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
-  return markerSetCoversFinal(markersInWindow, turn.finalText);
+  return markerSetCoversFinal(markersInWindow, turn.finalText, turn.progressTexts);
 }
 
 /** Some structured CLIs can report a durable completed turn while their

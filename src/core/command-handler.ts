@@ -94,6 +94,7 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
+import { notifySessionStopped } from './session-stop-notice.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -1280,8 +1281,12 @@ export async function handleCommand(
           // Capture the closed-session card BEFORE killWorker/closeSession —
           // it reads the live session's identity off `ds`.
           const card = buildClosedSessionCard(ds, loc);
-          const activeKey = sessionKey(rootId, larkAppId!);
           try {
+            // A previous failed/partial close attempt must not suppress the
+            // explicit user-requested terminal notice for this successful close.
+            ds.stopNoticeSent = false;
+            ds.stopNoticeInFlight = undefined;
+            ds.stopNoticeLifecycleId = undefined;
             await closeSession(ds.session.sessionId);
           } catch (err) {
             logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${err}`);
@@ -1291,7 +1296,9 @@ export async function handleCommand(
             );
             break;
           }
-          if (activeSessions.get(activeKey) === ds) activeSessions.delete(activeKey);
+          for (const [key, current] of activeSessions.entries()) {
+            if (current === ds) activeSessions.delete(key);
+          }
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -1302,6 +1309,10 @@ export async function handleCommand(
             'interactive',
             () => sessionReply(rootId, card, 'interactive'),
           );
+          await notifySessionStopped(ds, deps.sessionReply, 'ended', {
+            recipientOpenId: message.senderType === 'user' ? message.senderId : undefined,
+            turnId: message.messageId,
+          });
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));

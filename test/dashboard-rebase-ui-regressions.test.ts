@@ -106,6 +106,15 @@ describe('dashboard master feature integration', () => {
     expect(botDefaults).toContain('className="bd-field"');
   });
 
+  it('keeps topic-group memory mounted in the sessions tab after focused-layout refactors', () => {
+    const page = dashboardSource('bot-defaults-page.tsx');
+    const sessionsPanel = page.match(/id="bd-panel-sessions"[\s\S]*?id="bd-panel-security"/)?.[0] ?? '';
+
+    expect(sessionsPanel).toContain('<TopicGroupMemorySection bot={bot} putCardPref={putCardPref} />');
+    expect(sessionsPanel).toContain('className="bd-tile bd-tile-wide"');
+    expect((page.match(/<TopicGroupMemorySection bot=\{bot\} putCardPref=\{putCardPref\} \/>/g) ?? [])).toHaveLength(1);
+  });
+
   it('keeps topic-group memory compact in a column with names-only, scrolling, pagination, and actions', () => {
     const page = dashboardSource('bot-defaults-page.tsx');
     const css = dashboardSource('style.css');

@@ -4,10 +4,12 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. The bridge fallback
- * cares about exactly two records:
+ * cares about these records:
  *
  *   - user turn-start: `response_item.payload` message role=user
  *     (input_text content). Stable across every codex version.
+ *   - progress: assistant `response_item` message phase=commentary, plus
+ *     phase=final_answer Handoff Summary records created by compaction.
  *   - turn terminal: `event_msg.payload` `task_complete`, which carries the
  *     final visible text in `last_agent_message` (may be empty) and fires
  *     exactly ONCE per turn.
@@ -24,6 +26,9 @@
  *     0.146), fires once per turn, and dedups codex's THREE representations of
  *     one answer (event_msg agent_message / response_item message / event_msg
  *     task_complete) down to a single emit — no cross-source dedup needed.
+ *   - Explicit `phase=commentary` remains safe to mirror as non-terminal
+ *     progress. `phase=final_answer` is ignored except for compaction Handoff
+ *     Summaries, which are also progress and never close the turn.
  *   - A cancelled turn writes `turn_aborted` (no task_complete); we surface it
  *     as an `ambiguous` terminal so the durable delivery is released instead
  *     of wedging as "running" forever.
@@ -148,13 +153,73 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
-  /** Non-terminal progress subtype. */
+  /** Non-terminal progress subtype. Context-compaction summaries are shown to
+   * the user with locale-specific chrome by the worker, but remain ordinary
+   * progress for queueing/retry semantics. */
   progressKind?: 'compaction_summary';
-  /** Structured terminal upgrade that may arrive before/after an empty task_complete. */
+  /** Structured terminal upgrade that may arrive before or after the empty
+   * task_complete boundary. It upgrades the currently collecting or most
+   * recently closed ambiguous turn without creating a second final. */
   terminalOnly?: boolean;
   terminalEvidence?: string;
   terminalViewportEvidence?: string;
   submittedInputAtTerminal?: string;
+}
+
+export type CodexTerminalDiagnostic = 'context_window_exceeded' | 'stream_disconnected';
+
+const CODEX_CONTEXT_WINDOW_DIAGNOSTIC = "codex ran out of room in the model's context window";
+const CODEX_STREAM_DISCONNECTED_DIAGNOSTIC = 'stream disconnected before completion';
+const CODEX_STREAM_CLOSED_DIAGNOSTIC = 'stream closed before response.completed';
+
+function normalizeTerminalDiagnosticText(content: string): string {
+  return content.replace(/\r/g, '').replace(/\s+/g, ' ').toLowerCase();
+}
+
+function hasExplicitContextDiagnosticLine(content: string): boolean {
+  return content.replace(/\r/g, '\n').split('\n').some(line => {
+    // Codex renders a terminal failure as an unindented `■ ...` line. TUI
+    // input echoes are prefixed by `› ` (first line) or indentation
+    // (continuations), even when the user pastes the same diagnostic text.
+    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
+    return normalizedLine.startsWith(`■ ${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_CONTEXT_WINDOW_DIAGNOSTIC}`);
+  });
+}
+
+function hasExplicitStreamDiagnosticLine(content: string): boolean {
+  return content.replace(/\r/g, '\n').split('\n').some(line => {
+    const normalizedLine = line.replace(/\s+/g, ' ').toLowerCase();
+    return normalizedLine.startsWith(`■ ${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_STREAM_DISCONNECTED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■ ${CODEX_STREAM_CLOSED_DIAGNOSTIC}`)
+      || normalizedLine.startsWith(`■${CODEX_STREAM_CLOSED_DIAGNOSTIC}`);
+  });
+}
+
+/** Classify the exact terminal diagnostics that can disambiguate an empty
+ * `task_complete`. Keep this deliberately narrow: this is only a fallback for
+ * releases that omit the structured failure from rollout JSONL. */
+export function classifyCodexTerminalDiagnostic(
+  content: string,
+  opts: { ignoreContext?: boolean; requireTerminalLine?: boolean } = {},
+): CodexTerminalDiagnostic | undefined {
+  const normalized = normalizeTerminalDiagnosticText(content);
+  if (!opts.ignoreContext && hasExplicitContextDiagnosticLine(content)) {
+    return 'context_window_exceeded';
+  }
+  if ((normalized.includes(CODEX_STREAM_DISCONNECTED_DIAGNOSTIC)
+    || normalized.includes(CODEX_STREAM_CLOSED_DIAGNOSTIC))
+    && (!opts.requireTerminalLine || hasExplicitStreamDiagnosticLine(content))) {
+    return 'stream_disconnected';
+  }
+  return undefined;
+}
+
+/** Backwards-compatible predicate for callers that only care whether a
+ * terminal is abnormal. */
+export function isCodexAbnormalTerminationOutput(content: string): boolean {
+  return classifyCodexTerminalDiagnostic(content) !== undefined;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -382,6 +447,25 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+function isHandoffSummaryText(text: string): boolean {
+  return /^Handoff Summary\b/i.test(text.trim());
+}
+
+function codexErrorInfo(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  if (typeof (payload as any).codex_error_info === 'string') {
+    return (payload as any).codex_error_info;
+  }
+  const error = (payload as any).error;
+  return error && typeof error === 'object'
+    ? codexErrorInfo(error)
+    : undefined;
+}
+
+function isContextWindowErrorInfo(value: string | undefined): boolean {
+  return value?.replace(/[-_]/g, '').toLowerCase() === 'contextwindowexceeded';
+}
+
 /** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
  *  durable-delivery terminal outcome. Mirrors the traex reader. */
 function codexAbortErrorCode(reason: unknown): string {
@@ -444,6 +528,56 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }
+    // Explicit commentary is the only assistant response_item shape that is
+    // safe to mirror. Phase-less assistant messages are ambiguous in Codex
+    // >=0.146 and must remain ignored.
+    if (obj.type === 'response_item'
+      && p.type === 'message'
+      && p.role === 'assistant'
+      && p.phase === 'commentary') {
+      const progressText = joinTextBlocks(p.content, 'output_text');
+      if (!progressText) continue;
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_progress',
+        text: progressText,
+      });
+      continue;
+    }
+    // Automatic compaction writes a final_answer-shaped Handoff Summary for
+    // the continuation model. Surface it as progress, never as a terminal.
+    if (obj.type === 'response_item'
+      && p.type === 'message'
+      && p.role === 'assistant'
+      && p.phase === 'final_answer') {
+      const progressText = joinTextBlocks(p.content, 'output_text');
+      if (!progressText || !isHandoffSummaryText(progressText)) continue;
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_progress',
+        text: progressText,
+        progressKind: 'compaction_summary',
+      });
+      continue;
+    }
+    // Some Codex versions emit the structured failure independently. It is a
+    // terminal upgrade, not a second normal final candidate.
+    if (obj.type === 'event_msg'
+      && (p.type === 'error' || p.type === 'stream_error')
+      && isContextWindowErrorInfo(codexErrorInfo(p))) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_context_window_exceeded',
+        terminalOnly: true,
+      });
+      continue;
+    }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
     // This is the SOLE assistant_final source. Codex assistant `response_item`
@@ -463,6 +597,16 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+        terminalStatus: isContextWindowErrorInfo(codexErrorInfo(p))
+          ? 'failed'
+          : (typeof p.last_agent_message === 'string' && p.last_agent_message.trim().length > 0
+              ? 'completed'
+              : 'ambiguous'),
+        terminalErrorCode: isContextWindowErrorInfo(codexErrorInfo(p))
+          ? 'codex_context_window_exceeded'
+          : (typeof p.last_agent_message === 'string' && p.last_agent_message.trim().length > 0
+              ? undefined
+              : 'codex_task_complete_without_final_candidate'),
       });
       continue;
     }

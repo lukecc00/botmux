@@ -751,6 +751,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile bd-tile-wide"><TopicGroupMemorySection bot={bot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
         <div
