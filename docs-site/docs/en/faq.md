@@ -136,6 +136,8 @@ It hasn't been verified on native Windows, but WSL2 should be fine.
 
 `botmux upgrade`. The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately.
 
+The personal build must first be installed through the `lukecc00/botmux@p/ai_open` `install.sh`. Its primary daemon checks that branch's `dev-version.json` daily and DMs the owner once per new target version. An npm install remains on the official channel and is never switched silently. The full release contract is in `docs/personal-release-channel.md` in the repository.
+
 ## CoCo loses messages while busy?
 
 Upgrade to **CoCo ≥ 0.120.32** — type-ahead (messages received while busy go into CoCo's own queue) depends on that version's behavior.

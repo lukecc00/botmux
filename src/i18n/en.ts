@@ -1191,6 +1191,15 @@ export const messages: Record<string, string> = {
   'cli_update.manual_only': 'botmux only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
   'cli_update.dashboard': 'Dashboard: {url}',
 
+  // Personal Botmux distribution update monitor
+  'botmux_update.card_title': 'Personal Botmux update available',
+  'botmux_update.available': '⬆️ **A new personal Botmux version is available**',
+  'botmux_update.version_delta': 'Version: {current} → {latest}',
+  'botmux_update.source': 'Update source: `{repo}@{ref}`',
+  'botmux_update.command': 'Upgrade in Dashboard under Version & Update, or run on the host: {command}',
+  'botmux_update.manual_only': 'This notice only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
+  'botmux_update.dashboard': 'Dashboard: {url}',
+
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',
 

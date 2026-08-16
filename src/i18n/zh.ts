@@ -1194,6 +1194,15 @@ export const messages: Record<string, string> = {
   'cli_update.manual_only': 'botmux 只检查并提醒，不会自动安装；现有会话不受影响。',
   'cli_update.dashboard': 'Dashboard：{url}',
 
+  // Personal Botmux distribution update monitor
+  'botmux_update.card_title': '个人版 botmux 有新版本',
+  'botmux_update.available': '⬆️ **检测到个人版 botmux 新版本**',
+  'botmux_update.version_delta': '版本：{current} → {latest}',
+  'botmux_update.source': '更新源：`{repo}@{ref}`',
+  'botmux_update.command': '可在 Dashboard 的「版本与更新」中升级，或在宿主终端执行：{command}',
+  'botmux_update.manual_only': '本提醒只负责检测和通知，不会自动安装；现有会话不受影响。',
+  'botmux_update.dashboard': 'Dashboard：{url}',
+
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 `im.chat.member.bot.added_v1`。\n\n请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 `botmux restart`。\n\n错误详情：{detail}',
 

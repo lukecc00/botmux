@@ -21,6 +21,17 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Verify tag matches personal version manifest
         run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag" || {
+            echo "$GITHUB_REF_NAME must be an annotated tag" >&2
+            exit 1
+          }
+          git fetch origin '+refs/heads/p/ai_open:refs/remotes/origin/p/ai_open'
+          TAG_COMMIT="$(git rev-parse "$GITHUB_REF_NAME^{}")"
+          CHANNEL_COMMIT="$(git rev-parse refs/remotes/origin/p/ai_open)"
+          test "$TAG_COMMIT" = "$CHANNEL_COMMIT" || {
+            echo "tag commit $TAG_COMMIT is not the p/ai_open channel head $CHANNEL_COMMIT" >&2
+            exit 1
+          }
           EXPECTED="v$(node -p "require('./dev-version.json').version")"
           test "$GITHUB_REF_NAME" = "$EXPECTED" || {
             echo "tag $GITHUB_REF_NAME does not match dev-version.json ($EXPECTED)" >&2
