@@ -27,9 +27,15 @@ export type InflightItem = {
   logicalContent?: string;
   userGoal?: string;
   turnId?: string;
+  replyTurnId?: string;
   dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** At-most-once turn (idempotency lease): must NEVER be carried over to a
+   *  respawned CLI (codex #776 round-7 finding #1). See PendingCliInput.noReplay. */
+  noReplay?: boolean;
 };
 
 export class InflightInputTracker {
@@ -51,6 +57,14 @@ export class InflightInputTracker {
     if (inFlight.length > 0) return inFlight;
     const lastMatchingIndex = this.recent.map(item => item.turnId).lastIndexOf(turnId);
     return lastMatchingIndex >= 0 ? this.recent.slice(lastMatchingIndex) : [];
+  }
+
+  /** Remove one exact item after a definitive local write failure before the
+   * caller re-queues it. Covers both the live in-flight set and a synchronous
+   * backend-exit handoff that may already have moved it to carryOver. */
+  forget(item: InflightItem): void {
+    this.unacked = this.unacked.filter(candidate => candidate !== item);
+    this.carryOver = this.carryOver.filter(candidate => candidate !== item);
   }
 
   /** Retire one exact write whose transport outcome is ambiguous and must not

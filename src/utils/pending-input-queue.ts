@@ -9,7 +9,13 @@ export interface PendingCliInput {
   /** Clean user-authored goal retained separately for recovery handoff. */
   userGoal?: string;
   turnId?: string;
+  replyTurnId?: string;
   dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  /** Explicit positive steer authorization copied from the daemon ledger entry
+   * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
+  codexAppSteerable?: true;
+  queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
   /** Administrative raw command followed by a real model turn (for example,
@@ -72,6 +78,8 @@ export function mergeQueuedCliInput(
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+    || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
     || tail.logicalContent || next.logicalContent
@@ -106,10 +114,11 @@ export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
+  queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
     && !opts.adoptMode
-    && opts.dispatchAttempt !== undefined;
+    && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }
 
 /** Some backends (tmux in particular) reject long launch command strings before
@@ -215,6 +224,8 @@ export function shouldStopPendingBatch(
 ): boolean {
   return written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
+    || !!written.queuedActivationToken
+    || !!next?.queuedActivationToken
     || !!written.vcMeetingImTurnOrigin
     || !!next?.vcMeetingImTurnOrigin;
 }

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import {
+  CodexBridgeQueue,
+  STRUCTURED_SUBMIT_START_GRACE_MS,
+  STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS,
+  STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS,
+} from '../src/services/codex-bridge-queue.js';
 import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
@@ -156,6 +161,7 @@ describe('CodexBridgeQueue', () => {
         ...asstEv(''),
         terminalStatus: 'failed',
         terminalErrorCode: 'grok_turn_error',
+        terminalErrorSummary: 'safe summary',
       },
     ]);
     expect(q.drainEmittable()).toEqual([
@@ -165,6 +171,7 @@ describe('CodexBridgeQueue', () => {
         finalText: '',
         terminalStatus: 'failed',
         terminalErrorCode: 'grok_turn_error',
+        terminalErrorSummary: 'safe summary',
       }),
     ]);
   });
@@ -382,6 +389,35 @@ describe('CodexBridgeQueue', () => {
         finalText: 'replayed answer',
       }),
     ]);
+  });
+
+  it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('same-turn', 'durable prompt', 100, 1);
+    expect(q.beginSubmitVerification('same-turn', 110, 1)).toBe(true);
+    expect(q.dropPendingTurn('same-turn', 1)).toEqual(
+      expect.objectContaining({ dispatchAttempt: 1 }),
+    );
+
+    q.mark('same-turn', 'durable prompt', 200, 2);
+    expect(q.beginSubmitVerification('same-turn', 210, 2)).toBe(true);
+
+    // Old attempt N's delayed callbacks must not fall through to N+1.
+    expect(q.confirmPendingTurn('same-turn', 300, 1)).toBe(false);
+    expect(q.finishSubmitVerification('same-turn', 301, 1)).toBe(false);
+    // Omitting attempt retains ordinary-message compatibility but matches only
+    // an ordinary no-attempt mark, never a durable delivery generation.
+    expect(q.confirmPendingTurn('same-turn', 302)).toBe(false);
+    expect(q.finishSubmitVerification('same-turn', 303)).toBe(false);
+
+    expect(q.peek()).toEqual([
+      expect.objectContaining({
+        turnId: 'same-turn',
+        dispatchAttempt: 2,
+        submitVerificationStartedAtMs: 210,
+      }),
+    ]);
+    expect(q.peek()[0]?.submitConfirmedAtMs).toBeUndefined();
   });
 
   it('user event with no fingerprint match is ignored (history / local input)', () => {
@@ -745,6 +781,143 @@ describe('CodexBridgeQueue', () => {
     const ready = q.drainEmittable()[0];
     expect(ready.finalText).toBe('right session reply');
     expect(ready.sourceSessionId).toBe('h1');
+  });
+
+
+  // ── RPC mode: server-side execution has no local transcript ──────────────
+  // An RPC turn is confirmed by the app-server ack but never reaches started
+  // because no local transcript is ingested. Without rpcActive, the bounded
+  // 20s confirmation lease would expire mid-turn (long-running or approval-
+  // pending turns) → pruneExpiredPreStartHeads drops it → false idle.
+
+  it('rpcActive keeps the lifecycle gate asserted past the confirmation lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-turn', 'run on server', 100);
+    q.confirmPendingTurn('rpc-turn', 200);
+    q.markRpcActive('rpc-turn');
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    // 25s later — well past the 20s confirmation lease — still blocking.
+    now = 26_000;
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.preStartLeaseRemainingMs(now)).toBeUndefined();
+  });
+
+  it('rpcActive turn is never pruned by expiry while active', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-prune', 'server turn', 100);
+    q.markRpcActive('rpc-prune');
+
+    now = 60_000;  // far past any lease
+    const dropped = q.pruneExpiredPreStartHeads(now);
+    expect(dropped).toEqual([]);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.peek().length).toBe(1);
+  });
+
+  it('stopRpcActive releases the lifecycle gate without a terminal edge', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-stop', 'server turn', 100);
+    q.markRpcActive('rpc-stop');
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    expect(q.stopRpcActive('rpc-stop')).toBe(true);
+    expect(q.hasBlockingTurn(now)).toBe(false);
+    // Stopping again is a no-op (returns false).
+    expect(q.stopRpcActive('rpc-stop')).toBe(false);
+  });
+
+  it('stopRpcActive releases only the exact dispatch attempt', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('same-rpc-turn', 'attempt one', 100, 1);
+    q.mark('same-rpc-turn', 'attempt two', 200, 2);
+    expect(q.markRpcActive('same-rpc-turn', 1)).toBe(true);
+    expect(q.markRpcActive('same-rpc-turn', 2)).toBe(true);
+
+    expect(q.stopRpcActive('same-rpc-turn', 1)).toBe(true);
+    expect(q.peek().find(turn => turn.dispatchAttempt === 1)?.rpcActive).toBeUndefined();
+    expect(q.peek().find(turn => turn.dispatchAttempt === 2)?.rpcActive).toBe(true);
+    expect(q.stopRpcActive('same-rpc-turn', 1)).toBe(false);
+    expect(q.stopRpcActive('same-rpc-turn', 2)).toBe(true);
+  });
+
+  it('rpcActive does not block a normal started turn from draining', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('normal', 'local turn', 90);
+    q.mark('rpc', 'server turn', 100);
+    q.markRpcActive('rpc');
+
+    // Normal turn starts and finishes normally.
+    q.ingest([userEv('local turn', 'u-normal', 200)]);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    q.ingest([asstEv('done', 'a-normal', 300)]);
+
+    // Normal turn is emittable; rpc turn still blocks.
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['normal']);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    // After the RPC turn is stopped, it no longer blocks the lifecycle gate.
+    // It remains in the queue as a normal pending turn until its attribution
+    // lease expires (separate from the rpcActive gate).
+    q.stopRpcActive('rpc');
+    expect(q.hasBlockingTurn(now)).toBe(false);
+  });
+
+  it('replays successor events drained during predecessor hydration when its ACK is delayed beyond 5s', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('turn-n', 'first prompt', 100, 1);
+    q.markRpcActive('turn-n', 1);
+    q.ingest([userEv('first prompt', 'u-n', 200)]);
+
+    q.stopRpcActive('turn-n', 1);
+    q.ingest([
+      asstEv('first answer', 'a-n', 300),
+      userEv('second prompt', 'u-n-plus-1', 400),
+      asstEv('second answer', 'a-n-plus-1', 500),
+    ]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-n',
+        dispatchAttempt: 1,
+        finalText: 'first answer',
+      }),
+    ]);
+
+    // turn/start for N+1 was sent at t=350, but its ACK continuation does not
+    // install the mark until t=8,000. The worker preserves t=350 for this exact
+    // awaiting owner, so the pair buffered at t=400/500 is still replayable.
+    // Using the ACK time here would put both events outside the 5s window.
+    now = 8_000;
+    q.mark('turn-n-plus-1', 'second prompt', 350, 2);
+    expect(q.hasTerminalTurn('turn-n-plus-1', 2)).toBe(true);
+    expect(q.markRpcActive('turn-n-plus-1', 2)).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-n-plus-1',
+        dispatchAttempt: 2,
+        finalText: 'second answer',
+      }),
+    ]);
+  });
+
+  it('markRpcActive clears any pending verification/confirmation lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-verify', 'server turn', 100);
+    q.beginSubmitVerification('rpc-verify', 200);
+    // Move past the verification lease so it would normally be prunable.
+    now = 40_000;
+    q.markRpcActive('rpc-verify');
+    // rpcActive takes over from the expired verification lease.
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
   });
 
   it('clearPending wipes queue state', () => {

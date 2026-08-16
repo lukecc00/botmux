@@ -52,7 +52,10 @@ describe('API-only bot mode — boot-time Feishu decoupling (source lock)', () =
     // botHandlers.set stays unconditional (replay paths may read it); only the
     // WSClient start is gated.
     expect(block).toContain('if (!cfg.apiOnly) {');
-    expect(block).toContain('startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers');
+    // The dispatcher start is deferred into a startEventDispatchers thunk (args
+    // split across lines after the PR #597 merge); assert the gated call, not a
+    // single-line arg signature.
+    expect(block).toContain('startEventDispatchers.push(() => startLarkEventDispatcher(');
     expect(block.indexOf('if (!cfg.apiOnly) {'))
       .toBeLessThan(block.indexOf('startLarkEventDispatcher('));
   });
@@ -442,7 +445,17 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // getLoadedConfigPath() is host-frozen; the worker must not re-guess from env.
     const block = region(workerPoolSource, 'apiOnly: botCfg.apiOnly,', 'brand: normalizeBrand(botCfg.brand),');
     expect(block).toContain('loadedBotsConfigPath: getLoadedConfigPath(),');
-    expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay }");
+    // ...and its PROVENANCE travels with it, so the child-pin decision is made
+    // from a host-owned fact instead of an existence probe (see config-dir.ts).
+    expect(block).toContain('loadedBotsConfigProvenance: getLoadedConfigProvenance(),');
+    // Assert the import contents, not one frozen line: pinning the exact string
+    // makes this fail on any unrelated addition to the same import.
+    const importLine = workerPoolSource.match(/import \{[^}]*\} from '\.\.\/bot-registry\.js';/)?.[0];
+    expect(importLine).toBeDefined();
+    for (const sym of ['getBot', 'getAllBots', 'loadBotConfigs', 'resolveBrandLabel',
+      'getLoadedConfigPath', 'getLoadedConfigProvenance', 'resolveUsageDisplay']) {
+      expect(importLine, `missing ${sym}`).toContain(sym);
+    }
   });
 });
 
@@ -494,7 +507,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // after restore, ready line last.
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
     const bindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer(');
-    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions)');
+    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions');
     const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
     const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
     expect(armAt).toBeGreaterThan(0);
@@ -597,14 +610,20 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // arg; call sites resolve via resolveBotmuxWrapperBinDir(opts.env). NO hardcoded
     // $HOME/.botmux/bin and NO runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
-    expect(tmuxSrc).toContain('export function shellWrapperScript(binDir: string)');
-    expect(tmuxSrc).toContain('resolveBotmuxWrapperBinDir(opts.env ?? process.env)');
+    expect(tmuxSrc).toContain("export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh')");
+    expect(tmuxSrc).toContain('const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);');
+    expect(tmuxSrc).toContain(': shellWrapperScript(wrapperBinDir, shellKind);');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
     expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
-    // The other two persistent backends resolve host-side too (not the old const).
-    for (const f of ['src/adapters/backend/tmux-pipe-backend.ts', 'src/adapters/backend/zellij-backend.ts']) {
+    const fishAwarePersistentBackendCalls: Record<string, RegExp> = {
+      'src/adapters/backend/tmux-pipe-backend.ts': /shellWrapperScript\(\s*resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\),\s*shellKindForPath\(shellSpec\.shell\),\s*\)/,
+      'src/adapters/backend/zellij-backend.ts': /shellWrapperScript\(resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\), kind\)/,
+      'src/adapters/backend/zmx-backend.ts': /shellWrapperScript\(wrapperBinDir, shellKind\)/,
+    };
+    for (const [f, callPattern] of Object.entries(fishAwarePersistentBackendCalls)) {
       const src = readFileSync(resolve(f), 'utf8');
-      expect(src, f).toContain('shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env))');
+      expect(src, f).toContain('resolveBotmuxWrapperBinDir(opts.env ?? process.env)');
+      expect(src, f).toMatch(callPattern);
       // No longer IMPORTS or CALLS the old const (a lingering mention in a prose
       // comment is fine — assert the import + call-site are gone, not the word).
       expect(src, f).not.toMatch(/import \{[^}]*\bSHELL_WRAPPER_SCRIPT\b/);

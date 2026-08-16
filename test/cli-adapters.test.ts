@@ -19,7 +19,9 @@ import { codexHome } from '../src/services/codex-paths.js';
 // absolute paths before probing, so absolute pathOverrides never hit this.
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(() => ''),
+  execFileSync: vi.fn(() => ''),
   spawnSync: vi.fn(() => ({ stdout: '', status: 0 })),
+  execFile: vi.fn((_bin, _args, _opts, cb) => { cb(null, '{}'); }),
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
@@ -46,6 +48,8 @@ import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
+import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
+import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -53,7 +57,7 @@ import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js'
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -77,7 +81,7 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
+    if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -93,7 +97,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -548,6 +552,75 @@ describe('mira buildArgs', () => {
   });
 });
 
+describe('dsh buildArgs (runner model)', () => {
+  const adapter = createDshAdapter('/opt/dsh/bin/dsh-jsonrpc-agent');
+
+  it('spawns the node runner and passes the dsh runtime binary', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/dsh-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-dsh');
+    expect(args).toContain('--dsh-bin');
+    expect(args).toContain('/opt/dsh/bin/dsh-jsonrpc-agent');
+    expect(args).toContain('--cwd');
+    expect(args).toContain('/repo/root');
+  });
+
+  it('forwards bot identity, locale and model to the runner', () => {
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: false, botName: 'Monday', botOpenId: 'ou_x', locale: 'zh', model: 'deepseek-v4-pro',
+    });
+    expect(args).toContain('--bot-name');
+    expect(args).toContain('Monday');
+    expect(args).toContain('--bot-open-id');
+    expect(args).toContain('ou_x');
+    expect(args).toContain('--locale');
+    expect(args).toContain('zh');
+    expect(args).toContain('--model');
+    expect(args).toContain('deepseek-v4-pro');
+  });
+
+  it('omits --model when no model is configured', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(args).not.toContain('--model');
+  });
+
+  it('has no portable copy-paste resume command', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the runner prompt indicator', () => {
+    expect(adapter.readyPattern?.test('› ')).toBe(true);
+  });
+
+  it('defers the first prompt until the runner is ready (slow handshake)', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
+  it('does not type ahead (serial turns)', () => {
+    expect(adapter.supportsTypeAhead).not.toBe(true);
+  });
+
+  it('advertises the deepseek model choices', () => {
+    expect(adapter.modelChoices).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+  });
+
+  it('writeInput frames content with the dsh marker', async () => {
+    const written: string[] = [];
+    const pty = {
+      write: (data: string) => { written.push(data); return true; },
+    } as unknown as PtyHandle;
+    const result = await adapter.writeInput!(pty, 'hello dsh', { turnId: 'turn-1' });
+    expect(result).toEqual({ submitted: true, submissionDisposition: 'submitted' });
+    const line = written.join('');
+    expect(line.startsWith('::botmux-dsh:')).toBe(true);
+    const decoded = JSON.parse(Buffer.from(line.slice('::botmux-dsh:'.length).trim(), 'base64').toString('utf8'));
+    expect(decoded.content).toBe('hello dsh');
+    expect(decoded.replyTurnId).toBe('turn-1');
+  });
+});
+
 describe('mir buildArgs (runner model)', () => {
   const adapter = createMirAdapter();
 
@@ -803,6 +876,15 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
+  it('exposes paste-line raw command delivery capability', () => {
+    const rawAdapter = createOpenCodeAdapter('/bin/opencode');
+
+    expect(rawAdapter.rawCommandInputMode).toBe('paste-line');
+    expect(rawAdapter.rawCommandSettleMs).toEqual(expect.any(Number));
+    expect(Number.isFinite(rawAdapter.rawCommandSettleMs)).toBe(true);
+    expect(rawAdapter.rawCommandSettleMs).toBeGreaterThan(0);
+  });
+
   it('does not include session id or resume', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: true });
     expect(args).not.toContain('sess-6');
@@ -825,6 +907,18 @@ describe('pi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
     expect(adapter.altScreen).toBe(true);
+  });
+
+  it('pins the configured model instead of inheriting Pi defaults', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      model: 'custom/long-context-model',
+    });
+    expect(args).toEqual([
+      '--session-id', 'sess-pi',
+      '--model', 'custom/long-context-model',
+    ]);
   });
 });
 
@@ -1322,6 +1416,35 @@ describe('completionPattern', () => {
   });
 });
 
+describe('busyPattern', () => {
+  it('codex matches the active Working status but not idle or single-anchor text', () => {
+    const busy = createCodexAdapter('/bin/codex').busyPattern;
+    expect(busy).toBeDefined();
+    expect(busy!.test('• Working (18s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('› Ask anything                                      97% left')).toBe(false);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+});
+
+describe('idleToBusyPattern', () => {
+  it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
+    const adapter = createCodexAdapter('/bin/codex');
+    const busy = adapter.idleToBusyPattern;
+    expect(busy).toBeDefined();
+    expect(busy!.test('• Working (18s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+  });
+
+  it.each([
+    ['pi', createPiAdapter('/bin/pi')],
+    ['genius', createGeniusAdapter('/bin/genius')],
+    ['grok', createGrokAdapter('/bin/grok')],
+  ])('%s keeps legacy busyPattern semantics and does not opt in', (_name, adapter) => {
+    expect(adapter.idleToBusyPattern).toBeUndefined();
+  });
+});
+
 describe('readyPattern', () => {
   it('claude-code matches prompt indicator', () => {
     const adapter = createClaudeCodeAdapter('/bin/claude');
@@ -1518,6 +1641,7 @@ describe('systemHints', () => {
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
     ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
+    ['reasonix', () => createReasonixAdapter('/bin/reasonix')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -1526,8 +1650,8 @@ describe('systemHints', () => {
     expect(hints.some(h => h.includes('botmux send'))).toBe(true);
   });
 
-  it('traex systemHints declare the exact no-reply protocol', () => {
-    expect(createTraexAdapter('/bin/traex').systemHints.join('\n')).toContain('BOTMUX_NO_REPLY');
+  it('traex systemHints declare the exact nothing-to-send protocol', () => {
+    expect(createTraexAdapter('/bin/traex').systemHints.join('\n')).toContain('BOTMUX_NOTHING_TO_SEND');
   });
 });
 
@@ -1551,6 +1675,7 @@ describe('id property', () => {
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
     ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
+    ['reasonix', () => createReasonixAdapter('/bin/reasonix')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -1617,6 +1742,10 @@ describe('altScreen property', () => {
 
   it('kiro-cli uses alt screen', () => {
     expect(createKiroCliAdapter('/bin/kiro-cli').altScreen).toBe(true);
+  });
+
+  it('reasonix uses alt screen (bubbletea TUI)', () => {
+    expect(createReasonixAdapter('/bin/reasonix').altScreen).toBe(true);
   });
 });
 
@@ -2102,17 +2231,95 @@ describe('kiro-cli buildArgs', () => {
   });
 });
 
-describe('traex/coco sandbox authPaths', () => {
-  it('traex keeps the whole ~/.trae/cli real in the sandbox (codex-based, same SQLite lock hazard)', () => {
-    // traex keeps codex-style state_*.sqlite / logs_*.sqlite + rollout sessions
-    // under ~/.trae/cli; the daemon bridge reads them at the REAL path, and the
-    // overlayfs home lacks the fcntl locks SQLite needs (see codex.ts).
-    const adapter = createTraexAdapter('/bin/traex');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+describe('reasonix buildArgs', () => {
+  const adapter = createReasonixAdapter('/usr/bin/reasonix');
+
+  it('starts a fresh interactive session with --yolo by default', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: false });
+    expect(args).toEqual(['--yolo']);
   });
 
-  it('coco keeps ~/.trae/cli (shared trae state/SQLite) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
+  it('omits --yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: false, disableCliBypass: true });
+    expect(args).toEqual([]);
+  });
+
+  it('injects --model when provided', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: false, model: 'deepseek-flash/deepseek-v4-flash' });
+    expect(args).toEqual(['--yolo', '--model', 'deepseek-flash/deepseek-v4-flash']);
+  });
+
+  it('resumes a specific session id when available', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: true, resumeSessionId: 'rx-native-session' });
+    expect(args).toEqual(['--yolo', '--resume', 'rx-native-session']);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-rx', cliSessionId: 'rx-native-session' }))
+      .toBe('reasonix --resume rx-native-session');
+  });
+
+  it('starts clean and re-arms capture when resume lacks a precise id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: true });
+    expect(args).toEqual(['--yolo']);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-rx' })).toBeNull();
+  });
+
+  it('keeps the initial prompt on stdin (interactive mode has no prompt flag)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-rx', resume: false, initialPrompt: 'hello reasonix' });
+    expect(args).not.toContain('hello reasonix');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('relies on quiescence without a ready pattern', () => {
+    expect(adapter.readyPattern).toBeUndefined();
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBeUndefined();
+  });
+
+  it('binds the Reasonix state and skills root', () => {
+    expect(adapter.authPaths).toEqual(['~/.reasonix']);
+    expect(adapter.skillsDir).toBe('~/.reasonix/skills');
+  });
+
+  it('does not capture on resume spawns (id already persisted)', async () => {
+    const { execFile } = await import('node:child_process');
+    const mockedExec = vi.mocked(execFile);
+    mockedExec.mockClear();
+    const adapter = createReasonixAdapter('/usr/bin/reasonix');
+    adapter.buildArgs({ sessionId: 'sess-rx', resume: true, resumeSessionId: 'session_known' });
+    const pty = {
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(),
+      cliCwd: '/work/proj',
+      cliPid: 12345,
+    } as unknown as PtyHandle;
+    const result = await adapter.writeInput(pty, 'hello');
+    expect(result).toBeUndefined();
+    expect(mockedExec).not.toHaveBeenCalled();
+  });
+});
+
+describe('traex/coco sandbox authPaths', () => {
+  it('traex keeps ~/.trae/cli real (RW SQLite state) and exposes migration markers READ-ONLY (not the whole ~/.trae)', () => {
+    // authPaths (readWrite) stays scoped to cli/ — widening to the whole ~/.trae
+    // would give a chat-driven sandbox RW to sibling hooks/plugins/skills/config
+    // that other bots execute. The first-run "Legacy TRAE CLI data detected"
+    // migration prompt (which wedges goal-mode's human-less PTY) is instead
+    // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
+  });
+
+  it('coco keeps ~/.trae/cli + ~/.cache/coco real (RW) and exposes the same migration markers READ-ONLY', () => {
+    // Coco runs the same traecli binary as traex → same migration prompt; markers
+    // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the
+    // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
     expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
   });
 });
