@@ -7,6 +7,7 @@
  * supported; known Yarn layouts are identified for diagnostics but rejected
  * until their global-dir/bin-dir semantics are handled explicitly.
  */
+import { readdirSync, realpathSync } from 'node:fs';
 import { join, posix, win32 } from 'node:path';
 import { botmuxInstallRoot, managedSourceInstallAt, PERSONAL_UPDATE_REF, PERSONAL_UPDATE_REPO } from './install-info.js';
 

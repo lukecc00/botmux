@@ -140,7 +140,15 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
-import { __testOnly_legacyCodexTranscriptTurnStillActive, forkAdoptWorker, forkWorker, initWorkerPool, sendWorkerInput } from '../src/core/worker-pool.js';
+import {
+  __testOnly_legacyCodexTranscriptTurnStillActive,
+  __testOnly_resetOrdinaryImDeliveries,
+  forkAdoptWorker,
+  forkWorker,
+  initWorkerPool,
+  promoteQueuedActivationTail,
+  sendWorkerInput,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';

@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { BotRow, DeliveryMode, NativeSkillGroup, ProjectTrustMode, SkillPackRow, SkillRow } from './types.js';
+import type {
+  BotRow,
+  DeliveryMode,
+  NativeSkillGroup,
+  ProjectTrustMode,
+  SkillInstallHistoryRow,
+  SkillPackRow,
+  SkillRow,
+} from './types.js';
 
 export interface SkillsData {
   skills: SkillRow[];
   nativeSkillGroups: NativeSkillGroup[];
+  installHistory: SkillInstallHistoryRow[];
   bots: BotRow[];
   /** full pack rows from /api/skill-packs — the single source for pack state */
   packs: SkillPackRow[];
@@ -32,6 +41,7 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
   const mountedRef = useRef(true);
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [nativeSkillGroups, setNativeSkillGroups] = useState<NativeSkillGroup[]>([]);
+  const [installHistory, setInstallHistory] = useState<SkillInstallHistoryRow[]>([]);
   const [bots, setBots] = useState<BotRow[]>([]);
   const [packs, setPacks] = useState<SkillPackRow[]>([]);
   const [trustProjectSkills, setTrustProjectSkills] = useState<ProjectTrustMode>('off');
@@ -63,6 +73,7 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
       if (!mountedRef.current) return;
       setSkills(Array.isArray(skillsBody.skills) ? skillsBody.skills as SkillRow[] : []);
       setNativeSkillGroups(Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups as NativeSkillGroup[] : []);
+      setInstallHistory(Array.isArray(skillsBody.installHistory) ? skillsBody.installHistory as SkillInstallHistoryRow[] : []);
       setBots(Array.isArray(botsBody.bots) ? botsBody.bots as BotRow[] : []);
       // Pack failure semantics: only an explicit 404 (older daemon without the
       // pack API) means "no packs". Any other failure (network, 401/403, 5xx)
@@ -99,7 +110,7 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
   }, [refresh]);
 
   return {
-    skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
+    skills, nativeSkillGroups, installHistory, bots, packs, trustProjectSkills, delivery,
     loading, loadError, packsError, packsKnown, refresh,
     setSkills, setBots, setTrustProjectSkills, setDelivery,
   };

@@ -189,6 +189,7 @@ export async function updateBotCardPrefs(
       ? { ...entry.topicGroupMemory }
       : {};
     if (typeof val.enabled === 'boolean') current.enabled = val.enabled;
+    if (val.provider === 'auto' || val.provider === 'local' || val.provider === 'tencentdb') current.provider = val.provider;
     if (val.injectMode === 'off' || val.injectMode === 'summary' || val.injectMode === 'summary-and-facts') current.injectMode = val.injectMode;
     if (val.updateMode === 'off' || val.updateMode === 'manual' || val.updateMode === 'auto') current.updateMode = val.updateMode;
     if (typeof val.maxPromptChars === 'number' && Number.isInteger(val.maxPromptChars) && val.maxPromptChars > 0) current.maxPromptChars = val.maxPromptChars;
@@ -208,6 +209,24 @@ export async function updateBotCardPrefs(
       if (val.httpLlm.api === 'auto' || val.httpLlm.api === 'responses' || val.httpLlm.api === 'chat-completions') http.api = val.httpLlm.api;
       if (typeof val.httpLlm.timeoutMs === 'number' && Number.isInteger(val.httpLlm.timeoutMs) && val.httpLlm.timeoutMs > 0) http.timeoutMs = val.httpLlm.timeoutMs;
       current.httpLlm = http;
+    }
+    if (val.tencentdb && typeof val.tencentdb === 'object') {
+      const tencentdb = current.tencentdb && typeof current.tencentdb === 'object' ? { ...current.tencentdb } : {};
+      for (const key of ['runtimeDir', 'endpoint', 'apiKey', 'serviceId', 'teamId', 'agentId', 'userId', 'panelUrl'] as const) {
+        const value = val.tencentdb[key];
+        if (typeof value !== 'string') continue;
+        if (value.trim()) tencentdb[key] = value.trim();
+        else delete tencentdb[key];
+      }
+      if (typeof val.tencentdb.maxResults === 'number' && Number.isInteger(val.tencentdb.maxResults) && val.tencentdb.maxResults > 0) {
+        tencentdb.maxResults = Math.min(val.tencentdb.maxResults, 20);
+      }
+      if (typeof val.tencentdb.includePersona === 'boolean') tencentdb.includePersona = val.tencentdb.includePersona;
+      if (typeof val.tencentdb.includeScenes === 'boolean') tencentdb.includeScenes = val.tencentdb.includeScenes;
+      if (typeof val.tencentdb.timeoutMs === 'number' && Number.isInteger(val.tencentdb.timeoutMs) && val.tencentdb.timeoutMs > 0) {
+        tencentdb.timeoutMs = Math.min(val.tencentdb.timeoutMs, 60_000);
+      }
+      current.tencentdb = tencentdb;
     }
     entry.topicGroupMemory = current;
   };
@@ -308,10 +327,7 @@ export async function updateBotCardPrefs(
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
   if (patch.topicGroupMemory !== undefined) {
-    bot.config.topicGroupMemory = {
-      ...(bot.config.topicGroupMemory ?? {}),
-      ...patch.topicGroupMemory,
-    };
+    bot.config.topicGroupMemory = r.result.topicGroupMemory;
   }
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
@@ -323,7 +339,7 @@ export async function updateBotCardPrefs(
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
-    `topicGroupMemory=${r.result.topicGroupMemory.enabled}/${r.result.topicGroupMemory.injectMode}/${r.result.topicGroupMemory.updateMode} ` +
+    `topicGroupMemory=${r.result.topicGroupMemory.enabled}/${r.result.topicGroupMemory.provider}/${r.result.topicGroupMemory.injectMode}/${r.result.topicGroupMemory.updateMode} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

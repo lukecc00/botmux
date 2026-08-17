@@ -109,6 +109,7 @@ export type BotDefaultsRow = {
   autoStartOnNewTopic?: boolean;
   topicGroupMemory?: {
     enabled?: boolean;
+    provider?: 'auto' | 'local' | 'tencentdb';
     injectMode?: 'off' | 'summary' | 'summary-and-facts';
     updateMode?: 'off' | 'manual' | 'auto';
     maxPromptChars?: number;
@@ -120,6 +121,20 @@ export type BotDefaultsRow = {
       model?: string;
       api?: 'auto' | 'responses' | 'chat-completions';
       timeoutMs?: number;
+    };
+    tencentdb?: {
+      runtimeDir?: string;
+      endpoint?: string;
+      apiKey?: string;
+      serviceId?: string;
+      teamId?: string;
+      agentId?: string;
+      userId?: string;
+      maxResults?: number;
+      includePersona?: boolean;
+      includeScenes?: boolean;
+      timeoutMs?: number;
+      panelUrl?: string;
     };
   };
   autoGrantRequestCards?: boolean;

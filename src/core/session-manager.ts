@@ -14,6 +14,8 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliAdapter } from '../adapters/cli/types.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints, buildCodexBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -960,7 +962,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; substituteTrigger?: SubstituteTrigger },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -1044,6 +1046,7 @@ export function buildNewTopicPrompt(
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
   if (roleBlock) parts.push(roleBlock);
+  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
   if (topicGroupMemoryBlock) parts.push(topicGroupMemoryBlock);
   if (whiteboardBlock) parts.push(whiteboardBlock);
   if (chatContextPolicyBlock) parts.push(chatContextPolicyBlock);
@@ -1128,7 +1131,7 @@ export function buildNewTopicCliInput(
     content,
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock,
+      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       topicGroupMemoryBlock,
       whiteboardBlock,
       senderBlock,
@@ -1152,7 +1155,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'topicGroupMemory' | 'reminder' | 'codexDelivery' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1171,6 +1174,7 @@ type FollowUpOpts = {
   larkAppId?: string;
   chatId?: string;
   whiteboardId?: string;
+  topicGroupMemoryBlock?: string;
   substituteTrigger?: SubstituteTrigger;
   codexAppText?: string;
   codexAppApplicationContext?: string;
@@ -1187,9 +1191,10 @@ type FollowUpOpts = {
 function buildFollowUpBlocks(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
-): string {
-  const parts: string[] = [];
+  opts?: FollowUpOpts,
+  hookMode = false,
+): Array<{ key: FollowUpBlockKey; text: string }> {
+  const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const topicGroupMemoryBlock = opts?.topicGroupMemoryBlock ?? '';
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
@@ -1203,9 +1208,10 @@ function buildFollowUpBlocks(
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-  if (roleBlock) parts.push(roleBlock);
-  if (topicGroupMemoryBlock) parts.push(topicGroupMemoryBlock);
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (topicGroupMemoryBlock) blocks.push({ key: 'topicGroupMemory', text: topicGroupMemoryBlock });
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -1213,15 +1219,22 @@ function buildFollowUpBlocks(
     // (config.noVisibleOutputHint, default OFF); otherwise the reminder is
     // byte-for-byte the pre-feature baseline. Live-read so a Settings flip
     // applies to the next follow-up turn without a daemon restart.
-    const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
-    parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    // hook 模式（#794）：reminder 经 system-reminder 离带注入，命令式措辞可能触发
+    // 模型的注入防御被表面化，改用描述式的 reminder_hook。
+    const reminderKey = hookMode
+      ? 'ai.followup.reminder_hook'
+      : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
+    const reminder = t(reminderKey, undefined, opts?.locale);
+    blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
     if (opts?.cliId === 'codex' || opts?.cliId === 'codex-app') {
-      parts.push(`<codex_delivery>${t('ai.followup.codex_structured_delivery', undefined, opts?.locale)}</codex_delivery>`);
+      blocks.push({ key: 'codexDelivery', text: `<codex_delivery>${t('ai.followup.codex_structured_delivery', undefined, opts?.locale)}</codex_delivery>` });
     }
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
+  blocks.push({ key: 'userMessage', text: `<user_message>
+${content}
+</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
@@ -1335,7 +1348,7 @@ function effectivePromptHookConfigPath(
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
 ): CliTurnPayload {
   // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
@@ -1373,7 +1386,7 @@ export function buildFollowUpCliInput(
     content: legacyContent,
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
-      roleBlock,
+      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       topicGroupMemoryBlock,
       whiteboardBlock,
       senderBlock,
@@ -1712,8 +1725,12 @@ export async function staggeredRecoveryFork(
 
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
-  options: { recoverCodexHandoff?: (ds: DaemonSession) => void | Promise<void> } = {},
+  options: {
+    recoverCodexHandoff?: (ds: DaemonSession) => void | Promise<void>;
+    quarantinedSessionIds?: ReadonlySet<string>;
+  } = {},
 ): Promise<void> {
+  const quarantinedSessionIds = options.quarantinedSessionIds ?? new Set<string>();
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
@@ -3329,7 +3346,7 @@ async function forkOrShowRepoCard(
       larkAppId,
       chatId: ds.chatId,
       whiteboardId: ds.session.whiteboardId,
-      topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds),
+      topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds, userContent),
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
@@ -3410,6 +3427,7 @@ async function forkOrShowRepoCard(
     ds.pendingCodexAppText = undefined;
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
+    ds.pendingTopicGroupMemoryBlock = undefined;
     ds.pendingChatContext = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
@@ -3663,15 +3681,11 @@ export async function activateQueuedSession(
     if (ds.session.queuedActivationPending
       || (ds.session.queuedActivationTail?.length ?? 0) > 0
       || ds.session.pendingRepoSetup) {
-      // A contradictory live+queued snapshot can occur around recovery or a
-      // stale dashboard action. Never reinterpret the live child as proof that
-      // its durable activation/setup owner crossed the adapter ACK boundary.
       logger.warn(
         `[${ds.session.sessionId.substring(0, 8)}] Ignored queued activation cleanup while durable ownership remains`,
       );
       return { ok: true };
     }
-    // 不该发生（queued 一定 worker:null），但保险：清标记即可。
     ds.session.queued = false;
     ds.session.queuedPrompt = undefined;
     ds.session.queuedCodexAppText = undefined;
@@ -3687,29 +3701,97 @@ export async function activateQueuedSession(
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
-  const content = ds.session.queuedPrompt ?? ds.pendingPrompt ?? '';
-  // A parked dashboard task may have crossed a daemon restart. Restore the
-  // persisted clean-input sidecar before clearing the durable backlog fields;
-  // forkOrShowRepoCard will carry it through either immediate fork or /repo.
-  ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
-  ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
-  ds.pendingAttachments ??= ds.session.queuedAttachments;
-  ds.session.queued = false;
-  ds.session.queuedPrompt = undefined;
-  ds.session.queuedCodexAppText = undefined;
-  ds.session.queuedCodexAppMessageContext = undefined;
-  ds.session.queuedAttachments = undefined;
-  ds.pendingPrompt = undefined;
-  // `backlog` is a system-authored parked marker. Starting from the button or
-  // inbound message must release it back to runtime-derived placement, or the
-  // card stays pinned in-progress forever after the turn becomes idle. A real
-  // drag into in_progress opts into preserving the user's manual placement.
-  if (ds.session.kanbanColumn === 'backlog') {
-    ds.session.kanbanColumn = options.preserveManualColumn ? 'in_progress' : undefined;
-  }
-  sessionStore.updateSession(ds.session);
-  // 起会话或弹 /repo 卡片（没钉目录时）。content 已是包装好的首轮内容。
-  await forkOrShowRepoCard(ds, content);
-  logger.info(`[createSession] activated queued session ${ds.session.sessionId.substring(0, 8)} (bot=${ds.larkAppId}, pendingRepo=${!!ds.pendingRepo})`);
-  return { ok: true };
+
+  // Repo selection / auto-worktree already owns this activation attempt. Keep
+  // the durable queued payload as its crash-recovery journal and make repeated
+  // dashboard starts idempotent instead of posting a second picker/build.
+  if (ds.pendingRepo) return { ok: true };
+
+  const activate = async (): Promise<{ ok: boolean; error?: string }> => {
+    if (!ds.session.queued) {
+      return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
+    }
+    const content = ds.session.queuedPrompt ?? ds.pendingPrompt ?? '';
+    // Preserve the durable queued payload until fork or pendingRepo setup has
+    // succeeded. Ordinary inbound routing does not take the key lock, so the
+    // runtime reservation must also be visible throughout every await.
+    ds.initialStartPending = true;
+    ds.pendingPrompt = content;
+    ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
+    ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
+    ds.pendingAttachments ??= ds.session.queuedAttachments;
+    let outcome: 'forked' | 'pending_repo';
+    try {
+      const exactRetry = ds.session.queuedActivationInput;
+      if (exactRetry) {
+        forkWorker(ds, exactRetry, {
+          resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+          turnId: ds.session.queuedActivationTurnId,
+          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+        });
+        outcome = 'forked';
+      } else {
+        outcome = await forkOrShowRepoCard(ds, content);
+      }
+    } catch (err) {
+      // The backlog remains authoritative and retryable. Undo only transient
+      // route state installed by this failed attempt; never discard the opening
+      // prompt/sidecar before a worker or repo picker accepted it.
+      ds.initialStartPending = false;
+      ds.pendingRepo = false;
+      ds.repoCardMessageId = undefined;
+      ds.pendingPrompt = content;
+      return { ok: false, error: (err as Error)?.message ?? 'start_failed' };
+    }
+
+    // Ownership has transferred to a worker or pending-repo flow. Nothing
+    // below this point may advertise a retryable activation failure.
+    const backlogColumn = ds.session.kanbanColumn === 'backlog';
+    if (outcome === 'forked') {
+      ds.session.queued = false;
+      ds.session.queuedAttachments = undefined;
+      // A plain synchronous fork has no durable adapter-ACK owner, so its
+      // backlog journal can be retired immediately. Codex App and other
+      // durable activation paths keep the exact payload until submission ACK.
+      const isCodexApp = getBot(ds.larkAppId).config.cliId === 'codex-app';
+      if (!isCodexApp
+        && !ds.session.queuedActivationPending
+        && (ds.session.queuedActivationTail?.length ?? 0) === 0) {
+        ds.session.queuedPrompt = undefined;
+        ds.session.queuedCodexAppText = undefined;
+        ds.session.queuedCodexAppMessageContext = undefined;
+      }
+    }
+    // pending_repo deliberately retains queued + queuedPrompt: pendingPrompt
+    // is runtime-only, so clearing the durable copy here would lose the first
+    // turn if the daemon dies before repo selection/worktree commit forks.
+    if (backlogColumn) ds.session.kanbanColumn = 'in_progress';
+    try {
+      sessionStore.updateSession(ds.session);
+      // Button/start activation is runtime-derived rather than a manual board
+      // placement. Clear the transitional in_progress marker only after the
+      // ownership metadata above is durable; drag/drop explicitly preserves it.
+      if (backlogColumn && outcome === 'forked' && !options.preserveManualColumn) {
+        ds.session.kanbanColumn = undefined;
+        sessionStore.updateSession(ds.session);
+      }
+    } catch (err) {
+      logger.error(
+        `[createSession] queued activation metadata persistence failed after ownership transfer: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    logger.info(`[createSession] activated queued session ${ds.session.sessionId.substring(0, 8)} (bot=${ds.larkAppId}, pendingRepo=${!!ds.pendingRepo})`);
+    return { ok: true };
+  };
+
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return activate();
+  const key = activeSessionKey(ds);
+  return withActiveSessionKeyLock(registry, key, async () => {
+    if (registry.get(key) !== ds || ds.session.status !== 'active') {
+      return { ok: false, error: 'session_not_active' };
+    }
+    return activate();
+  });
 }

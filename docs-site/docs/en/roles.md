@@ -89,7 +89,7 @@ On the **Team** panel of `botmux dashboard`, you can invite **someone else's dep
 
 ## Role Switch
 
-> ⚠️ Advanced feature — requires deploying a "role library" first, and currently supports Claude Code only. Deployment steps are in the [role-system deploy runbook](https://github.com/deepcoldy/botmux/blob/master/docs/roles/deploy-runbook.md); the below covers **how end users use it once deployed**.
+> ⚠️ Advanced feature — requires deploying a "role library" first, and currently supports Claude Code only. Deployment steps are in the [role-system deploy runbook](../../../docs/roles/deploy-runbook.md); the below covers **how end users use it once deployed**.
 
 Unlike `/role` above (a single persona, overridable per group), **role switch** gives one bot **multiple full roles**, each with its own persona **and independent memory** — switch to "After-sales" and it carries the after-sales persona plus memory accumulated only for after-sales; switch to "PM" and it's a whole different set. Roles take effect **per topic**; new topics start from the default role.
 

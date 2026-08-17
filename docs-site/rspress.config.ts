@@ -2,12 +2,6 @@ import { defineConfig } from '@rspress/core';
 import { pluginLlms } from '@rspress/plugin-llms';
 
 const docsBase = process.env.BOTMUX_DOCS_BASE || '/';
-// Rspress resolves public assets against `base` when emitting HTML. Keeping
-// the favicon root-relative avoids a duplicated docs/public/botmux lookup;
-// the navbar logo itself needs the public base included in its emitted URL.
-const faviconPath = '/botmux-logo.png';
-const productLogoPath = `${docsBase.replace(/\/+$/, '')}/botmux-logo.png`;
-const socialLogoUrl = 'https://deepcoldy.github.io/botmux/botmux-logo.png';
 
 const zhSidebar = [
   {
@@ -179,42 +173,30 @@ export default defineConfig({
   root: 'docs',
   base: docsBase,
   lang: 'zh',
-  title: 'botmux 文档',
+  title: 'AI CLI 文档',
   description: '飞书话题群 ↔ AI 编程 CLI 桥接',
-  icon: faviconPath,
-  logo: productLogoPath,
-  logoText: 'botmux 文档',
   // llms.txt 支持：产出 /llms.txt（索引）+ /llms-full.txt（全文），并为每篇文档
   // 生成 .md 纯文本版，方便 AI / LLM 抓取本站内容（AI 友好）。
   plugins: [pluginLlms()],
   // 多语言：zh 为默认语（无前缀），en 走 /en/ 前缀
   locales: [
-    { lang: 'zh', label: '简体中文', title: 'botmux 文档', description: '飞书话题群 ↔ AI 编程 CLI 桥接' },
-    { lang: 'en', label: 'English', title: 'botmux Docs', description: 'Bridge Lark topic groups to AI coding CLIs' },
+    { lang: 'zh', label: '简体中文', title: 'AI CLI 文档', description: '飞书话题群 ↔ AI 编程 CLI 桥接' },
+    { lang: 'en', label: 'English', title: 'AI CLI Docs', description: 'Bridge Lark topic groups to AI coding CLIs' },
   ],
   // og:title / og:description 由 rspress 按页自动生成，这里只补它不处理的
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
-    ['meta', { property: 'og:image', content: socialLogoUrl }],
-    ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-    ['meta', { name: 'twitter:image', content: socialLogoUrl }],
+    ['meta', { name: 'twitter:card', content: 'summary' }],
     ['meta', { name: 'theme-color', content: '#646CEA' }],
   ],
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },
   builderConfig: {
-    // 默认（妙搭发布）：static 走 jsDelivr CDN。GitHub Pages 发布时用 BOTMUX_DOCS_ASSET_PREFIX
-    // 覆盖成同源子路径（Pages 原生服务 static，无需 CDN）。
-    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v29/" },
+    // 默认使用当前文档基址，不依赖上游仓库。若托管平台只服务 HTML，
+    // 发布方可显式设置 BOTMUX_DOCS_ASSET_PREFIX 指向自己的静态资源 CDN。
+    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || docsBase },
   },
   themeConfig: {
-    editLink: {
-      docRepoBaseUrl: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs',
-    },
-    socialLinks: [
-      { icon: 'github', mode: 'link', content: 'https://github.com/deepcoldy/botmux' },
-    ],
     lastUpdated: true,
     locales: [
       {

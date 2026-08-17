@@ -22,6 +22,10 @@ export interface PendingCliInput {
    * Codex /compact handoff). Wait for a genuine prompt instead of steering
    * this turn into the still-running command. */
   requireIdle?: boolean;
+  /** Per-item at-most-once marker: never replay this input onto an
+   * auto-restarted CLI. It is deliberately scoped to the keyed turn rather
+   * than the whole session so ordinary follow-ups remain recoverable. */
+  noReplay?: boolean;
 }
 
 /**

@@ -2,7 +2,24 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, classifyCodexTerminalDiagnostic, isCodexAbnormalTerminationOutput, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import {
+  CODEX_AUTH_ERROR_CODE,
+  CODEX_INVALID_REQUEST_ERROR_CODE,
+  CODEX_RATE_LIMIT_ERROR_CODE,
+  drainCodexRollout,
+  codexSessionIdFromRolloutPath,
+  findCodexRolloutBySessionId,
+  findCodexSessionIdByBotmuxSessionId,
+  codexHistorySidIsOwned,
+  isCodexRateLimitEvent,
+  splitCodexEventsByCutoff,
+  extractLastCodexTurn,
+  scanCodexThreadSettings,
+  readLatestCodexRuntime,
+  classifyCodexTerminalDiagnostic,
+  isCodexAbnormalTerminationOutput,
+  type CodexBridgeEvent,
+} from '../src/services/codex-transcript.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 let dir: string;
@@ -25,16 +42,22 @@ function userResponseItem(text: string, ts = '2026-04-29T07:00:00.000Z') {
 }
 
 function assistantFinalResponseItem(text: string, ts = '2026-04-29T07:00:01.000Z') {
+  // Codex >=0.146 closes a turn with event_msg/task_complete. Assistant
+  // response_item records (including old phase=final_answer records) are no
+  // longer sufficient to establish the terminal boundary.
   return {
     timestamp: ts,
-    type: 'response_item',
+    type: 'event_msg',
     payload: {
-      type: 'message',
-      role: 'assistant',
-      phase: 'final_answer',
-      content: [{ type: 'output_text', text }],
+      type: 'task_complete',
+      turn_id: `turn-${ts}`,
+      last_agent_message: text,
     },
   };
+}
+
+function assistantFinalMessageResponseItem(text: string, ts = '2026-04-29T07:00:01.000Z') {
+  return assistantMessageResponseItem(text, 'final_answer', ts);
 }
 
 /** An assistant `response_item` message — mid-turn OR final, both phase-less in
@@ -364,7 +387,7 @@ describe('drainCodexRollout', () => {
   it('extracts user (response_item) + assistant_final (task_complete)', () => {
     writeFileSync(path,
       ev(userResponseItem('hello there')) +
-      ev(assistantFinalResponseItem('hi back')) +
+      ev(assistantFinalMessageResponseItem('hi back')) +
       ev(taskComplete('hi back')));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(2);
@@ -390,7 +413,7 @@ describe('drainCodexRollout', () => {
   it('extracts assistant phase=commentary as clean progress, separate from final output', () => {
     writeFileSync(path,
       ev(assistantMessageResponseItem('已完成修复，正在跑边界测试。', 'commentary'))
-      + ev(assistantFinalResponseItem('done'))
+      + ev(assistantFinalMessageResponseItem('done'))
       + ev(taskComplete('done')),
     );
     expect(drainCodexRollout(path, 0).events).toEqual([
@@ -825,7 +848,7 @@ describe('drainCodexRollout', () => {
   it('byte-offset stable: re-drain from newOffset returns no events', () => {
     writeFileSync(path,
       ev(userResponseItem('first')) +
-      ev(assistantFinalResponseItem('reply')) +
+      ev(assistantFinalMessageResponseItem('reply')) +
       ev(taskComplete('reply')));
     const first = drainCodexRollout(path, 0);
     const second = drainCodexRollout(path, first.newOffset);
@@ -837,7 +860,7 @@ describe('drainCodexRollout', () => {
     writeFileSync(path, ev(userResponseItem('first')));
     const r1 = drainCodexRollout(path, 0);
     expect(r1.events).toHaveLength(1);
-    appendFileSync(path, ev(assistantFinalResponseItem('reply')));
+    appendFileSync(path, ev(assistantFinalMessageResponseItem('reply')));
     const r2 = drainCodexRollout(path, r1.newOffset);
     expect(r2.events).toEqual([]);
 
@@ -854,9 +877,9 @@ describe('drainCodexRollout', () => {
 
     writeFileSync(path,
       ev(userResponseItem('long dashboard fix'))
-      + ev(assistantFinalResponseItem('Handoff Summary\n\nPartial progress only.', '2026-04-29T07:10:00.000Z'))
+      + ev(assistantFinalMessageResponseItem('Handoff Summary\n\nPartial progress only.', '2026-04-29T07:10:00.000Z'))
       + ev({ timestamp: '2026-04-29T07:10:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } })
-      + ev(assistantFinalResponseItem('Handoff Summary\n\nStill not final.', '2026-04-29T07:20:00.000Z'))
+      + ev(assistantFinalMessageResponseItem('Handoff Summary\n\nStill not final.', '2026-04-29T07:20:00.000Z'))
       + ev({ timestamp: '2026-04-29T07:20:00.010Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
     );
     const beforeFinal = drainCodexRollout(path, 0);
@@ -890,7 +913,7 @@ describe('drainCodexRollout', () => {
     expect(q.drainEmittable()).toEqual([]);
 
     appendFileSync(path,
-      ev(assistantFinalResponseItem('真正最终结果', '2026-04-29T07:30:00.000Z'))
+      ev(assistantFinalMessageResponseItem('真正最终结果', '2026-04-29T07:30:00.000Z'))
       + ev(taskComplete('真正最终结果', '2026-04-29T07:30:00.010Z')),
     );
     const afterFinal = drainCodexRollout(path, beforeFinal.newOffset);
@@ -928,7 +951,7 @@ describe('drainCodexRollout', () => {
   it('truncated file (size < fromOffset) re-drains from top', () => {
     writeFileSync(path,
       ev(userResponseItem('original message that is reasonably long for offset')) +
-      ev(assistantFinalResponseItem('long original answer to take up bytes')) +
+      ev(assistantFinalMessageResponseItem('long original answer to take up bytes')) +
       ev(taskComplete('long original answer to take up bytes')));
     const r1 = drainCodexRollout(path, 0);
     // Simulate truncation: rewrite with strictly shorter content so the new
@@ -1177,4 +1200,3 @@ describe('readLatestCodexRuntime (attach bootstrap)', () => {
     expect(readLatestCodexRuntime(path)).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' });
   });
 });
-

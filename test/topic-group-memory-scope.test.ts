@@ -40,15 +40,25 @@ describe('topic-group memory scope', () => {
 
   it('uses the documented 8k injection and 10k summary hard limits', () => {
     expect(DEFAULT_TOPIC_GROUP_MEMORY_CONFIG).toMatchObject({
+      provider: 'auto',
       maxPromptChars: 8_000,
       maxSummaryChars: 10_000,
+      tencentdb: {
+        endpoint: 'http://127.0.0.1:8420',
+        teamId: 'botmux-topic-{scopeHash}',
+        agentId: 'botmux-{appHash}',
+      },
     });
     expect(resolveTopicGroupMemoryConfig(normalizeTopicGroupMemoryConfig({
+      provider: 'tencentdb',
       maxPromptChars: 99_000,
       maxSummaryChars: 99_000,
+      tencentdb: { maxResults: 99, timeoutMs: 999_999 },
     }))).toMatchObject({
+      provider: 'tencentdb',
       maxPromptChars: 8_000,
       maxSummaryChars: 10_000,
+      tencentdb: { maxResults: 20, timeoutMs: 60_000 },
     });
   });
 });

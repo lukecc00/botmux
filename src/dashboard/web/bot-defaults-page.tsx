@@ -39,7 +39,15 @@ import {
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, chatDisplayTitle, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { botAvatarHtml, chatDisplayTitle, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
+import {
+  DEFAULT_GRANT_DURATION_MS,
+  DEFAULT_GRANT_QUOTA,
+  GRANT_DURATION_OPTIONS,
+  MAX_GRANT_QUOTA,
+} from '../../services/grant-policy.js';
+import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -93,6 +101,19 @@ function runtimeDraftFromBot(bot: Pick<BotDefaultsRow, 'cliRuntime' | 'cliPathOv
       ? runtime.update.packageName
       : '',
   };
+}
+
+function safeHttpExternalUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+      || !!parsed.username || !!parsed.password) return undefined;
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 type BotProfileRoleItem = {
@@ -798,7 +819,7 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile bd-tile-wide"><TopicGroupMemorySection bot={bot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
@@ -4055,6 +4076,9 @@ function TopicGroupMemorySection(props: {
   const tr = useT();
   const current = props.bot.topicGroupMemory ?? {};
   const [enabled, setEnabled] = useState(current.enabled === true);
+  const [provider, setProvider] = useState<'auto' | 'local' | 'tencentdb'>(
+    current.provider === 'local' || current.provider === 'tencentdb' ? current.provider : 'auto',
+  );
   const [injectMode, setInjectMode] = useState<'off' | 'summary' | 'summary-and-facts'>(
     current.injectMode === 'off' || current.injectMode === 'summary-and-facts' ? current.injectMode : 'summary',
   );
@@ -4071,6 +4095,19 @@ function TopicGroupMemorySection(props: {
     current.httpLlm?.api === 'responses' || current.httpLlm?.api === 'chat-completions' ? current.httpLlm.api : 'auto',
   );
   const [httpTimeoutMs, setHttpTimeoutMs] = useState(String(current.httpLlm?.timeoutMs ?? 60000));
+  const [tencentRuntimeDir, setTencentRuntimeDir] = useState(current.tencentdb?.runtimeDir ?? '~/harness_ai/heavy_duty_tools/tencentdb-agent-memory-runtime');
+  const [tencentEndpoint, setTencentEndpoint] = useState(current.tencentdb?.endpoint ?? 'http://127.0.0.1:8420');
+  const [tencentApiKey, setTencentApiKey] = useState(current.tencentdb?.apiKey ?? 'local');
+  const [tencentServiceId, setTencentServiceId] = useState(current.tencentdb?.serviceId ?? 'botmux-local');
+  const [tencentTeamId, setTencentTeamId] = useState(current.tencentdb?.teamId ?? 'botmux-topic-{scopeHash}');
+  const [tencentAgentId, setTencentAgentId] = useState(current.tencentdb?.agentId ?? 'botmux-{appHash}');
+  const [tencentUserId, setTencentUserId] = useState(current.tencentdb?.userId ?? 'topic-group-shared');
+  const [tencentMaxResults, setTencentMaxResults] = useState(String(current.tencentdb?.maxResults ?? 5));
+  const [tencentIncludePersona, setTencentIncludePersona] = useState(current.tencentdb?.includePersona !== false);
+  const [tencentIncludeScenes, setTencentIncludeScenes] = useState(current.tencentdb?.includeScenes !== false);
+  const [tencentTimeoutMs, setTencentTimeoutMs] = useState(String(current.tencentdb?.timeoutMs ?? 10000));
+  const [tencentPanelUrl, setTencentPanelUrl] = useState(current.tencentdb?.panelUrl ?? '');
+  const tencentPanelHref = useMemo(() => safeHttpExternalUrl(tencentPanelUrl), [tencentPanelUrl]);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
   const [memories, setMemories] = useState<TopicGroupMemoryStats[]>([]);
@@ -4082,6 +4119,7 @@ function TopicGroupMemorySection(props: {
   useEffect(() => {
     const next = props.bot.topicGroupMemory ?? {};
     setEnabled(next.enabled === true);
+    setProvider(next.provider === 'local' || next.provider === 'tencentdb' ? next.provider : 'auto');
     setInjectMode(next.injectMode === 'off' || next.injectMode === 'summary-and-facts' ? next.injectMode : 'summary');
     setUpdateMode(next.updateMode === 'off' || next.updateMode === 'manual' ? next.updateMode : 'auto');
     setMaxPromptChars(String(next.maxPromptChars ?? 8000));
@@ -4092,6 +4130,18 @@ function TopicGroupMemorySection(props: {
     setHttpModel(next.httpLlm?.model ?? '');
     setHttpApi(next.httpLlm?.api === 'responses' || next.httpLlm?.api === 'chat-completions' ? next.httpLlm.api : 'auto');
     setHttpTimeoutMs(String(next.httpLlm?.timeoutMs ?? 60000));
+    setTencentRuntimeDir(next.tencentdb?.runtimeDir ?? '~/harness_ai/heavy_duty_tools/tencentdb-agent-memory-runtime');
+    setTencentEndpoint(next.tencentdb?.endpoint ?? 'http://127.0.0.1:8420');
+    setTencentApiKey(next.tencentdb?.apiKey ?? 'local');
+    setTencentServiceId(next.tencentdb?.serviceId ?? 'botmux-local');
+    setTencentTeamId(next.tencentdb?.teamId ?? 'botmux-topic-{scopeHash}');
+    setTencentAgentId(next.tencentdb?.agentId ?? 'botmux-{appHash}');
+    setTencentUserId(next.tencentdb?.userId ?? 'topic-group-shared');
+    setTencentMaxResults(String(next.tencentdb?.maxResults ?? 5));
+    setTencentIncludePersona(next.tencentdb?.includePersona !== false);
+    setTencentIncludeScenes(next.tencentdb?.includeScenes !== false);
+    setTencentTimeoutMs(String(next.tencentdb?.timeoutMs ?? 10000));
+    setTencentPanelUrl(next.tencentdb?.panelUrl ?? '');
   }, [props.bot.topicGroupMemory]);
 
   const memoryBaseUrl = `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-group-memory`;
@@ -4277,10 +4327,58 @@ function TopicGroupMemorySection(props: {
     });
   }
 
+  async function saveTencentDb(): Promise<void> {
+    const maxResults = Number(tencentMaxResults);
+    const timeoutMs = Number(tencentTimeoutMs);
+    let endpoint: URL;
+    try {
+      endpoint = new URL(tencentEndpoint.trim());
+    } catch {
+      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryTencentInvalid')}` });
+      return;
+    }
+    const loopback = endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]'
+      || /^127(?:\.\d{1,3}){3}$/u.test(endpoint.hostname);
+    if ((endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback))
+      || !!endpoint.username || !!endpoint.password || !!endpoint.search || !!endpoint.hash
+      || !tencentRuntimeDir.trim() || !tencentApiKey.trim() || !tencentServiceId.trim()
+      || !tencentTeamId.trim() || !tencentAgentId.trim() || !tencentUserId.trim()
+      || !Number.isInteger(maxResults) || maxResults < 1 || maxResults > 20
+      || !Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000) {
+      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryTencentInvalid')}` });
+      return;
+    }
+    if (tencentPanelUrl.trim() && !tencentPanelHref) {
+      setStatus({ text: `✗ ${tr('botDefaults.topicGroupMemoryTencentInvalid')}` });
+      return;
+    }
+    await save({
+      tencentdb: {
+        runtimeDir: tencentRuntimeDir.trim(),
+        endpoint: endpoint.toString().replace(/\/$/u, ''),
+        apiKey: tencentApiKey.trim(),
+        serviceId: tencentServiceId.trim(),
+        teamId: tencentTeamId.trim(),
+        agentId: tencentAgentId.trim(),
+        userId: tencentUserId.trim(),
+        maxResults,
+        includePersona: tencentIncludePersona,
+        includeScenes: tencentIncludeScenes,
+        timeoutMs,
+        panelUrl: tencentPanelHref ?? '',
+      },
+    });
+  }
+
   const injectOptions: DropdownFieldOption<'off' | 'summary' | 'summary-and-facts'>[] = [
     { value: 'off', label: tr('botDefaults.topicGroupMemoryInjectOff') },
     { value: 'summary', label: tr('botDefaults.topicGroupMemoryInjectSummary') },
     { value: 'summary-and-facts', label: tr('botDefaults.topicGroupMemoryInjectFacts') },
+  ];
+  const providerOptions: DropdownFieldOption<'auto' | 'local' | 'tencentdb'>[] = [
+    { value: 'auto', label: tr('botDefaults.topicGroupMemoryProviderAuto') },
+    { value: 'tencentdb', label: tr('botDefaults.topicGroupMemoryProviderTencent') },
+    { value: 'local', label: tr('botDefaults.topicGroupMemoryProviderLocal') },
   ];
   const updateOptions: DropdownFieldOption<'off' | 'manual' | 'auto'>[] = [
     { value: 'off', label: tr('botDefaults.topicGroupMemoryUpdateOff') },
@@ -4318,6 +4416,22 @@ function TopicGroupMemorySection(props: {
           void save({ enabled: next }).then(ok => { if (!ok) setEnabled(previous); });
         }}
       />
+      <div className="bd-row tgm-memory-settings-grid">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.topicGroupMemoryProviderHelp')}>{tr('botDefaults.topicGroupMemoryProvider')}</FieldTitle>
+          <DropdownField
+            dataInput="topicGroupMemoryProvider"
+            value={provider}
+            disabled={busy}
+            options={providerOptions}
+            onChange={next => {
+              const previous = provider;
+              setProvider(next);
+              void save({ provider: next }).then(ok => { if (!ok) setProvider(previous); });
+            }}
+          />
+        </div>
+      </div>
       <div className="bd-row tgm-memory-settings-grid">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.topicGroupMemoryInjectHelp')}>{tr('botDefaults.topicGroupMemoryInjectMode')}</FieldTitle>
@@ -4363,6 +4477,80 @@ function TopicGroupMemorySection(props: {
           {tr('botDefaults.save')}
         </button>
         <StatusSpan status={status} attr={{ 'data-topic-group-memory-status': '' }} />
+      </div>
+      <div className="bd-subsection tgm-memory-tencentdb">
+        <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryTencentTitle')}</h4>
+        <p className="bd-section-help">{tr('botDefaults.topicGroupMemoryTencentHelp')}</p>
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentRuntimeDir')}</span>
+            <input type="text" value={tencentRuntimeDir} disabled={busy} onChange={event => setTencentRuntimeDir(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentEndpoint')}</span>
+            <input type="url" value={tencentEndpoint} disabled={busy} onChange={event => setTencentEndpoint(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentApiKey')}</span>
+            <input type="password" autoComplete="new-password" value={tencentApiKey} disabled={busy} onChange={event => setTencentApiKey(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentServiceId')}</span>
+            <input type="text" value={tencentServiceId} disabled={busy} onChange={event => setTencentServiceId(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentTeamId')}</span>
+            <input type="text" value={tencentTeamId} disabled={busy} onChange={event => setTencentTeamId(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentAgentId')}</span>
+            <input type="text" value={tencentAgentId} disabled={busy} onChange={event => setTencentAgentId(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentUserId')}</span>
+            <input type="text" value={tencentUserId} disabled={busy} onChange={event => setTencentUserId(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentMaxResults')}</span>
+            <input type="number" min="1" max="20" value={tencentMaxResults} disabled={busy} onChange={event => setTencentMaxResults(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="bd-row tgm-memory-settings-grid">
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentTimeout')}</span>
+            <input type="number" min="1000" max="60000" step="1000" value={tencentTimeoutMs} disabled={busy} onChange={event => setTencentTimeoutMs(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>{tr('botDefaults.topicGroupMemoryTencentPanelUrl')}</span>
+            <input type="url" value={tencentPanelUrl} disabled={busy} placeholder="http://127.0.0.1:3000" onChange={event => setTencentPanelUrl(event.currentTarget.value)} />
+          </label>
+        </div>
+        <ToggleRow
+          checked={tencentIncludePersona}
+          disabled={busy}
+          dataAction="toggle-topic-group-memory-tencent-persona"
+          title={tr('botDefaults.topicGroupMemoryTencentPersona')}
+          help={tr('botDefaults.topicGroupMemoryTencentPersonaHelp')}
+          onChange={setTencentIncludePersona}
+        />
+        <ToggleRow
+          checked={tencentIncludeScenes}
+          disabled={busy}
+          dataAction="toggle-topic-group-memory-tencent-scenes"
+          title={tr('botDefaults.topicGroupMemoryTencentScenes')}
+          help={tr('botDefaults.topicGroupMemoryTencentScenesHelp')}
+          onChange={setTencentIncludeScenes}
+        />
+        <div className="actions">
+          <button type="button" className="primary" disabled={busy} onClick={() => void saveTencentDb()}>{tr('botDefaults.save')}</button>
+          {tencentPanelHref ? <a href={tencentPanelHref} target="_blank" rel="noreferrer">{tr('botDefaults.topicGroupMemoryTencentOpenPanel')}</a> : null}
+        </div>
       </div>
       <div className="bd-subsection tgm-memory-http-llm">
         <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryHttpTitle')}</h4>

@@ -106,7 +106,6 @@ function vtag(v: string): string {
 }
 
 const PERSONAL_VERSION_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${PERSONAL_UPDATE_REF}/dev-version.json`;
-const LATEST_RELEASE_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 const REGISTRY_PACKUMENT_URL = 'https://registry.npmjs.org/botmux';
 
 export interface FetchOpts {
@@ -128,60 +127,55 @@ async function latestFromManifest(fetchImpl: typeof fetch, opts?: FetchOpts): Pr
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return null;
-    const body = await res.json() as { version?: unknown };
-    return typeof body?.version === 'string' && parseVersion(body.version) ? body.version : null;
+    return versionFromManifest(await res.json());
   } catch {
     return null;
   }
 }
 
-async function latestFromReleaseApi(fetchImpl: typeof fetch, opts?: FetchOpts): Promise<string | null> {
+function versionFromManifest(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const version = (raw as { version?: unknown }).version;
+  return typeof version === 'string' && isCanonicalStableVersion(version) ? version : null;
+}
+
+function versionFromManifestText(raw: string | null): string | null {
+  if (raw === null) return null;
   try {
-    const res = await fetchImpl(LATEST_RELEASE_URL, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'botmux',
-        ...githubAuthHeaders(opts?.auth),
-      },
-      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
-    });
-    if (!res.ok) return null;
-    const body = await res.json() as { tag_name?: unknown; draft?: unknown; prerelease?: unknown };
-    const version = typeof body?.tag_name === 'string' ? body.tag_name.replace(/^v/i, '') : '';
-    return body.draft !== true && body.prerelease !== true && isStableVersion(version) ? version : null;
+    return versionFromManifest(JSON.parse(raw));
   } catch {
     return null;
   }
 }
 
-function latestStableTag(tags: string[] | null): string | null {
-  if (!tags) return null;
-  const versions = tags
-    .map(tag => tag.replace(/^v/i, ''))
-    .filter(isStableVersion)
-    .sort((a, b) => compareVersions(b, a));
-  return versions[0] ?? null;
+async function latestFromManifestViaGit(
+  gitFallback: GithubGitFallback,
+  timeoutMs?: number,
+): Promise<string | null> {
+  if (!gitFallback.readFileAtRef) return null;
+  const raw = await gitFallback.readFileAtRef(
+    GITHUB_REPO,
+    PERSONAL_UPDATE_REF,
+    'dev-version.json',
+    timeoutMs,
+  );
+  return versionFromManifestText(raw);
 }
 
 /**
- * Latest stable personal release. HTTPS release metadata and the branch
- * manifest run alongside an SSH tag lookup; the highest valid result wins.
+ * Latest stable personal release. `dev-version.json` on the pinned personal
+ * branch is the release-channel authority. GitHub Releases remain a notes
+ * surface, while fork tags are deliberately excluded: syncing upstream into a
+ * fork also syncs its tags and must never make an official tag look like a
+ * personal release.
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
+  const manifest = await latestFromManifest(fetchImpl, opts);
+  if (manifest) return manifest;
+
   const gitFallback = opts?.gitFallback === undefined ? defaultGithubGitFallback : opts.gitFallback;
-  const candidates: Array<Promise<string | null>> = [
-    latestFromReleaseApi(fetchImpl, opts),
-    latestFromManifest(fetchImpl, opts),
-  ];
-  if (gitFallback) {
-    candidates.push(gitFallback.listTags(GITHUB_REPO, opts?.timeoutMs).then(latestStableTag));
-  }
-  const settled = await Promise.allSettled(candidates);
-  const versions = settled.flatMap(result =>
-    result.status === 'fulfilled' && result.value ? [result.value] : []);
-  versions.sort((a, b) => compareVersions(b, a));
-  return versions[0] ?? null;
+  return gitFallback ? latestFromManifestViaGit(gitFallback, opts?.timeoutMs) : null;
 }
 
 export interface RollbackVersion {
@@ -300,31 +294,24 @@ async function fetchReleasesSinceViaGit(
   gitFallback: GithubGitFallback,
   timeoutMs?: number,
 ): Promise<ReleaseNote[] | null> {
-  const tags = await gitFallback.listTags(GITHUB_REPO, timeoutMs);
-  if (!tags) return null;
-  const versions = tags
-    .map(tag => tag.replace(/^v/i, ''))
-    .filter(version => isStableVersion(version) && compareVersions(version, current) > 0)
-    .sort((a, b) => compareVersions(b, a))
-    .slice(0, max);
-  if (versions.length === 0) return [];
-  const annotations = await gitFallback.readTagAnnotations(
-    GITHUB_REPO,
-    versions.map(vtag),
-    timeoutMs,
-  );
+  if (max <= 0) return [];
+  const latest = await latestFromManifestViaGit(gitFallback, timeoutMs);
+  if (!latest) return null;
+  if (compareVersions(latest, current) <= 0) return [];
+
+  // Read only the manifest-named tag. Enumerating a fork's tags would mix in
+  // upstream tags and could surface official changelog entries as personal.
+  const tag = vtag(latest);
+  const annotations = await gitFallback.readTagAnnotations(GITHUB_REPO, [tag], timeoutMs);
   if (!annotations) return null;
-  return versions.map((version) => {
-    const tag = vtag(version);
-    const annotation = annotations.get(tag);
-    return {
-      version,
-      name: tag,
-      body: annotation?.body ?? '',
-      url: `https://github.com/${GITHUB_REPO}/releases/tag/${tag}`,
-      publishedAt: annotation?.createdAt ?? null,
-    };
-  });
+  const annotation = annotations.get(tag);
+  return [{
+    version: latest,
+    name: tag,
+    body: annotation?.body ?? '',
+    url: `https://github.com/${GITHUB_REPO}/releases/tag/${tag}`,
+    publishedAt: annotation?.createdAt ?? null,
+  }];
 }
 
 /**

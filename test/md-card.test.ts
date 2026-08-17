@@ -20,9 +20,9 @@ import {
   brandFooterSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
-  DEFAULT_BRAND_LABEL,
   hasMarkdown,
   normalizeLocalHomeLinks,
+  REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -867,27 +867,27 @@ describe('buildMarkdownCard', () => {
     expect(rendered).not.toContain('不可用');
   });
 
-  it('keeps brand and recipient chrome when usage is entirely missing', () => {
+  it('keeps recipient chrome without inventing a default brand when usage is missing', () => {
     const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
       context: null,
       tokens: null,
     });
     const footer = JSON.parse(json).body.elements.at(-1).content;
 
-    expect(footer).toContain('[botmux](');
+    expect(footer).toContain(REPLY_CARD_FOOTER_MARKER);
     expect(footer).toContain('<at id=ou_abc></at>');
+    expect(footer).not.toContain('botmux');
     expect(footer).not.toContain('上下文');
     expect(footer).not.toContain('Token');
     expect(footer).not.toContain('不可用');
   });
 
-  it('appends footer hr + grey link element', () => {
+  it('does not append an orphan footer separator when no footer content exists', () => {
     const json = buildMarkdownCard('hello');
     const card = JSON.parse(json);
     const tags = card.body.elements.map((e: any) => e.tag);
-    expect(tags).toContain('hr');
-    const last = card.body.elements[card.body.elements.length - 1];
-    expect(last.content).toContain('[botmux](');
+    expect(tags).not.toContain('hr');
+    expect(JSON.stringify(card)).not.toContain(REPLY_CARD_FOOTER_MARKER);
   });
 
   it('addresses recipient in footer when openId is provided', () => {
@@ -991,7 +991,7 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      'Acme [·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+      `Acme ${REPLY_CARD_FOOTER_MARKER} `
       + '上下文 12.3K · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
@@ -1024,9 +1024,7 @@ describe('buildReplyCardFooter', () => {
       element_id: 'botmux_reply_footer',
       content: expect.stringContaining('Sent to: <at id=ou_owner></at>'),
     });
-    expect(card.body.elements.at(-1).content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(card.body.elements.at(-1).content).toContain(REPLY_CARD_FOOTER_MARKER);
   });
 
   it('rejects caller-supplied cards without schema-2 body elements', () => {
@@ -1099,14 +1097,9 @@ describe('buildReplyCardFooter', () => {
     expect(card.body.elements.at(-1).element_id).toBe('botmux_reply_footer');
   });
 
-  it('does NOT sign a default-brand-only footer (no usage, no recipient) — avoids a dangling "botmux ·"', () => {
+  it('does not render a footer when brand, usage, and recipient are all absent', () => {
     const footer = buildReplyCardFooter({});
-    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
-    // Brand alone is legitimate content with no `@` → no ownership marker, so it
-    // renders "botmux" without a trailing separator dot.
-    expect(footer?.content).not.toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer).toBeNull();
   });
 
   it('still signs a usage-only footer (brand disabled) with the versioned marker', () => {
@@ -1114,9 +1107,8 @@ describe('buildReplyCardFooter', () => {
       brand: '', // brand off
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer?.content).not.toContain('github.com/deepcoldy/botmux');
   });
 
   it('still signs a recipient-only footer (brand disabled) with the versioned marker', () => {
@@ -1124,20 +1116,16 @@ describe('buildReplyCardFooter', () => {
       brand: '',
       recipientOpenIds: ['ou_abc'],
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain(REPLY_CARD_FOOTER_MARKER);
     expect(footer?.content).toContain('<at id=ou_abc></at>');
   });
 
-  it('signs a default-brand + usage footer (marker as the first separator)', () => {
+  it('signs an unbranded usage footer with the neutral marker', () => {
     const footer = buildReplyCardFooter({
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
-    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer?.content).not.toContain('botmux');
   });
 });
 
@@ -1153,8 +1141,8 @@ describe('hasMarkdown', () => {
 // ─── Footer brand label (per-bot configurable) ────────────────────────────
 
 describe('brandFooterSegment', () => {
-  it('undefined (unset) → default botmux brand', () => {
-    expect(brandFooterSegment(undefined)).toBe(DEFAULT_BRAND_LABEL);
+  it('undefined (unset) → null (brand off by default)', () => {
+    expect(brandFooterSegment(undefined)).toBeNull();
   });
   it('empty / whitespace → null (brand off)', () => {
     expect(brandFooterSegment('')).toBeNull();
@@ -1171,8 +1159,11 @@ describe('brandFooterSegment', () => {
 describe('buildMarkdownCard footer brand', () => {
   const lastEl = (json: string) => { const els = JSON.parse(json).body.elements; return els[els.length - 1]; };
 
-  it('unset brand → default botmux footer', () => {
-    expect(lastEl(buildMarkdownCard('hi', 'ou_x')).content).toContain(DEFAULT_BRAND_LABEL);
+  it('unset brand → recipient-only footer without product branding', () => {
+    const content = lastEl(buildMarkdownCard('hi', 'ou_x')).content;
+    expect(content).toContain('发送给');
+    expect(content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(content).not.toContain('deepcoldy/botmux');
   });
 
   it('custom brand → custom footer, no botmux', () => {

@@ -71,7 +71,7 @@ subdirectory. The package `prepare` script builds the missing `dist` files:
 ```json
 {
   "dependencies": {
-    "botmux-workflow-core": "github:deepcoldy/botmux#FULL_COMMIT_SHA&path:/packages/workflow-core"
+    "botmux-workflow-core": "github:OWNER/REPOSITORY#FULL_COMMIT_SHA&path:/packages/workflow-core"
   }
 }
 ```
@@ -79,7 +79,7 @@ subdirectory. The package `prepare` script builds the missing `dist` files:
 When adding it from a shell, quote the spec because `&` is a shell operator:
 
 ```bash
-pnpm add --save-exact 'github:deepcoldy/botmux#FULL_COMMIT_SHA&path:/packages/workflow-core'
+pnpm add --save-exact 'github:OWNER/REPOSITORY#FULL_COMMIT_SHA&path:/packages/workflow-core'
 ```
 
 Always pin the full commit SHA. Do not depend on the whole Botmux package or

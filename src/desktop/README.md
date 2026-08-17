@@ -4,7 +4,7 @@
 
 ## 正式发布
 
-`.github/workflows/release.yml` 在 macOS runner 上完成 Universal 构建、Developer ID 签名、Apple 公证和 stapling，再把 DMG/ZIP 作为附件加入同一个 GitHub Release。签名 job 只接受 `deepcoldy` 发起或重新运行，并且必须通过受保护的 `macos-signing` Environment 审批。以下凭据配置为该 Environment 的 Secrets，不应配置成仓库级 Secrets：
+`.github/workflows/release.yml` 在 macOS runner 上完成 Universal 构建、Developer ID 签名、Apple 公证和 stapling，再把 DMG/ZIP 作为附件加入同一个 GitHub Release。签名 job 只接受仓库授权维护者发起或重新运行，并且必须通过受保护的 `macos-signing` Environment 审批。以下凭据配置为该 Environment 的 Secrets，不应配置成仓库级 Secrets：
 
 其他 contributor 从分支推送 canary、beta、rc 或其它 prerelease tag 时，仍会发布对应的 npm dist-tag 和 GitHub prerelease，但签名 job 会被跳过，因此不会读取签名凭据，也不会生成 macOS 附件。正式版缺少成功的签名产物时会直接拒绝发布。
 

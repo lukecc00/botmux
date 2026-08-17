@@ -23,7 +23,7 @@ export interface RuntimeBotInput {
   daemonStatus?: RuntimeDaemonStatus;
 }
 
-const WORKING_STATUSES = new Set(['working', 'analyzing']);
+const WORKING_STATUSES = new Set(['working', 'analyzing', 'stalled']);
 const STARTING_STATUSES = new Set(['starting', 'queued']);
 // `active` is the persisted open/closed lifecycle state used by legacy
 // dashboard rows. It carries no evidence that a model turn is still running.

@@ -162,8 +162,8 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
   ));
   const botsPath = join(deps.paths.botmuxHome, 'bots.json');
   const installCliMessage = deps.bundledRuntime
-    ? 'The bundled botmux runtime is unavailable. Reinstall Botmux Desktop.'
-    : 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
+    ? 'The bundled runtime is unavailable. Reinstall the Desktop app.'
+    : 'Install the global botmux CLI with `npm install -g botmux`, then reopen the Desktop app.';
 
   function command(runtime: RuntimeLaunchTarget, args: string[]): BotmuxCommand {
     if (runtime.kind === 'bundled') {

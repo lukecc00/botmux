@@ -147,6 +147,10 @@ export interface DaemonSession {
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
   pendingCodexAppMessageContext?: string;
+  /** Memory recalled while the opening turn owns the initial-start fence.
+   * Staging it here preserves the synchronous reserved-fork contract without
+   * dropping the local MemoryCore prompt lane. In-memory only. */
+  pendingTopicGroupMemoryBlock?: string;
   /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
   pendingChatContext?: ChatContext;
   /** One-shot CLI slash command to send literally after the worker reports

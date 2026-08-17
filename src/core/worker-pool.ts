@@ -71,6 +71,11 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import {
+  resolveFeedbackPolicyForDelivery,
+  resolveFeedbackTeamId,
+} from '../services/feedback-policy-resolver.js';
 import { scheduleTopicGroupMemoryUpdate } from '../services/topic-group-memory-update.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, type CodexBridgeEvent } from '../services/codex-transcript.js';
 import { makeFingerprint, normaliseForFingerprint } from '../services/bridge-turn-queue.js';
@@ -465,7 +470,7 @@ export interface WorkerPoolCallbacks {
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
-  closeSession: (ds: DaemonSession) => void;
+  closeSession: (ds: DaemonSession) => boolean | void | Promise<boolean | void>;
   /** Give the daemon first refusal over a transcript-backed final. */
   onFinalOutput?: (
     ds: DaemonSession,
@@ -1039,6 +1044,34 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+function sessionRuntimeDisplayName(
+  ds: DaemonSession,
+  botCfg?: { cliRuntime?: CliRuntimeConfig },
+): string | undefined {
+  const liveRuntime = botCfg
+    ? botCfg.cliRuntime
+    : getBot(ds.larkAppId).config.cliRuntime;
+  return sessionConfiguredRuntimeDisplayName(ds.session, liveRuntime);
+}
+
+function sessionCliDisplayName(
+  ds: DaemonSession,
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig },
+): string {
+  return sessionRuntimeDisplayName(ds, botCfg)
+    ?? getCliDisplayName(sessionCliId(ds, botCfg));
+}
+
+function storedSessionCliDisplayName(ds: DaemonSession): string {
+  try {
+    return sessionCliDisplayName(ds, getBot(ds.larkAppId).config);
+  } catch {
+    return getCliDisplayName(
+      (ds.session.cliId ?? ds.initConfig?.cliId ?? 'claude-code') as CliId,
+    );
+  }
 }
 
 /** Original two-phase card chrome for transcript-native commentary: no owner
@@ -3382,7 +3415,7 @@ export type CloseSessionResult =
 export async function closeSession(
   sessionId: string,
   options: { suppressStopNotice?: boolean } = {},
-): Promise<{ ok: true; alreadyClosed: boolean; known: boolean }> {
+): Promise<CloseSessionResult> {
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
@@ -3440,34 +3473,6 @@ export async function closeSession(
   if (stored && !wasOpen && storedHadDocCommentTargets) {
     sessionStore.updateSession(stored);
   }
-  if (ds) {
-    // Fence durable progress/final continuations before the worker is killed
-    // or the persisted status transitions. Timers hold this object directly,
-    // so registry deletion alone would not stop a late Lark send.
-    ds.progressDeliveryClosed = true;
-    // Usage ledger: flush the final delta before the worker goes away (a
-    // crash/limited turn may never have reached an idle edge).
-    recordUsageForDaemonSession(ds);
-    killWorker(ds);
-    // Explicit close is a terminal user-visible lifecycle transition. Notify
-    // while the live routing object is still available so chat-scope sessions
-    // keep their current thread target. Internal replacement/handoff callers
-    // opt out with suppressStopNotice.
-    if (callbacks && !options.suppressStopNotice) {
-      await notifySessionStopped(ds, callbacks.sessionReply, 'ended');
-    }
-    const activeKey = activeSessionKey(ds);
-    if (activeSessionsRegistry?.get(activeKey) === ds) {
-      activeSessionsRegistry.delete(activeKey);
-    }
-    // Mark the captured object too. Async message/card paths may already hold a
-    // reference to `ds`; deleting only the registry entry would not stop one of
-    // those continuations from re-forking the closed session after its await.
-    ds.session.status = 'closed';
-    ds.session.closedAt ??= new Date().toISOString();
-    killedLive = true;
-  }
-
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
   if (wasOpen) {
@@ -3502,6 +3507,10 @@ export async function closeSession(
   }
 
   if (ds) {
+    // Fence durable progress/final continuations before the worker is killed.
+    // Timers hold this object directly, so registry deletion alone would not
+    // stop a late Lark send.
+    ds.progressDeliveryClosed = true;
     killWorker(ds, {
       ...(preparedRiffRequestId ? { riffCloseCommitRequestId: preparedRiffRequestId } : {}),
     });
@@ -3603,6 +3612,13 @@ export async function closeSession(
       }
     }
     if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
+  }
+
+  // Explicit close is a terminal user-visible lifecycle transition. Send the
+  // best-effort notice only after authoritative close and document cleanup;
+  // internal replacement/handoff callers opt out with suppressStopNotice.
+  if (ds && callbacks && !options.suppressStopNotice) {
+    await notifySessionStopped(ds, callbacks.sessionReply, 'ended');
   }
 
   // A deliberately closed conversation can never accept a replayed
@@ -3884,17 +3900,126 @@ export async function setActiveSessionSafe(
   map: Map<string, DaemonSession>,
   key: string,
   ds: DaemonSession,
-  options: { suppressPreviousStopNotice?: boolean } = {},
-): Promise<boolean> {
-  const previous = map.get(key);
-  if (previous && previous !== ds && options.suppressPreviousStopNotice) {
-    await closeSession(previous.session.sessionId, {
-      suppressStopNotice: true,
-    });
-    const replacement = map.get(key);
-    if (replacement && replacement !== ds) return false;
+  _options: { suppressPreviousStopNotice?: boolean } = {},
+): Promise<SetActiveSessionResult> {
+  const canonicalKey = activeSessionKey(ds);
+  if (canonicalKey !== key) {
+    throw new Error(
+      `refusing noncanonical active-session registration: requested=${key} canonical=${canonicalKey}`,
+    );
   }
-  return setActiveSessionIfActive(map, key, ds);
+  return withActiveSessionKeyLock(map, key, async () => {
+    // Reboot-resume guard (master): a daemon close can flip the shared Session
+    // to a non-active status while an async creator/restore awaited Lark/project
+    // metadata. Never publish that now-inactive row back into the live map; drop
+    // only our exact stale object so a newer owner of the same key is untouched.
+    if (ds.session.status !== 'active') {
+      if (map.get(key) === ds) map.delete(key);
+      logger.warn(
+        `[setActiveSessionSafe] refusing to register inactive session `
+        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
+      );
+      return {
+        accepted: false,
+        reason: 'inactive_incoming',
+        keptSessionId: ds.session.sessionId,
+        preservedIncomingSessionId: ds.session.sessionId,
+      };
+    }
+    const prev = map.get(key);
+    if (prev && prev !== ds) {
+      if (prev.session.sessionId === ds.session.sessionId) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between distinct owners of session id `
+          + `${prev.session.sessionId}; preserving both objects and the durable row`,
+        );
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: 'ambiguous_session_id',
+        };
+      }
+      const prevPending = hasProtectedSessionMutationOwnership(prev);
+      const incomingPending = hasProtectedSessionMutationOwnership(ds);
+      if (prevPending && incomingPending) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between two unsettled Codex App owners `
+          + `${prev.session.sessionId} and ${ds.session.sessionId}; preserving both rows/panes`,
+        );
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      if (prevPending) {
+        logger.warn(
+          `[setActiveSessionSafe] keeping unsettled owner ${prev.session.sessionId.substring(0, 8)}; `
+          + `closing ledger-empty incoming ${ds.session.sessionId.substring(0, 8)}`,
+        );
+        const cleanup = await closeUnregisteredCollisionLoser(map, ds);
+        if (!cleanup.ok) {
+          return {
+            accepted: false,
+            reason: 'cleanup_failed',
+            keptSessionId: prev.session.sessionId,
+            preservedIncomingSessionId: ds.session.sessionId,
+            cleanupSessionId: ds.session.sessionId,
+            error: cleanup.error,
+          };
+        }
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      logger.warn(
+        `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
+        `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+      );
+      const cleanup = await closeUnregisteredCollisionLoser(map, prev);
+      if (!cleanup.ok) {
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: cleanup.error,
+        };
+      }
+    }
+    // Reboot-resume guard (master): a durable quarantine reservation for this
+    // route (an inconclusive exact-backend teardown) must block a second runtime
+    // beside a possibly-live persistent target, even after the in-memory prev
+    // occupant above was closed. Closed rows never match, so an operator close
+    // immediately releases the route.
+    const quarantined = findQuarantinedRoutingConflict(key, ds.larkAppId, ds.session.sessionId);
+    if (quarantined) {
+      logger.warn(
+        `[setActiveSessionSafe] refusing to occupy routing key reserved by quarantined session `
+        + `${quarantined.sessionId.substring(0, 8)}`,
+      );
+      return {
+        accepted: false,
+        reason: 'quarantine_reserved',
+        keptSessionId: quarantined.sessionId,
+        preservedIncomingSessionId: ds.session.sessionId,
+      };
+    }
+    map.set(key, ds);
+    clearRestoreQuarantineMarker(ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
+  });
 }
 
 /**
@@ -5087,7 +5212,8 @@ export async function forkSession(
   };
 
   if (activeSessionsRegistry) {
-    if (!(await setActiveSessionSafe(activeSessionsRegistry, targetKey, childDs))) {
+    const registration = await setActiveSessionSafe(activeSessionsRegistry, targetKey, childDs);
+    if (!registration.accepted) {
       // Target slot was taken between the guard and here — roll back the child
       // row so it doesn't linger as a ghost-active session.
       await closeSession(childSession.sessionId).catch(() => { /* best effort */ });
@@ -5151,6 +5277,28 @@ export async function forkSession(
 function resolvesToHome(p: string): boolean {
   try { return realpathSync(p) === realpathSync(homedir()); }
   catch { return p === homedir(); }
+}
+
+export function codexAppCleanInputAcceptedForSession(ds: DaemonSession): boolean {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+    return effectiveCliId === 'codex-app'
+      && botCfg.codexAppCleanInput === true
+      && !ds.adoptedFrom;
+  } catch {
+    return false;
+  }
+}
+
+function cloneFrozenCodexAppInput(
+  input: CodexAppTurnInput | undefined,
+  turnId?: string,
+): CodexAppTurnInput | undefined {
+  if (!input) return undefined;
+  const cloned = structuredClone(input);
+  if (turnId && !cloned.clientUserMessageId) cloned.clientUserMessageId = turnId;
+  return cloned;
 }
 
 /** Migration proof for a Codex turn that predates pendingBridgeTurns (or was
@@ -5764,10 +5912,72 @@ export function sendWorkerInput(
       }
     }
   }
-  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
-  if (turnId && ['codex', 'codex-app'].includes(ds.session.cliId ?? getBot(ds.larkAppId).config.cliId)) {
+  if (hasQueuedActivationAdmissionGate(ds)) {
+    const queuedTurnId = effectiveTurnId
+      ?? routingTurnId
+      ?? `queued-activation-followup-${randomUUID()}`;
+    try {
+      admitQueuedActivationTail(ds, {
+        userPrompt: normalized.content,
+        cliInput: {
+          content: normalized.content,
+          ...(normalized.codexAppInput
+            ? { codexAppInput: normalized.codexAppInput }
+            : {}),
+          // Freeze the admission-time steer authorization into the queued
+          // successor so promotion/recovery cannot reinterpret a later config.
+          ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+        },
+        turnId: queuedTurnId,
+        ...(opts.dispatchAttempt !== undefined
+          ? { dispatchAttempt: opts.dispatchAttempt }
+          : {}),
+      });
+      logger.info(
+        `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
+      );
+      return true;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Failed to durably stage turn ${queuedTurnId} behind activation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  const codexAppInput = codexAppInputForSession(
+    ds,
+    normalized.codexAppInput,
+    effectiveTurnId,
+  );
+  const codexAppDispatchId = acceptCodexAppDispatch(
+    ds,
+    {
+      content: normalized.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      ...(replyTurnId ? { replyTurnId } : {}),
+      replyTarget: replyContext.target,
+      ...(replyContext.quoteTargetId ? { quoteTargetId: replyContext.quoteTargetId } : {}),
+      ...(replyContext.replyTargetSenderOpenId
+        ? { replyTargetSenderOpenId: replyContext.replyTargetSenderOpenId }
+        : {}),
+      ...(replyContext.replyTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
+        : {}),
+      ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    },
+    effectiveTurnId,
+    opts.dispatchAttempt,
+    vcMeetingImTurnOrigin,
+  );
+
+  // Keep the local structured bridge recovery journal. The upstream dispatch
+  // ledger is authoritative for Codex App acceptance; this journal additionally
+  // preserves native Codex replay/recovery across worker replacement.
+  if (effectiveTurnId && ['codex', 'codex-app'].includes(effectiveCliId)) {
     if (stagePendingBridgeTurn(ds.session, {
-      turnId,
+      turnId: effectiveTurnId,
       content: normalized.content,
       userGoal: normalized.userGoal,
       dispatchAttempt: opts.dispatchAttempt,
@@ -6349,11 +6559,18 @@ export function forkWorker(
   // scheduler, card retry and other system starts stay unattributed. Falling
   // back to currentReplyTarget here would let a later system prompt reuse an
   // older human turn after a worker replacement.
-  const initAttributionTurnId = initTurnId;
+  let initAttributionTurnId = initTurnId
+    ?? (queuedForkSnapshot ? ds.session.pendingRepoSetup?.turnId : undefined);
   const effectiveInitCliId = ds.session.cliId ?? botCfg.cliId;
   const bridgeInitTurnId = prompt.length > 0 && effectiveInitCliId === 'codex'
     ? (initAttributionTurnId ?? `bridge-${randomBytes(8).toString('hex')}`)
     : initAttributionTurnId;
+  // Reply routing is frozen only from the same explicitly accepted turn. A
+  // system prompt must not borrow an older mutable currentReplyTarget.
+  const initReplyTurnId = initTurnId;
+  const initReplyContext = prompt.length > 0
+    ? frozenReplyContextForTurn(ds, initReplyTurnId)
+    : undefined;
 
   // Compatibility migration for a Codex turn accepted by an older daemon.
   // That version persisted the exact worker commit receipt and last CLI input,
@@ -6811,6 +7028,12 @@ export function forkWorker(
   const runtimeIdentity = runtimeBuildIdentity();
   const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
   ds.feedbackPolicy = feedbackPolicy;
+  // Classic Codex may synthesize a bridge-only identity before agent config is
+  // frozen. Codex App instead uses the durable dispatch identity minted above,
+  // which must reach both the worker FIFO and the signed control channel.
+  const workerInitTurnId = agentCfg.cliId === 'codex'
+    ? bridgeInitTurnId
+    : initAttributionTurnId;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -6915,18 +7138,27 @@ export function forkWorker(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: bridgeInitTurnId,
+    turnId: workerInitTurnId,
+    ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
+    ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    // Preserve the admission-time steer decision on the opening turn. Never
+    // recompute it from mutable session or bot state during recovery.
+    ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+    ...(codexAppRecoveredDispatches.length > 0
+      ? { codexAppRecoveredDispatches }
+      : {}),
+    ...((ds.session.codexAppGenerationCommits?.length ?? 0) > 0
+      ? { codexAppGenerationCommits: ds.session.codexAppGenerationCommits }
+      : {}),
+    ...(initAtMostOnce ? { atMostOnce: true } : {}),
     // A dead Node worker may be lazily re-forked by the next user message.
     // Carry older in-flight structured turns even when this init also contains
     // a new prompt so the worker can baseline/replay them before that prompt.
     recoverBridgeTurns: (agentCfg.cliId === 'codex' || agentCfg.cliId === 'codex-app')
       ? ds.session.pendingBridgeTurns
       : undefined,
-    vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
-      ds.session,
-      bridgeInitTurnId,
-    ),
+    vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
@@ -6935,10 +7167,10 @@ export function forkWorker(
     ...(ds.session.runnerBuildId ? { persistedRunnerBuildId: ds.session.runnerBuildId } : {}),
     ...(restartAttemptId ? { restartAttemptId } : {}),
   };
-  if (prompt.length > 0 && bridgeInitTurnId
+  if (prompt.length > 0 && workerInitTurnId
     && (agentCfg.cliId === 'codex' || agentCfg.cliId === 'codex-app')) {
     if (stagePendingBridgeTurn(ds.session, {
-      turnId: bridgeInitTurnId,
+      turnId: workerInitTurnId,
       content: prompt,
       userGoal: promptPayload.userGoal,
       dispatchAttempt: initDispatchAttempt,
@@ -6946,7 +7178,17 @@ export function forkWorker(
       startedAt: Date.now(),
     })) {
       sessionStore.updateSession(ds.session);
-      publishSessionRuntimeStatus(ds);
+      try {
+        publishSessionRuntimeStatus(ds);
+      } catch (err) {
+        // The durable turn journal above is authoritative. Dashboard projection
+        // is post-admission bookkeeping and must never make an accepted init
+        // retryable (which could execute the same model turn twice).
+        logger.error(
+          `[${t}] Failed to publish staged bridge runtime state: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
   // A persisted port from an older ZMX implementation must never revive the
@@ -9468,6 +9710,185 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        if (msg.codexAppSettlement) {
+          const settlement = msg.codexAppSettlement;
+          const acknowledge = (ok: boolean, error?: string): void => {
+            try {
+              worker.send({
+                type: 'codex_app_dispatch_persisted',
+                requestId: settlement.requestId,
+                ok,
+                ...(error ? { error } : {}),
+              } as DaemonToWorker);
+            } catch { /* runner keeps the final unacknowledged for replacement */ }
+          };
+          if (ds.worker !== worker) {
+            acknowledge(false, 'stale_worker_generation');
+            break;
+          }
+          if (msg.sessionId !== ds.session.sessionId) {
+            acknowledge(false, 'session_mismatch');
+            break;
+          }
+          if (committedCodexAppSequence(
+            ds.session.codexAppGenerationCommits ?? [],
+            settlement.generation,
+            settlement.seq,
+          )) {
+            acknowledge(true);
+            if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+              try { await cb.onCodexAppLedgerDrained?.(ds); }
+              catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+            }
+            break;
+          }
+          const identity = {
+            dispatchId: settlement.dispatchId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          };
+          const preview = settleCodexAppDispatch(
+            ds.session.codexAppDispatchLedger ?? [],
+            ds.session.codexAppGenerationCommits ?? [],
+            identity,
+            settlement.generation,
+            settlement.seq,
+          );
+          if (!preview.ok) {
+            acknowledge(false, preview.error);
+            break;
+          }
+          // R4/R5-B4 defense-in-depth: a `steer_superseded` settlement silently
+          // advances the FIFO without delivering, so it is ONLY legitimate for a
+          // genuine plain-Lark steerable head that STILL has a successor. Reject
+          // (ACK=false, no pop, no receiver completion, no mutation) BEFORE the
+          // commit block below if the settled entry is not steerable, not an
+          // explicit Lark sink, belongs to a VC / durable-receiver / special
+          // channel, or is the SOLE remaining head. R5: `deliverySink` must be
+          // exactly 'lark' — admission always writes both sink and steerable
+          // together, so "steerable=true + sink missing" can only be a
+          // mixed/corrupt/legacy ledger and must fail closed, not be treated as
+          // safe Lark. And a lone forged superseded (no successor) must never
+          // silently commit the only head — the real final would then find no
+          // pending turn. preview.ledger is the post-settle remainder.
+          if (msg.disposition === 'steer_superseded') {
+            const entry = preview.settledEntry;
+            const supersededHeadOk = entry.codexAppSteerable === true
+              && entry.deliverySink === 'lark'
+              && entry.vcMeetingImTurnOrigin === undefined
+              && ds.session.vcMeetingReceiver === undefined
+              && preview.ledger.length > 0;
+            if (!supersededHeadOk) {
+              logger.warn(
+                `[${t}] Rejected steer_superseded for non-steerable/special/last head `
+                + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
+                + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
+              );
+              acknowledge(false, 'superseded_head_not_plain_lark_steerable_with_successor');
+              break;
+            }
+          }
+          const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          let inFlight = codexAppFinalSettlementInFlight.get(key);
+          if (!inFlight) {
+            inFlight = (async () => {
+              const unavailableSinkFailClosed = codexAppDeliveryMustFailClosed(
+                ds,
+                preview.settledEntry,
+              );
+              const deliverySuppressed = msg.suppressDelivery === true
+                || managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)
+                || unavailableSinkFailClosed;
+              if (unavailableSinkFailClosed
+                && preview.settledEntry.deliverySink !== 'suppressed'
+                && msg.suppressDelivery !== true) {
+                logger.warn(
+                  `[${t}] Codex App recovery suppressed unavailable `
+                  + `${preview.settledEntry.deliverySink ?? 'legacy non-Lark'} sink `
+                  + `(turn ${msg.turnId.substring(0, 8)})`,
+                );
+              }
+              const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
+              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
+                ? true
+                : await new Promise<boolean>(resolve => {
+                    deliverFinalOutput(
+                      ds,
+                      msg,
+                      t,
+                      0,
+                      resolve,
+                      () => ds.worker === worker
+                        && ds.session.sessionId === msg.sessionId,
+                      preview.settledEntry.replyTarget,
+                    );
+                  });
+              if (!owned) return false;
+
+              // Re-read after the asynchronous external delivery. A concurrent
+              // replacement may already have committed this signed sequence;
+              // that is idempotent success, never a second FIFO pop.
+              if (committedCodexAppSequence(
+                ds.session.codexAppGenerationCommits ?? [],
+                settlement.generation,
+                settlement.seq,
+              )) return true;
+              const committed = settleCodexAppDispatch(
+                ds.session.codexAppDispatchLedger ?? [],
+                ds.session.codexAppGenerationCommits ?? [],
+                identity,
+                settlement.generation,
+                settlement.seq,
+              );
+              if (!committed.ok) return false;
+              if (msg.dispatchAttempt !== undefined) {
+                try {
+                  // Durable receivers must not depend on the worker surviving
+                  // the daemon ACK long enough to emit a later terminal IPC.
+                  // Persist the exact completed attempt first; the worker's
+                  // ordered duplicate terminal remains idempotent.
+                  await cb.onTurnTerminal?.(ds, {
+                    type: 'turn_terminal',
+                    sessionId: ds.session.sessionId,
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    status: 'completed',
+                  }, { workerGeneration });
+                } catch (err) {
+                  logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
+                  return false;
+                }
+              }
+              const priorLedger = ds.session.codexAppDispatchLedger;
+              const priorCommits = ds.session.codexAppGenerationCommits;
+              ds.session.codexAppDispatchLedger = committed.ledger;
+              ds.session.codexAppGenerationCommits = committed.commits;
+              try {
+                // One atomic sessions-file replacement owns both the exact FIFO
+                // pop and cumulative runner ACK boundary. Only after this write
+                // may the worker acknowledge final-end to the runner.
+                sessionStore.updateSession(ds.session);
+                return true;
+              } catch (err) {
+                ds.session.codexAppDispatchLedger = priorLedger;
+                ds.session.codexAppGenerationCommits = priorCommits;
+                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
+                return false;
+              }
+            })().finally(() => codexAppFinalSettlementInFlight.delete(key));
+            codexAppFinalSettlementInFlight.set(key, inFlight);
+          }
+          const persisted = await inFlight;
+          acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+            try { await cb.onCodexAppLedgerDrained?.(ds); }
+            catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+          }
+          break;
+        }
+
         // Transcript final delivery is independently durable. Validate the
         // source, consult the persisted acknowledgement ledger, then give the
         // daemon's fresh-session handoff interceptor first refusal.
@@ -9518,7 +9939,17 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        deliverFinalOutput(ds, msg, t, 0, ownsLifecycleMutation, undefined, earlierProgress);
+        deliverFinalOutput(
+          ds,
+          msg,
+          t,
+          0,
+          undefined,
+          ownsLifecycleMutation,
+          undefined,
+          undefined,
+          earlierProgress,
+        );
         break;
       }
 
@@ -9614,7 +10045,9 @@ function setupWorkerHandlers(
           logger.error(`[${t}] Failed to deliver unexpected worker exit diagnostic to Lark: ${err?.message ?? err}`);
         });
       }
-      void notifySessionStopped(ds, cb.sessionReply, unexpected ? 'unexpected' : 'ended');
+      void notifySessionStopped(ds, cb.sessionReply, unexpected ? 'unexpected' : 'ended', {
+        turnId: startupState.initTurnId,
+      });
     }
 
     // Clear the current child before notifying durable consumers. A callback
@@ -9705,7 +10138,9 @@ function setupWorkerHandlers(
         }, 250).unref?.();
       } else {
         logger.error(`[${t}] Pending Codex worker recovery stopped after ${rc.count} exits in 1 minute`);
-        void notifySessionStopped(ds, cb.sessionReply, 'unexpected');
+        void notifySessionStopped(ds, cb.sessionReply, 'unexpected', {
+          turnId: startupState.initTurnId,
+        });
         ds.exitEventEmitted = false;
       }
     }
@@ -9736,6 +10171,17 @@ function setupWorkerHandlers(
  * "accepted, then daemon crashed" window idempotent. The bounded array is a
  * backoff schedule, not an attempt budget. */
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
+
+/** Snapshot in-flight Codex App final settlements for graceful-shutdown
+ * quiescence. No new entry can appear after worker IPC channels disconnect. */
+export function snapshotCodexAppFinalSettlements(): Promise<boolean>[] {
+  return [...codexAppFinalSettlementInFlight.values()];
+}
+
+export function codexAppFinalSettlementCount(): number {
+  return codexAppFinalSettlementInFlight.size;
+}
 /** Preserve commentary-before-final ordering during ordinary short provider
  * hiccups, but never let the durable commentary FIFO hold the terminal answer
  * hostage indefinitely. Commentary remains in its own outbox and can land
@@ -10038,7 +10484,7 @@ function deliverFinalOutput(
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
       }
-      if (isSessionClosed(ds) || !stillCurrent()) {
+      if (isSessionClosed(ds) || !isStillOwned()) {
         logger.info(`[${t}] Bridge final_output abandoned after progress wait — session closed or stale`);
         return;
       }
@@ -10231,9 +10677,12 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            cardUsage,
-            'body',
-          );
+            usage: cardUsage,
+            recipientMentionMode: 'body',
+          });
+      const baseFeedbackCard = feedback
+        ? JSON.parse(cardJson) as Record<string, unknown>
+        : undefined;
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -10439,7 +10888,17 @@ function deliverFinalOutput(
         Math.min(next, FINAL_OUTPUT_RETRY_BACKOFF_MS.length - 1)
       ] ?? 30_000;
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${nextBackoff}ms`);
-      deliverFinalOutput(ds, msg, t, next, stillCurrent, cardUsage, retryEarlierProgress);
+      deliverFinalOutput(
+        ds,
+        msg,
+        t,
+        next,
+        onComplete,
+        isStillOwned,
+        frozenReplyTarget,
+        cardUsage,
+        retryEarlierProgress,
+      );
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[
     Math.min(attempt, FINAL_OUTPUT_RETRY_BACKOFF_MS.length - 1)

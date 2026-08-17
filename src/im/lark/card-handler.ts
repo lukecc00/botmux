@@ -9,7 +9,8 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, buildManagementAccessCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, buildManagementAccessCard } from './card-builder.js';
+import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
   applyConfigField,
@@ -98,7 +99,8 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { isRiffBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { buildManagementDashboardUrl } from '../../core/manage-access.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
@@ -603,6 +605,7 @@ export async function commitRepoSelection(
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
+      ds.pendingTopicGroupMemoryBlock = undefined;
       ds.pendingChatContext = undefined;
       ds.pendingAttachments = undefined;
       ds.pendingMentions = undefined;
@@ -2402,6 +2405,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         };
       }
+      const { current, botCfg, card } = closed;
       // closeSession removes the captured ds before awaiting best-effort remote
       // cleanup. A new session may claim the same route during that await; only
       // delete here if this handler still owns the exact object it closed.

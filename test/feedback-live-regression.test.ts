@@ -24,7 +24,14 @@ function fixture(input: Record<string, unknown> = {}) {
     },
     ...input,
   });
-  const base = JSON.parse(buildCanonicalFinalReplyCard({ markdown: '真实回答正文', feedback: { policy } }));
+  const base = JSON.parse(buildCanonicalFinalReplyCard({
+    markdown: '真实回答正文',
+    feedback: { policy },
+    usage: {
+      context: { usedTokens: 1_000, windowTokens: 10_000, percentUsed: 10 },
+      tokens: { in: 900, out: 100 },
+    },
+  }));
   return { policy, base };
 }
 

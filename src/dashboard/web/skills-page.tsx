@@ -6,65 +6,35 @@ import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { readSkillInstallDraft, writeSkillInstallDraft } from './skill-install-draft.js';
-
-interface SkillRow {
-  name: string;
-  displayName?: string;
-  description?: string;
-  tags?: string[];
-  source?: Record<string, any>;
-  rootDir?: string;
-}
-
-interface NativeSkillGroup {
-  cliId: string;
-  rootDir: string;
-  skills: SkillRow[];
-  label?: string;
-}
-
-interface BotRow {
-  larkAppId: string;
-  botName?: string;
-  online?: boolean;
-  error?: string;
-  skills?: SkillPolicy | null;
-}
-
-interface SkillPolicy {
-  include?: string[];
-}
-
-interface DashboardRequestError extends Error {
-  status?: number;
-  body?: any;
-}
-
-interface SkillJob {
-  id: string;
-  status: 'running' | 'succeeded' | 'failed';
-  error?: string;
-}
-
-interface InstallSkillCandidate {
-  name: string;
-  path: string;
-  description?: string;
-}
-
-interface SkillInstallHistoryRow {
-  id: string;
-  source: string;
-  path?: string;
-  ref?: string;
-  skillNames: string[];
-  installedSkillNames: string[];
-  updatedAt: string;
-}
-
-type StatusMessage = { text: string; ok: boolean } | null;
-type DeliveryMode = 'auto' | 'prompt' | 'native';
-type ProjectTrustMode = 'off' | 'all';
+import { SkillPacksTab } from './skills/skill-packs-tab.js';
+import { detectSourceType, SkillLibraryTab } from './skills/skill-library-tab.js';
+import { BotAssignmentsTab } from './skills/bot-assignments-tab.js';
+import { DeliverySettingsTab } from './skills/delivery-settings-tab.js';
+import {
+  buildSkillGraph,
+  danglingSkillNames,
+  discoveryGroupKey,
+  mergeBotAssignmentSelectors,
+  packIds,
+  policyConfigured,
+  priorityNames,
+  selectInstallCandidates,
+  sourceLabel,
+} from './skills/shared.js';
+import { useSkillsData } from './skills/use-skills-data.js';
+import type {
+  BotRow,
+  DashboardRequestError,
+  DeliveryMode,
+  InstallSkillCandidate,
+  ProjectTrustMode,
+  SkillInstallHistoryRow,
+  SkillJob,
+  SkillRemovalReference,
+  SkillRow,
+  SkillsNavIntent,
+  StatusMessage,
+} from './skills/types.js';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
 
@@ -142,6 +112,8 @@ interface SkillsInstallPanelProps {
   onInstallSourceChange: (value: string) => void;
   onInstallPathChange: (value: string) => void;
   onInstallRefChange: (value: string) => void;
+  onInstallFullDepthChange: (value: boolean) => void;
+  onClearInstallTarget?: () => void;
   onSelectInstallHistory?: (id: string) => void;
   onUpdateInstallHistory?: () => void;
   onToggleInstallSkill?: (name: string) => void;
@@ -166,6 +138,30 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const installHistory = props.installHistory ?? [];
   const selectedHistory = installHistory.find(entry => entry.id === props.selectedInstallHistoryId);
   const busy = props.installBusy || props.installDiscovering || props.installHistoryBusy;
+  const sourceType = detectSourceType(props.installSource);
+  const sourceTypeLabel = sourceType === 'github'
+    ? tr('skills.sourceDetectedGithub')
+    : sourceType === 'git'
+      ? tr('skills.sourceDetectedGit')
+      : sourceType === 'agentbuddy'
+        ? tr('skills.sourceDetectedAgentbuddy')
+        : sourceType === 'local'
+          ? tr('skills.sourceDetectedLocal')
+          : tr('skills.sourceDetectedUnknown');
+  const sourcePreflight = sourceType === 'agentbuddy'
+    ? tr('skills.sourcePreflightAgentbuddy')
+    : sourceType === 'github' || sourceType === 'git'
+      ? tr('skills.sourcePreflightGit')
+      : sourceType === 'local'
+        ? tr('skills.sourcePreflightLocal')
+        : tr('skills.sourcePreflightUnknown');
+  const diagnostic = sourceType === 'agentbuddy'
+    ? tr('skills.installDiagnosticAgentbuddy')
+    : sourceType === 'github' || sourceType === 'git'
+      ? tr('skills.installDiagnosticGit')
+      : sourceType === 'local'
+        ? tr('skills.installDiagnosticLocal')
+        : tr('skills.installDiagnosticUnknown');
 
   useEffect(() => {
     const dialog = selectionDialogRef.current;
@@ -212,18 +208,65 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
       ) : null}
       <div className="skills-install-grid">
         <div className="skills-source-label">
-          <FieldTitle
-            help={(
-              <span className="skills-source-help">
-                <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
-                <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
-                <span><strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>{tr('skills.sourceHelpAgentbuddy')}</span>
-              </span>
-            )}
-            helpLabel={tr('skills.source')}
+          <div
+            className="skills-source-heading"
+            ref={sourceHelpRef}
+            onKeyDown={event => {
+              if (event.key === 'Escape') setSourceHelpOpen(false);
+            }}
           >
-            {tr('skills.source')}
-          </FieldTitle>
+            <label htmlFor={sourceInputId}>{tr('skills.source')}</label>
+            <button
+              type="button"
+              className="skills-source-help-trigger"
+              data-action="toggle-source-help"
+              aria-label={tr('skills.sourceHelpOpen')}
+              aria-expanded={sourceHelpOpen}
+              aria-controls={sourceHelpId}
+              aria-haspopup="dialog"
+              onClick={() => setSourceHelpOpen(open => !open)}
+            >?</button>
+            {sourceHelpOpen ? (
+              <aside
+                className="skills-source-help-popover"
+                id={sourceHelpId}
+                role="dialog"
+                aria-labelledby={sourceHelpTitleId}
+                data-source-help-popover
+              >
+                <div className="skills-source-help-head">
+                  <div>
+                    <strong id={sourceHelpTitleId}>{tr('skills.sourceHelpTitle')}</strong>
+                    <span>{tr('skills.sourceHelpIntro')}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="skills-source-help-close"
+                    data-action="close-source-help"
+                    aria-label={tr('skills.sourceHelpClose')}
+                    onClick={() => setSourceHelpOpen(false)}
+                  >×</button>
+                </div>
+                <div className="skills-source-help-list">
+                  <section>
+                    <strong>{tr('skills.sourceHelpRemoteLabel')}</strong>
+                    <span>{tr('skills.sourceHelpRemote')}</span>
+                    <code>{tr('skills.sourceHelpRemoteExample')}</code>
+                  </section>
+                  <section>
+                    <strong>{tr('skills.sourceHelpLocalLabel')}</strong>
+                    <span>{tr('skills.sourceHelpLocal')}</span>
+                    <code>{tr('skills.sourceHelpLocalExample')}</code>
+                  </section>
+                  <section>
+                    <strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>
+                    <span>{tr('skills.sourceHelpAgentbuddy')}</span>
+                    <code>{tr('skills.sourceHelpAgentbuddyExample')}</code>
+                  </section>
+                </div>
+              </aside>
+            ) : null}
+          </div>
           {installHistory.length > 0 ? (
             <div className="skills-install-history-control">
               <select
@@ -262,25 +305,58 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               onChange={e => props.onInstallSourceChange(e.currentTarget.value)}
             />
           </div>
+          {props.installSource.trim() ? (
+            <div className={`skills-source-feedback is-${sourceType}`} data-source-hint={sourceType}>
+              <strong>{sourceTypeLabel}</strong>
+              <span>{sourcePreflight}</span>
+            </div>
+          ) : null}
         </div>
-        <label className="skills-install-field-wide skills-install-path-field"><span>{tr('skills.path')}</span>
-          <input
-            type="text"
-            data-install="path"
-            placeholder={tr('skills.pathPlaceholder')}
-            value={props.installPath}
-            onChange={e => props.onInstallPathChange(e.currentTarget.value)}
-          />
-        </label>
-        <label className="skills-install-field-wide skills-install-ref-field"><span>{tr('skills.ref')}</span>
-          <input
-            type="text"
-            data-install="ref"
-            placeholder={tr('skills.refPlaceholder')}
-            value={props.installRef}
-            onChange={e => props.onInstallRefChange(e.currentTarget.value)}
-          />
-        </label>
+        {/* Advanced options stay folded: the overwhelming majority of installs
+            are "paste an address and go". Path/Ref only apply to git sources and
+            the depth toggle is a fallback the backend already performs on its
+            own, so surfacing all three up front unbalanced the form and buried
+            the primary action. */}
+        <details className="skills-install-advanced" data-install-advanced>
+          <summary>{tr('skills.advancedOptions')}</summary>
+          <div className="skills-install-advanced-body">
+            <label className="skills-install-field"><span>{tr('skills.path')}</span>
+              <input
+                type="text"
+                data-install="path"
+                placeholder={tr('skills.pathPlaceholder')}
+                value={props.installPath}
+                onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+              />
+              <small>{tr('skills.pathHelpInline')}</small>
+            </label>
+            <label className="skills-install-field"><span>{tr('skills.ref')}</span>
+              <input
+                type="text"
+                data-install="ref"
+                placeholder={tr('skills.refPlaceholder')}
+                value={props.installRef}
+                onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+              />
+              <small>{tr('skills.refHelpInline')}</small>
+            </label>
+            <label className="skills-scan-toggle">
+              <input
+                type="checkbox"
+                data-install="full-depth"
+                checked={props.installFullDepth}
+                disabled={busy}
+                onChange={event => props.onInstallFullDepthChange(event.currentTarget.checked)}
+              />
+              <span>
+                <strong>{tr('skills.deepScan')}</strong>
+                <small>{tr('skills.deepScanHelp')}</small>
+                <small className="muted">{tr('skills.autoDeepScanHint')}</small>
+              </span>
+            </label>
+          </div>
+        </details>
+
         <div className="skills-install-actions">
           <button
             type="button"
@@ -873,7 +949,7 @@ export function SkillsPage() {
   const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const {
-    skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
+    skills, nativeSkillGroups, installHistory, bots, packs, trustProjectSkills, delivery,
     loading, loadError, packsError, packsKnown, refresh,
     setSkills, setBots, setTrustProjectSkills, setDelivery,
   } = useSkillsData({ apiUnavailableText: tr('skills.apiUnavailable') });
@@ -899,7 +975,6 @@ export function SkillsPage() {
   const [installSource, setInstallSource] = useState(initialInstallDraft.source);
   const [installPath, setInstallPath] = useState(initialInstallDraft.path);
   const [installRef, setInstallRef] = useState(initialInstallDraft.ref);
-  const [installHistory, setInstallHistory] = useState<SkillInstallHistoryRow[]>([]);
   const [selectedInstallHistoryId, setSelectedInstallHistoryId] = useState('');
   const [installHistoryBusy, setInstallHistoryBusy] = useState(false);
   const [installStatus, setInstallStatus] = useState<StatusMessage>(null);
@@ -963,60 +1038,6 @@ export function SkillsPage() {
     timersRef.current.add(id);
   }), []);
 
-  const fetchData = useCallback(async () => {
-    const [skillsRes, botsRes] = await Promise.all([
-      fetch('/api/skills'),
-      fetch('/api/bots'),
-    ]);
-    const skillsBody = await skillsRes.json().catch(() => ({}));
-    const botsBody = await botsRes.json().catch(() => ({}));
-    if (!skillsRes.ok) {
-      const error = skillsBody?.error ?? `skills HTTP ${skillsRes.status}`;
-      throw new Error(error === 'not_found_yet' || error === 'not_found' ? tr('skills.apiUnavailable') : error);
-    }
-    if (!botsRes.ok) throw new Error(botsBody?.error ?? `bots HTTP ${botsRes.status}`);
-    return {
-      skills: Array.isArray(skillsBody.skills) ? skillsBody.skills as SkillRow[] : [],
-      nativeSkillGroups: Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups as NativeSkillGroup[] : [],
-      installHistory: Array.isArray(skillsBody.installHistory) ? skillsBody.installHistory as SkillInstallHistoryRow[] : [],
-      bots: Array.isArray(botsBody.bots) ? botsBody.bots as BotRow[] : [],
-      trustProjectSkills: skillsBody.trustProjectSkills === 'all' ? 'all' as const : 'off' as const,
-      delivery: (skillsBody.delivery === 'prompt' || skillsBody.delivery === 'native' ? skillsBody.delivery : 'auto') as DeliveryMode,
-    };
-  }, [tr]);
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      const next = await fetchData();
-      if (!mountedRef.current) return;
-      setSkills(next.skills);
-      setNativeSkillGroups(next.nativeSkillGroups);
-      setInstallHistory(next.installHistory);
-      setSelectedInstallHistoryId(current => next.installHistory.some(entry => entry.id === current) ? current : '');
-      setBots(next.bots);
-      setTrustProjectSkills(next.trustProjectSkills);
-      setDelivery(next.delivery);
-      setLoadError(null);
-      setSelectedDiscovered(selected => {
-        const valid = new Set<string>();
-        const installed = new Set(next.skills.map(skill => skill.name));
-        for (const group of next.nativeSkillGroups) {
-          for (const skill of group.skills) {
-            const path = skill.rootDir ?? skill.source?.root ?? '';
-            if (path && !installed.has(skill.name) && selected.has(path)) valid.add(path);
-          }
-        }
-        return valid;
-      });
-    } catch (err: any) {
-      if (!mountedRef.current) return;
-      setLoadError(err?.message ?? String(err));
-    } finally {
-      if (mountedRef.current) setLoading(false);
-    }
-  }, [fetchData]);
-
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -1024,6 +1045,10 @@ export function SkillsPage() {
       clearTimers();
     };
   }, [clearTimers]);
+
+  useEffect(() => {
+    setSelectedInstallHistoryId(current => installHistory.some(entry => entry.id === current) ? current : '');
+  }, [installHistory]);
 
   // Drop native-discovery selections that became invalid after a refresh
   // (skill got installed, or its group disappeared).
@@ -1626,100 +1651,24 @@ export function SkillsPage() {
     <div className="skills-page-stack">
       {loading ? <LoadingState label={tr('common.loading')} /> : loadError ? <p className="hint-warn">{loadError}</p> : (
         <>
-          <div className="skills-config-row">
-            <section className="skills-config-block">
-              <SectionHeader title={tr('skills.globalDefaults')} />
-              <article className="bd-card skills-defaults-panel skills-config-card">
-                <div className="skills-control-block">
-                  <span className="skills-control-label">{tr('skills.globalProject')}</span>
-                  <SkillSegmented
-                    value={trustProjectSkills}
-                    disabled={globalBusy === 'project'}
-                    options={[
-                      { value: 'off', label: tr('skills.globalProjectOff'), help: tr('skills.globalProjectOffHelp') },
-                      { value: 'all', label: tr('skills.globalProjectAll'), help: tr('skills.globalProjectAllHelp') },
-                    ]}
-                    onChange={value => void updateGlobalProject(value)}
-                  />
-                </div>
-                <div className="skills-control-block">
-                  <span className="skills-control-label">{tr('skills.globalDelivery')}</span>
-                  <SkillSegmented
-                    value={delivery}
-                    disabled={globalBusy === 'delivery'}
-                    options={[
-                      { value: 'auto', label: tr('skills.deliveryAuto'), help: tr('skills.deliveryAutoHelp') },
-                      { value: 'prompt', label: tr('skills.deliveryPrompt'), help: tr('skills.deliveryPromptHelp') },
-                      { value: 'native', label: tr('skills.deliveryNative'), help: tr('skills.deliveryNativeHelp') },
-                    ]}
-                    onChange={value => void updateGlobalDelivery(value)}
-                  />
-                </div>
-              </article>
-            </section>
-
-            <section className="skills-config-block">
-              <SectionHeader
-                title={<FieldTitle help={tr('skills.installInfo')} helpLabel={tr('skills.installInfoLabel')}>{tr('skills.install')}</FieldTitle>}
-              />
-              <SkillsInstallPanel
-                showTitle={false}
-                installSource={installSource}
-                installPath={installPath}
-                installRef={installRef}
-                installStatus={installStatus}
-                installBusy={installBusy}
-                installDiscovering={installDiscovering}
-                installHistory={installHistory}
-                selectedInstallHistoryId={selectedInstallHistoryId}
-                installHistoryBusy={installHistoryBusy}
-                installSelectionOpen={installSelectionOpen}
-                installCandidates={installCandidates}
-                selectedInstallSkills={selectedInstallSkills}
-                onInstallSourceChange={(value) => {
-                  setInstallSource(value);
-                  setSelectedInstallHistoryId('');
-                  clearInstallDiscovery();
-                }}
-                onInstallPathChange={(value) => {
-                  setInstallPath(value);
-                  setSelectedInstallHistoryId('');
-                  clearInstallDiscovery();
-                }}
-                onInstallRefChange={(value) => {
-                  setInstallRef(value);
-                  setSelectedInstallHistoryId('');
-                  clearInstallDiscovery();
-                }}
-                onSelectInstallHistory={selectInstallHistory}
-                onUpdateInstallHistory={() => void updateInstallHistory()}
-                onToggleInstallSkill={toggleInstallCandidate}
-                onSelectAllInstallSkills={selectAllInstallCandidates}
-                onConfirmInstallSelection={() => void confirmInstallSelection()}
-                onCloseInstallSelection={() => setInstallSelectionOpen(false)}
-                onInstall={() => void installSkill()}
-                onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
-              />
-            </section>
-
-            <section className="skills-config-block">
-              <SectionHeader title={tr('skills.bots')} count={tr('skills.botCount', { count: bots.length })} hint={tr('skills.botsHelp')} />
-              <section className="bd-card skills-bots-panel skills-config-card">
-                <div className="skills-bot-grid">
-                  {bots.map(bot => (
-                    <BotPolicyCard
-                      key={bot.larkAppId}
-                      bot={bot}
-                      installedNames={installedNames}
-                      skills={skills}
-                      status={botStatuses[bot.larkAppId] ?? null}
-                      busyKey={botBusy}
-                      onSave={setBotSkills}
-                    />
-                  ))}
-                </div>
-              </section>
-            </section>
+          {packsError && (
+            <p className="hint-warn" data-packs-error role="alert">
+              {tr(packsKnown ? 'skills.packsLoadError' : 'skills.packsLoadErrorFirst', { error: packsError })}
+            </p>
+          )}
+          <div className="skills-tabs" role="tablist">
+            <button role="tab" aria-selected={activeTab === 'library'} className={activeTab === 'library' ? 'active' : ''} onClick={() => setActiveTab('library')}>
+              {tr('skills.tabLibrary')}
+            </button>
+            <button role="tab" aria-selected={activeTab === 'packs'} className={activeTab === 'packs' ? 'active' : ''} onClick={() => setActiveTab('packs')}>
+              {tr('skills.tabPacks')}
+            </button>
+            <button role="tab" aria-selected={activeTab === 'bots'} className={activeTab === 'bots' ? 'active' : ''} onClick={() => setActiveTab('bots')}>
+              {tr('skills.tabBots')}
+            </button>
+            <button role="tab" aria-selected={activeTab === 'delivery'} className={activeTab === 'delivery' ? 'active' : ''} onClick={() => setActiveTab('delivery')}>
+              {tr('skills.tabDelivery')}
+            </button>
           </div>
 
           {activeTab === 'packs' && (
@@ -1755,10 +1704,15 @@ export function SkillsPage() {
               installSelectionOpen={installSelectionOpen}
               installCandidates={installCandidates}
               selectedInstallSkills={selectedInstallSkills}
-              onInstallSourceChange={(value) => { setInstallSource(value); clearInstallDiscovery(); }}
-              onInstallPathChange={(value) => { setInstallPath(value); clearInstallDiscovery(); }}
-              onInstallRefChange={(value) => { setInstallRef(value); clearInstallDiscovery(); }}
+              installHistory={installHistory}
+              selectedInstallHistoryId={selectedInstallHistoryId}
+              installHistoryBusy={installHistoryBusy}
+              onInstallSourceChange={(value) => { setInstallSource(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
+              onInstallPathChange={(value) => { setInstallPath(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
+              onInstallRefChange={(value) => { setInstallRef(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
               onInstallFullDepthChange={(value) => { setInstallForceFullDepth(value); clearInstallDiscovery(); }}
+              onSelectInstallHistory={selectInstallHistory}
+              onUpdateInstallHistory={() => void updateInstallHistory()}
               onToggleInstallSkill={toggleInstallCandidate}
               onSelectAllInstallSkills={selectAllInstallCandidates}
               onConfirmInstallSelection={confirmInstallSelection}

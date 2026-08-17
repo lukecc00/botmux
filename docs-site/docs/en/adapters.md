@@ -7,7 +7,7 @@ botmux bridges different CLIs / agents through adapters, selected via `cliId` in
 
 ## Supported CLIs / Agents
 
-The table lists the current built-in adapters (the **authoritative source** for `cliId`s is [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts), which changes across versions):
+The table lists the current built-in adapters (the **authoritative source** for `cliId`s is [`src/adapters/cli/registry.ts`](../../../src/adapters/cli/registry.ts), which changes across versions):
 
 | `cliId` | CLI / Agent | Integration | `model` |
 |---------|-----|-----|:--:|
@@ -119,4 +119,4 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 5. Add an option to the setup interactive menu in `src/cli.ts`
 6. Update the README
 
-See [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) for details.
+See [CONTRIBUTING.md](../../../CONTRIBUTING.md) for details.

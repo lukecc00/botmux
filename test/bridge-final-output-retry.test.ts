@@ -669,7 +669,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain('[botmux](');
+    expect(cardJson).toContain('botmux_reply_footer');
     expect(cardJson).not.toContain('web终端');
     expect(cardJson).not.toContain('reply_stop');
     expect(cardJson).not.toContain('reply_manage');
@@ -786,7 +786,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(elements[0].content).toBe('<at id=ou_human></at>');
     expect(elements[elements.length - 1]).toMatchObject({
       tag: 'markdown',
-      content: expect.stringContaining('[botmux]('),
+      element_id: 'botmux_reply_footer',
     });
     expect(cardJson.match(/<at id=ou_human><\/at>/g)).toHaveLength(1);
     expect(cardJson).not.toContain('reply_stop');
@@ -1734,7 +1734,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(getSessionUsageSnapshot).not.toHaveBeenCalled();
     const card = sessionReply.mock.calls[0]?.[1] as string;
-    expect(card).toContain('[botmux](');
+    expect(card).not.toContain('botmux_reply_footer');
     expect(card).not.toContain('上下文');
     expect(card).not.toContain('Token');
   });

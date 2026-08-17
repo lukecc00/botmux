@@ -3,6 +3,6 @@
  * while simplifying a card into Format A. */
 export const REPLY_CARD_FOOTER_ELEMENT_ID = 'botmux_reply_footer';
 export const REPLY_CARD_FOOTER_MARKER_URL =
-  'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1';
+  'https://localhost/#reply-card-footer-v2';
 export const REPLY_CARD_FOOTER_MARKER =
   `[·](${REPLY_CARD_FOOTER_MARKER_URL})`;

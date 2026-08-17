@@ -32,6 +32,10 @@ import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
 } from './services/codex-app-token-usage.js';
+import {
+  CODEX_APP_INPUT_PREFIX,
+  decodeCodexAppRunnerInput,
+} from './services/codex-app-runner-protocol.js';
 
 type JsonObject = Record<string, any>;
 
@@ -151,6 +155,33 @@ interface QueuedInput {
 
 const output = new RunnerControlWriter();
 const recentMarkers: Array<{ kind: string; payload: unknown }> = [];
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const RECONCILIATION_TIMEOUT_MS = 5_000;
+const RECONCILIATION_PAGE_LIMIT = 3;
+const RECONCILIATION_PAGE_SIZE = 50;
+
+class AppServerRpcError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number | undefined,
+    readonly data: unknown,
+    message: string,
+  ) {
+    super(`${method}: ${message}`);
+    this.name = 'AppServerRpcError';
+  }
+}
+
+class AppServerRequestTimeoutError extends Error {
+  constructor(readonly method: string, readonly timeoutMs: number) {
+    super(`${method}: timed out after ${timeoutMs}ms; request acceptance is unknown`);
+    this.name = 'AppServerRequestTimeoutError';
+  }
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
 
 function parseArgs(argv: string[]): Args {
   const controlBootstrapPath = process.env[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
@@ -186,12 +217,6 @@ function parseArgs(argv: string[]): Args {
   out.controlSocketPath = control.socketPath;
   out.controlLocatorPath = control.locatorPath;
   return out;
-}
-
-function emitMarker(kind: string, payload: unknown): void {
-  recentMarkers.push({ kind, payload });
-  if (recentMarkers.length > 512) recentMarkers.splice(0, recentMarkers.length - 512);
-  output.marker(kind, payload);
 }
 
 function markerReplyTurnId(payload: unknown): string | undefined {
@@ -595,6 +620,8 @@ function emitMarker(kind: string, payload: JsonObject): void {
     process.exit(2);
     return;
   }
+  recentMarkers.push({ kind, payload });
+  if (recentMarkers.length > 512) recentMarkers.splice(0, recentMarkers.length - 512);
   controlQueue.push({ seq: ++controlSeq, kind, payload });
   flushControlQueue();
 }
@@ -1213,8 +1240,26 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'item/completed') {
     const item = params.item;
     if (item?.type === 'agentMessage') {
-      if (item.phase === 'final_answer') turn.finalText = String(item.text ?? '');
-      else if (!turn.itemText.has(item.id) && item.text) {
+      const itemId = String(item.id ?? '');
+      const text = typeof item.text === 'string'
+        ? item.text
+        : turn.itemText.get(itemId) ?? '';
+      if (item.phase === 'final_answer') turn.finalText = text;
+      else if (item.phase === 'commentary') {
+        const content = text.trim();
+        const appTurnId = turn.nativeTurnId
+          ?? (typeof notificationTurnId === 'string' ? notificationTurnId : undefined);
+        const replyTurnId = turn.accepted?.at(-1)?.replyTurnId
+          ?? turn.clientUserMessageId;
+        if (content && itemId && appTurnId) {
+          emitMarker('progress', {
+            content,
+            itemId,
+            appTurnId,
+            ...(replyTurnId ? { replyTurnId } : {}),
+          });
+        }
+      } else if (!turn.itemText.has(itemId) && text) {
         turn.allAgentText += String(item.text);
       }
     }
@@ -2025,31 +2070,49 @@ async function runTurn(message: QueuedInput): Promise<void> {
   activeTurn = null;
 }
 
-controller = new CodexAppTurnController({
-  cwd: args.cwd,
-  ensureThread,
-  request: (method, params) => client.request(method, params),
-  prepareInput: prepareControllerInput,
-  isStartCapabilityError: isCleanInputCapabilityError,
-  onTurnInput(_input, prepared) {
-    writeLine();
-    writeLine('[user]');
-    writeLine(prepared.visibleText);
-    writeLine();
-  },
-  onOutput: text => output.display(text),
-  onDiagnostic: writeLine,
-  onLifecycle: event => emitMarker('lifecycle', event),
-  onProgress: marker => emitMarker('progress', marker),
-  onFinal: marker => {
-    // Attach this turn's token usage (if the accumulator saw coherent totals)
-    // and drain its accumulator. Omitted when no usage was observed — never zeros.
-    const acc = marker.appTurnId ? usageAccumulators.get(marker.appTurnId) : undefined;
-    const usage = acc?.result() ?? undefined;
-    // Surface a protocol anomaly rather than silently omitting usage — a
-    // regression/negative-baseline should be visible in the runner log.
-    if (acc?.warning && !usage) {
-      writeLine(`[codex-app] token usage dropped for turn ${marker.appTurnId ?? '?'}: ${acc.warning}`);
+async function drainQueue(): Promise<void> {
+  if (processing) return;
+  processing = true;
+  try {
+    while (queue.length > 0) {
+      // An unknown turn outcome poisons the FIFO. The signed fatal lifecycle
+      // already tears this generation down, so never consume another input.
+      if (generationFenced) break;
+      // A non-steerable input must remain serial while a native Goal turn is
+      // active. The native completion path will re-kick this drain.
+      if (nativeActiveTurnId !== undefined && queue[0].codexAppSteerable !== true) {
+        break;
+      }
+      const next = queue.shift()!;
+      try {
+        await runTurn(next);
+      } catch (err: any) {
+        if (generationFenced) {
+          activeTurn = null;
+          break;
+        }
+        const message = `Codex App runner error: ${err?.message ?? err}`;
+        const completedAtMs = Date.now();
+        const replyTurnId = next.replyTurnId;
+        const nativeTurnId = activeTurn?.nativeTurnId;
+        writeLine(message);
+        emitFinalMarker({
+          ...(replyTurnId ? { turnId: replyTurnId } : {}),
+          ...(nativeTurnId ? { nativeTurnId } : {}),
+          content: message,
+          startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
+          completedAtMs,
+        });
+        activeTurn = null;
+      }
+      const parkedBehindGoal = queue.length > 0
+        && nativeActiveTurnId !== undefined
+        && queue[0].codexAppSteerable !== true;
+      if (queue.length === 0 || parkedBehindGoal) {
+        const nativeBusy = nativeActiveTurnId !== undefined;
+        emitRunnerState(nativeBusy, !nativeBusy);
+        if (!nativeBusy) prompt();
+      }
     }
   } finally {
     processing = false;
@@ -2085,8 +2148,19 @@ function enqueueLine(line: string): void {
       }
     } catch { /* ordinary decoder below owns malformed-message diagnostics */ }
     const decoded = decodeCodexAppRunnerInput(trimmed);
-    if (decoded) controller.enqueue(decoded);
-    else writeLine('[codex-app] bad botmux input');
+    if (!decoded) {
+      writeLine('[codex-app] bad botmux input');
+      return;
+    }
+    queue.push({
+      content: decoded.content,
+      ...(decoded.codexAppInput ? { codexAppInput: decoded.codexAppInput } : {}),
+      ...(decoded.replyTurnId ? { replyTurnId: decoded.replyTurnId } : {}),
+      ...(decoded.codexAppSteerable === true ? { codexAppSteerable: true } : {}),
+      receivedAtMs: Date.now(),
+    });
+    void tryAdmitSteer();
+    void drainQueue();
     return;
   }
   queue.push({ content: line });

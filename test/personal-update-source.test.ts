@@ -33,6 +33,10 @@ describe('personal distribution source invariants', () => {
     const workflow = read('.github/workflows/release.yml');
     expect(workflow).toContain('Create GitHub Release');
     expect(workflow).toContain('dev-version.json');
+    expect(workflow).toContain('must be an annotated tag');
+    expect(workflow).toContain('refs/remotes/origin/p/ai_open');
+    expect(workflow).toContain('TAG_COMMIT');
+    expect(workflow).toContain('CHANNEL_COMMIT');
     expect(workflow).not.toContain('npm publish');
     expect(workflow).not.toContain('NODE_AUTH_TOKEN');
   });
@@ -43,5 +47,8 @@ describe('personal distribution source invariants', () => {
     expect(read('src/utils/install-info.ts')).toContain("PERSONAL_UPDATE_REF = 'p/ai_open'");
     expect(read('src/core/update-check.ts')).toContain('raw.githubusercontent.com/${GITHUB_REPO}/${PERSONAL_UPDATE_REF}/dev-version.json');
     expect(read('src/core/github-source.ts')).toContain('git@github.com:${repo}.git');
+    expect(read('src/core/botmux-update-monitor.ts')).toContain('startBotmuxUpdateMonitor');
+    expect(read('src/core/botmux-update-monitor.ts')).toContain('managedSourceInstall()');
+    expect(read('src/daemon.ts')).toContain('startBotmuxUpdateMonitor({');
   });
 });

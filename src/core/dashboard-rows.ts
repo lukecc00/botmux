@@ -203,6 +203,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...sessionRuntimeFields(ds.session),
     // Durable bridge/handoff work can outlive one worker process, while an
     // ordinary workerless active row is dormant. Keep this projection aligned
     // with the daemon's lifecycle policy instead of re-deriving it here.

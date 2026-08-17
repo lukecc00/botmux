@@ -744,6 +744,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY',
   'ai.followup.reminder_no_resend': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY；send 成功即已送达，本轮无可见文本地结束是正常的，别因「无输出」提示重发',
+  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书，终端里的输出用户看不到。会话约定：回复通过 botmux send 发送到飞书话题；发什么、发几条由你判断。只有无需回复时才让 final 只输出 BOTMUX_NO_REPLY。',
   'ai.followup.codex_structured_delivery': '把本轮关键阶段写成面向用户的 commentary，最后给出 final；两者会分别自动同步为当前话题内的飞书卡片。长任务在每个可验证阶段完成后、长构建/测试/等待前、新发现改变下一步时立即写 commentary，简要说明已验证事实、选定方案及依据、下一步；不要等到 final、不要合并里程碑，也不要输出内部思维链、草稿、原始命令日志或细碎状态。普通进度/结果不要用 `botmux send` 重复发送；附件、@mention、跨群除外。',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
@@ -1297,6 +1298,15 @@ export const messages: Record<string, string> = {
   'cli_update.command': '建议在宿主终端执行：{command}',
   'cli_update.manual_only': 'botmux 只检查并提醒，不会自动安装；现有会话不受影响。',
   'cli_update.dashboard': 'Dashboard：{url}',
+
+  // Personal Botmux distribution update monitor
+  'botmux_update.card_title': '个人版 botmux 有新版本',
+  'botmux_update.available': '⬆️ **检测到个人版 botmux 新版本**',
+  'botmux_update.version_delta': '版本：{current} → {latest}',
+  'botmux_update.source': '更新源：`{repo}@{ref}`',
+  'botmux_update.command': '可在 Dashboard 的「版本与更新」中升级，或在宿主终端执行：{command}',
+  'botmux_update.manual_only': '本提醒只负责检测和通知，不会自动安装；现有会话不受影响。',
+  'botmux_update.dashboard': 'Dashboard：{url}',
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 `im.chat.member.bot.added_v1`。\n\n请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 `botmux restart`。\n\n错误详情：{detail}',

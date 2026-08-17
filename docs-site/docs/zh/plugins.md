@@ -544,7 +544,7 @@ gh pr create \
 
 ## 参考
 
-- [Botmux 源码](https://github.com/deepcoldy/botmux)
+- [当前项目源码](../../../src/)
 - [官方 Plugin 模板](https://github.com/botmux-ai/botmux-plugin-template)
 - [Botmux Plugin Market](https://github.com/botmux-ai/plugin-market)
 - [Agent Chrome Plugin 示例](https://github.com/botmux-ai/botmux-plugin-agent-chrome)

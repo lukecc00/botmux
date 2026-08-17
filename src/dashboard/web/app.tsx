@@ -503,7 +503,7 @@ function AuthExpiredOverlay(props: {
       <div className="auth-expired-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-expired-title">
         <h2 id="auth-expired-title">{canLogin ? '登录 Dashboard' : '访问链接已失效'}</h2>
         <p>{canLogin
-          ? '当前浏览器尚未登录。点击后将通过 Botmux 平台校验机器 owner 权限，并返回当前页面；无权限账号仍会被拒绝。'
+          ? '当前浏览器尚未登录。点击后将通过平台校验机器 owner 权限，并返回当前页面；无权限账号仍会被拒绝。'
           : '当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。'}</p>
         <div className="auth-expired-actions">
           {props.loginUrl ? (
@@ -968,17 +968,6 @@ function TopbarVersionControl(props: {
               role={phase === 'error' || refreshFailed ? 'alert' : 'status'}
               aria-live="polite"
             >{message}</p>
-            <a
-              className="dashboard-version-release-link"
-              href="https://github.com/deepcoldy/botmux/releases"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M8 1.5a6.5 6.5 0 0 0-2.1 12.65c.33.06.45-.14.45-.32v-1.26c-1.84.4-2.23-.78-2.23-.78-.3-.76-.73-.96-.73-.96-.6-.41.05-.4.05-.4.66.05 1 .68 1 .68.59 1 1.54.72 1.92.55.06-.42.23-.72.42-.88-1.47-.17-3.02-.74-3.02-3.28 0-.72.26-1.32.68-1.78-.07-.17-.3-.84.07-1.75 0 0 .56-.18 1.79.68A6.2 6.2 0 0 1 8 4.63a6.2 6.2 0 0 1 1.71.22c1.23-.86 1.79-.68 1.79-.68.37.91.14 1.58.07 1.75.42.46.68 1.06.68 1.78 0 2.55-1.55 3.11-3.03 3.28.24.21.45.61.45 1.23v1.62c0 .18.12.38.46.32A6.5 6.5 0 0 0 8 1.5Z" />
-              </svg>
-              <span>{t('update.changelogViewOnGitHub')}</span>
-            </a>
             {(behind || rollbackOpen) && status.installs.multiple ? (
               <details className="dashboard-version-installs">
                 <summary>{t('update.multiInstallWarn')}</summary>
@@ -1053,15 +1042,7 @@ function TopbarVersionControl(props: {
                         <path d="M7.1 2.3 1.8 12a1 1 0 0 0 .9 1.5h10.6a1 1 0 0 0 .9-1.5L8.9 2.3a1 1 0 0 0-1.8 0Z" />
                         <path d="M8 5.5v3.6M8 11.6h.01" />
                       </svg>
-                      <span>
-                        {t('update.rollbackRisk', { version: selectedRollback })}{' '}
-                        <a
-                          href={`https://github.com/deepcoldy/botmux/releases/tag/v${encodeURIComponent(selectedRollback)}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          aria-label={t('update.rollbackReleaseNotesA11y', { version: selectedRollback })}
-                        >{t('update.rollbackReleaseNotes', { version: selectedRollback })}</a>
-                      </span>
+                      <span>{t('update.rollbackRisk', { version: selectedRollback })}</span>
                     </p>
                   ) : null}
                   {rollbackVersions.length > 0 ? (
@@ -1165,10 +1146,6 @@ function DashboardShell(): React.JSX.Element {
           <div className="topbar-left">
             <div className="topbar-brand-block">
               <a className="brand" href="#/">
-                <span className="brand-mark" aria-hidden="true">
-                  <img className="brand-logo-img" src="/assets/brand-logo.png" alt="" decoding="sync" loading="eager" fetchPriority="high" />
-                </span>
-                <strong className="brand-wordmark">Botmux</strong>
                 <span className="brand-product">Dashboard</span>
               </a>
               <TopbarVersionControl status={botmuxUpdateStatus} onRefresh={() => checkUpdateBadge(true)} />

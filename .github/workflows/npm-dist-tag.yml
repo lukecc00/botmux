@@ -43,15 +43,15 @@ jobs:
   retag:
     runs-on: ubuntu-latest
     steps:
-      - name: Require deepcoldy authority
+      - name: Require repository-owner authority
         # 重指 dist-tag（尤其 latest）直接改变每个 `npm i -g botmux` 用户装到的
-        # 版本,是敏感运维操作。对齐 release.yml 里「只有 deepcoldy 能动 latest」
-        # 的授权模型,这里更保守:整个 workflow 都要求 deepcoldy 本人触发。
+        # 版本是敏感运维操作。整个 workflow 只允许当前仓库 owner 触发，
+        # 避免 fork 继续绑定上游维护者身份。
         # 用独立 step fail-loud（exit 1）而非 job 级 if,让未授权触发显式 failed、
         # 不静默 skip。
-        if: github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy'
+        if: github.actor != github.repository_owner || github.triggering_actor != github.repository_owner
         run: |
-          echo "REFUSING: npm dist-tag changes may only be run by deepcoldy."
+          echo "REFUSING: npm dist-tag changes may only be run by the repository owner."
           echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
           exit 1
 

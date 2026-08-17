@@ -7,7 +7,7 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 
 ## 支持的 CLI / Agent
 
-下表为当前内置适配器（`cliId` 的**权威事实源**是 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts)，随版本增减）：
+下表为当前内置适配器（`cliId` 的**权威事实源**是 [`src/adapters/cli/registry.ts`](../../../src/adapters/cli/registry.ts)，随版本增减）：
 
 | `cliId` | CLI / Agent | 接入方式 | 支持 `model` |
 |---------|-----|-----|:--:|
@@ -119,4 +119,4 @@ BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` �
 5. `src/cli.ts` setup 交互菜单加选项
 6. 更新 README
 
-详见 [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md)。
+详见 [CONTRIBUTING.md](../../../CONTRIBUTING.md)。

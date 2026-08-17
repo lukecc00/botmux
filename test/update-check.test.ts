@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   parseVersion,
   isStableVersion,
@@ -131,8 +131,10 @@ function jsonResponse(status: number, body: unknown): Response {
 function gitFallback(
   tags: string[] | null,
   annotations: Record<string, GithubTagAnnotation> = {},
+  manifest: string | null = null,
 ): GithubGitFallback {
   return {
+    readFileAtRef: async () => manifest,
     listTags: async () => tags,
     readTagAnnotations: async () => new Map(Object.entries(annotations)),
   };
@@ -143,42 +145,62 @@ describe('fetchLatestVersion', () => {
     const requested: string[] = [];
     const v = await fetchLatestVersion({ fetchImpl: async (input) => {
       requested.push(String(input));
-      return String(input).includes('/releases/latest')
-        ? jsonResponse(404, {})
-        : jsonResponse(200, { version: '2.85.1' });
+      return jsonResponse(200, { version: '3.2.8' });
     }, gitFallback: null });
-    expect(v).toBe('2.85.1');
-    expect(requested).toContain('https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json');
+    expect(v).toBe('3.2.8');
+    expect(requested).toEqual([
+      'https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/dev-version.json',
+    ]);
   });
-  it('uses the latest stable GitHub release when the API is available', async () => {
+
+  it('does not let synchronized upstream tags override the personal manifest', async () => {
+    const fallback = gitFallback(['v3.13.0', 'v3.12.1', 'v3.2.8']);
+    const listTags = vi.spyOn(fallback, 'listTags');
     const v = await fetchLatestVersion({
-      fetchImpl: async (input) => String(input).includes('/releases/latest')
-        ? jsonResponse(200, { tag_name: 'v3.2.2', prerelease: false, draft: false })
-        : jsonResponse(503, {}),
-      gitFallback: null,
+      fetchImpl: async () => jsonResponse(200, { version: '3.2.8' }),
+      gitFallback: fallback,
     });
-    expect(v).toBe('3.2.2');
+    expect(v).toBe('3.2.8');
+    expect(listTags).not.toHaveBeenCalled();
   });
-  it('falls back to stable SSH tags when GitHub HTTPS is unavailable', async () => {
+
+  it('falls back to the fixed-ref manifest over SSH when raw GitHub is unavailable', async () => {
+    const fallback = gitFallback(
+      ['v3.13.0', 'v3.2.8'],
+      {},
+      JSON.stringify({ version: '3.2.8' }),
+    );
+    const readFileAtRef = vi.spyOn(fallback, 'readFileAtRef');
     const v = await fetchLatestVersion({
       fetchImpl: async () => { throw new Error('https blocked'); },
-      gitFallback: gitFallback(['v3.2.0', 'v3.2.2-rc.1', 'v3.2.1']),
+      gitFallback: fallback,
+      timeoutMs: 1234,
     });
-    expect(v).toBe('3.2.1');
+    expect(v).toBe('3.2.8');
+    expect(readFileAtRef).toHaveBeenCalledWith(
+      'lukecc00/botmux',
+      'p/ai_open',
+      'dev-version.json',
+      1234,
+    );
   });
-  it('uses the highest stable version when update sources briefly disagree', async () => {
-    const v = await fetchLatestVersion({
-      fetchImpl: async (input) => String(input).includes('/releases/latest')
-        ? jsonResponse(200, { tag_name: 'v3.2.0' })
-        : jsonResponse(200, { version: '3.2.1' }),
-      gitFallback: gitFallback(['v3.2.2']),
-    });
-    expect(v).toBe('3.2.2');
+
+  it('never promotes a release API or tag when the authoritative manifest is invalid', async () => {
+    const fallback = gitFallback(
+      ['v3.13.0', 'v3.2.8'],
+      {},
+      JSON.stringify({ version: 'latest' }),
+    );
+    expect(await fetchLatestVersion({
+      fetchImpl: async () => jsonResponse(200, { version: 'latest' }),
+      gitFallback: fallback,
+    })).toBeNull();
   });
-  it('null on non-200 / malformed / unparseable / throw', async () => {
+
+  it('returns null on unavailable or malformed manifests', async () => {
     expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}), gitFallback: null })).toBeNull();
     expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, {}), gitFallback: null })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'latest' }), gitFallback: null })).toBeNull();
+    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'v3.2.8' }), gitFallback: null })).toBeNull();
     expect(await fetchLatestVersion({ fetchImpl: async () => { throw new Error('offline'); }, gitFallback: null })).toBeNull();
   });
 });
@@ -313,16 +335,17 @@ describe('fetchReleasesSince', () => {
     const out = await fetchReleasesSince('3.1.9', {
       fetchImpl: async () => jsonResponse(403, {}),
       gitFallback: gitFallback(
-        ['v3.2.0', 'v3.2.1', 'v3.3.0-rc.1'],
+        ['v3.13.0', 'v3.2.0', 'v3.2.1'],
         {
-          'v3.2.0': { body: '二开说明 3.2.0', createdAt: '2026-07-18T00:00:00+08:00' },
           'v3.2.1': { body: '二开说明 3.2.1', createdAt: '2026-07-19T00:00:00+08:00' },
+          'v3.13.0': { body: '官方同步 tag，不属于个人通道', createdAt: '2026-08-01T00:00:00+08:00' },
         },
+        JSON.stringify({ version: '3.2.1' }),
       ),
     });
     expect(out.ok).toBe(true);
     expect(out.rateLimited).toBeUndefined();
-    expect(out.releases.map(release => release.version)).toEqual(['3.2.1', '3.2.0']);
+    expect(out.releases.map(release => release.version)).toEqual(['3.2.1']);
     expect(out.releases[0]).toMatchObject({ body: '二开说明 3.2.1', publishedAt: '2026-07-19T00:00:00+08:00' });
     expect(out.releases[0].url).toBe('https://github.com/lukecc00/botmux/releases/tag/v3.2.1');
   });

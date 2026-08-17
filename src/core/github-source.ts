@@ -18,6 +18,13 @@ export interface GithubTagAnnotation {
 }
 
 export interface GithubGitFallback {
+  /** Read one repository file from an exact branch/ref without enumerating tags. */
+  readFileAtRef?: (
+    repo: string,
+    ref: string,
+    path: string,
+    timeoutMs?: number,
+  ) => Promise<string | null>;
   listTags: (repo: string, timeoutMs?: number) => Promise<string[] | null>;
   readTagAnnotations: (
     repo: string,
@@ -49,6 +56,42 @@ function runGit(args: string[], timeoutMs: number): Promise<string> {
       else resolve(stdout);
     });
   });
+}
+
+
+/**
+ * Read one file from an exact remote ref over SSH. This is the safe fallback
+ * for release-channel manifests: a fork can contain upstream tags, so scanning
+ * all tags cannot establish which versions belong to the fork's own channel.
+ */
+export async function readGithubFileAtRefViaSsh(
+  repo: string,
+  ref: string,
+  path: string,
+  timeoutMs = 12_000,
+): Promise<string | null> {
+  // These are passed to git as argv (never a shell), but reject option-like or
+  // traversal-shaped values anyway so this helper remains a narrow boundary.
+  if (!/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-') || ref.includes('..')) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(path) || path.startsWith('/') || path.includes('..')) return null;
+
+  let dir: string | undefined;
+  try {
+    dir = await mkdtemp(join(tmpdir(), 'botmux-github-ref-'));
+    await runGit([
+      'clone', '--bare', '--quiet', '--filter=blob:none', '--depth=1',
+      '--single-branch', '--branch', ref,
+      githubSshUrl(repo),
+      dir,
+    ], timeoutMs);
+    // The partial clone keeps the first transfer small. `show` lazily fetches
+    // only the requested blob through the configured promisor remote.
+    return await runGit(['--git-dir', dir, 'show', `HEAD:${path}`], timeoutMs);
+  } catch {
+    return null;
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** List v-prefixed tags without downloading the repository. null on failure. */
@@ -118,6 +161,7 @@ export async function readGithubTagAnnotationsViaSsh(
 }
 
 export const defaultGithubGitFallback: GithubGitFallback = {
+  readFileAtRef: readGithubFileAtRefViaSsh,
   listTags: listGithubTagsViaSsh,
   readTagAnnotations: readGithubTagAnnotationsViaSsh,
 };

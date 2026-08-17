@@ -3,7 +3,7 @@
 ## Development Setup
 
 ```bash
-git clone https://github.com/deepcoldy/botmux.git
+git clone <your-repository-url> botmux
 cd botmux
 pnpm install
 pnpm build

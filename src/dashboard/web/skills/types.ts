@@ -49,6 +49,16 @@ export interface InstallSkillCandidate {
   description?: string;
 }
 
+export interface SkillInstallHistoryRow {
+  id: string;
+  source: string;
+  path?: string;
+  ref?: string;
+  skillNames: string[];
+  installedSkillNames: string[];
+  updatedAt: string;
+}
+
 export type StatusMessage = { text: string; ok: boolean } | null;
 export type DeliveryMode = 'auto' | 'prompt' | 'native';
 export type ProjectTrustMode = 'off' | 'all';

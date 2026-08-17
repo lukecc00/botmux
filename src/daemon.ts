@@ -42,6 +42,10 @@ import {
   startCliRuntimeUpdateMonitor,
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
+import {
+  startBotmuxUpdateMonitor,
+  stopBotmuxUpdateMonitor,
+} from './core/botmux-update-monitor.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import {
   SUPERVISOR_SHUTDOWN_PROTOCOL,
@@ -249,11 +253,22 @@ import {
   selectCodexHandoffSummary,
   shouldFreshHandoffCodex,
 } from './core/codex-handoff.js';
-import { triggerSessionTurn } from './core/trigger-session.js';
+import {
+  triggerSessionTurn,
+  reconcileIdempotencyLeasesOnBoot,
+  convergeIdempotentAsyncTurnOnWorkerExit,
+  externalEventOpensOwnTopic,
+} from './core/trigger-session.js';
+import {
+  runDetachedBotTurnMutation,
+  tryWithBotTurnMutation,
+  withBotTurnAdmission,
+  withBotTurnMutation,
+} from './core/bot-turn-mutation-gate.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, rememberTurnCaller, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, rememberTurnCaller, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -4576,16 +4591,17 @@ async function migrateCodexHandoffToFreshSession(
     fresh.workingDir = session.workingDir;
     fresh.hasHistory = !!session.cliSessionId;
     const freshKey = sessionKey(anchor, source.larkAppId);
-    if (!await setActiveSessionSafe(
+    const registration = await setActiveSessionSafe(
       activeSessions,
       freshKey,
       fresh,
       { suppressPreviousStopNotice: true },
-    )) {
+    );
+    if (!registration.accepted) {
       throw new Error('fresh Codex session lost the same-topic registration race');
     }
     ensureSessionWhiteboard(fresh);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(fresh);
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(fresh, promptText);
     const input = buildNewTopicCliInput(
       promptText,
       session.sessionId,
@@ -4817,7 +4833,7 @@ async function beginAutomaticCodexContextHandoff(
   };
   source.pendingCodexFreshHandoff = pending;
   persistCodexHandoff(source);
-  beginNewTurn(source, 'Codex Handoff Summary');
+  beginNewTurn(source, 'Codex Handoff Summary', pending.summaryTurnId);
   armCodexHandoffWatchdog(source, pending);
   try {
     source.worker.send({
@@ -4947,7 +4963,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
 
   if (ds.worker && !ds.worker.killed) {
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, `[Doc Watch] ${sub.fileToken}`);
     const { promptContent, cliInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -4965,7 +4981,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
+    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, `[Doc Watch] ${sub.fileToken}`);
     const { promptContent, cliInput: wrappedInput } = buildDocWatchWarmupTurnInput({
       ds,
       promptInput: warmupInput,
@@ -5412,6 +5428,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingCodexAppText = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingTopicGroupMemoryBlock = undefined;
   ds.pendingChatContext = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
@@ -16743,6 +16760,7 @@ function buildReservedInitialInput(
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
+      topicGroupMemoryBlock: ds.pendingTopicGroupMemoryBlock,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
       // master: thread the joined-chat context into the opening prompt (group-join
@@ -16761,6 +16779,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingCodexAppText = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingTopicGroupMemoryBlock = undefined;
   ds.pendingAttachments = undefined;
   ds.pendingMentions = undefined;
   ds.pendingSubstituteTrigger = undefined;
@@ -17238,7 +17257,7 @@ function deliverPassthroughToExistingSession(
         phase: 'collecting',
       };
       persistCodexHandoff(ds);
-      beginNewTurn(ds, 'Codex Handoff Summary');
+      beginNewTurn(ds, 'Codex Handoff Summary', ds.pendingCodexFreshHandoff.summaryTurnId);
       const pending = ds.pendingCodexFreshHandoff;
       armCodexHandoffWatchdog(ds, pending);
       try {
@@ -17408,7 +17427,8 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId);
+  const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
   rememberTurnCaller(ds, messageId, senderOpenId, undefined, session.quoteTargetSenderIsBot);
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
@@ -17761,7 +17781,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId));
   const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
   const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
-  const botCfg = getBot(larkAppId).config;
+  const selfBot = getBot(larkAppId);
+  const botCfg = selfBot.config;
   // Upgrade a card match's text/title from the resolved message (button URLs the
   // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
   if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
@@ -18288,7 +18309,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+  // Post inline-@ participants from BOTH the current message and a folded
+  // forward seed — extracted once so the CAS-loser handoff below can carry the
+  // exact same set (a race-losing scratch's seed @s must not vanish).
+  const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt);
+  // Turn key is the reply anchor (== messageId outside session-group births) so
+  // the per-turn reply context and currentReplyTarget.turnId line up with the
+  // worker's turn id — current-turn provenance requires that equality.
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   rememberTurnCaller(ds, messageId, senderOpenId, undefined, session.quoteTargetSenderIsBot);
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
@@ -18348,12 +18377,20 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt, { turnId: messageId });
-    ds.pendingTurnId = undefined;
+    await maybeSeedCardlessForceTopicTurn({
+      ds,
+      enabled: !!forceTopic && !isBareForceTopic,
+      anchor,
+      messageId,
+    });
+    ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    const availableBots = await getAvailableBots(larkAppId, chatId);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    forkReservedInitialSession(ds, availableBots);
+    // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+    markIngressAdmitted(ctx);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -18392,12 +18429,18 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     markIngressAdmitted(ctx);
     ds.pendingRepo = false;
     ensureSessionWhiteboard(ds);
-    const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt, { turnId: messageId });
-    ds.pendingTurnId = undefined;
+    await maybeSeedCardlessForceTopicTurn({
+      ds,
+      enabled: !!forceTopic && !isBareForceTopic,
+      anchor,
+      messageId,
+    });
+    ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    const availableBots = await getAvailableBots(larkAppId, chatId);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    forkReservedInitialSession(ds, availableBots);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -18795,14 +18838,6 @@ async function handleBotAdded(
     // even in 话题群 (where dsKey is the seed id, not chatId).
     groupJoinAnchorByChat.set(chatLiveKey, dsKey);
 
-    const selfBot = getBot(larkAppId);
-    const buildPrompt = async () => buildNewTopicCliInput(
-      promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
-      undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
-      { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, topicGroupMemoryBlock: await loadTopicGroupMemoryBlockForSession(ds), codexAppText },
-    );
-
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
@@ -18822,6 +18857,7 @@ async function handleBotAdded(
         return;
       }
       ensureSessionWhiteboard(ds);
+      ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, promptBody);
       const availableBots = await getAvailableBots(larkAppId, chatId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
@@ -18871,6 +18907,7 @@ async function handleBotAdded(
     } else {
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
+      ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, promptBody);
       const availableBots = await getAvailableBots(larkAppId, chatId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
@@ -19560,7 +19597,18 @@ async function handleThreadReplyAdmitted(
     const substituteReplyMode = substituteTrigger
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+    // Sender name is best-effort here: getThreadSender() resolves later (this
+    // hot path avoids an await before the buffering barrier), so the candidate
+    // list may show open_id without a name — the ambiguity decision itself is
+    // unaffected. Post inline-@s: on a prepared (registration-race loser) handoff
+    // use the COMPLETE pre-extracted seed+follow-up set; otherwise extract from
+    // this message. Include the forward-seed message too: a new-topic/auto-create
+    // CAS loser routes here without re-passing prepared.postParticipantMentions, so
+    // recompute from BOTH data and ctx.forwardSeedData or the seed's post @s vanish
+    // on the double-race (matches the new-topic path's collectPostAtMentions args).
+    const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
     rememberTurnCaller(ds, parsed.messageId, callerOpenId, undefined, isForeignBot);
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -19881,7 +19929,8 @@ async function handleThreadReplyAdmitted(
 
     const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
     const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
-    const botCfg = getBot(larkAppId).config;
+    const selfBot = getBot(larkAppId);
+    const botCfg = selfBot.config;
     const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
       larkAppId,
       autoCreateChatId,
@@ -19990,7 +20039,9 @@ async function handleThreadReplyAdmitted(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+    const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
     rememberTurnCaller(newDs, parsed.messageId, senderOId, undefined, isForeignBot);
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
@@ -20045,8 +20096,8 @@ async function handleThreadReplyAdmitted(
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       ensureSessionWhiteboard(newDs);
-      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      newDs.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs, parsed.content);
+      const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
@@ -20085,8 +20136,8 @@ async function handleThreadReplyAdmitted(
       markIngressAdmitted(ctx);
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
-      const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, topicGroupMemoryBlock, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
+      newDs.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs, parsed.content);
+      const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots);
     }
@@ -20128,7 +20179,7 @@ async function handleThreadReplyAdmitted(
     // degrades to an ordinary follow-up in queue order.
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
-    const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds);
+    const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
     const turnSender = await getThreadSender();
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
@@ -22203,6 +22254,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run. Keep the readiness-barrier
   // source contract explicit: restoration begins only after IPC has bound.
   const restoreOptions: Parameters<typeof restoreActiveSessions>[1] = {
+    quarantinedSessionIds: idempotencyQuarantinedSessionIds,
     recoverCodexHandoff: async (ds) => {
       const pending = ds.pendingCodexFreshHandoff;
       if (!pending) return;
@@ -22218,7 +22270,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     },
   };
-  await restoreActiveSessions(activeSessions);
+  await restoreActiveSessions(activeSessions, restoreOptions);
   // Recovery-only post-restore work remains separate from the readiness marker;
   // persisted handoffs are migrated after the active registry is populated.
   for (const restored of activeSessions.values()) {
@@ -22434,6 +22486,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       targets: configuredCodexUpdateTargets,
       sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
       log: (m) => logger.info(`[cli-update] ${m}`),
+    });
+    startBotmuxUpdateMonitor({
+      dataDir: config.session.dataDir,
+      primaryLarkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      dashboardUrl: () => dashboardUrlForReport().url,
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
+      log: (m) => logger.info(`[botmux-update] ${m}`),
     });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
@@ -22699,6 +22759,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     deferredScheduleSettleTimers.clear();
     vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
+    stopBotmuxUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);

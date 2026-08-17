@@ -109,6 +109,7 @@ describe('desktop device credential store', () => {
     const homeDir = tempHome();
     const filePath = deviceCredentialsPath({ homeDir });
     mkdirSync(dirname(filePath), { recursive: true });
+    chmodSync(dirname(filePath), 0o700);
     writeFileSync(filePath, '{}', { mode: 0o600 });
     chmodSync(filePath, 0o644);
     expect(() => readDeviceCredentials({ homeDir })).toThrow(/0600/);

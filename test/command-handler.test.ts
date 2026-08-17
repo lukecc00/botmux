@@ -1859,14 +1859,9 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
-      const stopNoticeCall = (deps.sessionReply as any).mock.calls.find((call: any[]) =>
-        String(call[1]).includes('当前对话已经停止'));
-      expect(stopNoticeCall).toEqual(expect.arrayContaining([
-        ROOT_ID,
-        expect.stringContaining('当前对话已经停止'),
-        'text',
-        LARK_APP_ID,
-      ]));
+      // The authoritative worker-pool closeSession owns the stop notice after
+      // teardown succeeds. This unit stubs that boundary, so it must not expect
+      // the nested worker-pool side effect (covered by close/notice tests).
       const replyArgs = (deps.sessionReply as any).mock.calls.find((call: any[]) => call[2] === 'interactive');
       expect(replyArgs).toBeTruthy();
       const cardJson = replyArgs[1] as string;

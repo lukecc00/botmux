@@ -6,6 +6,8 @@
 
 ## Step 1 · 安装
 
+> 使用 `lukecc00/botmux@p/ai_open` 个人开发版并接收该通道的 Dashboard 红点与飞书 owner 私聊更新提醒时，请运行 `curl -fsSL https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh`。下面的 npm 命令安装的是官方通道，个人版不会静默把它切换到 fork。
+
 ```bash
 npm install -g botmux
 ```

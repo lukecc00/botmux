@@ -439,13 +439,10 @@ export function historySenderKey(message: any): string {
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
-  if (s.status === 'starting') return 'starting';
-  // `active` is the persisted open/closed lifecycle state used by older rows,
-  // not proof that a model turn is still running. Treat only explicit runtime
-  // states as busy so completed legacy conversations fall back to idle.
-  if (s.status === 'working' || s.status === 'analyzing') return 'working';
-  if (s.status === 'dormant') return 'idle';
+  // needs-you 保留 stalled 触发；starting 并入「进行中」。
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
+  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
+  if (hasOpenTodos(s)) return 'todo';
   return 'idle';
 }
 

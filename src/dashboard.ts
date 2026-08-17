@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
+import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
@@ -196,7 +197,7 @@ import {
   listSkillInstallHistory,
   recordSkillInstallHistory,
 } from './services/skill-install-history-store.js';
-import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -244,7 +245,19 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import {
+  buildDashboardSummary,
+  parseDashboardSummaryRows,
+} from './dashboard/dashboard-summary.js';
+import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
 import { clearTopicGroupMemoriesForChat } from './services/topic-group-memory-store.js';
+
+// The dashboard is an independent long-lived PM2 app and can be resurrected
+// from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
+// and detached-restart children inherit process.env, so a leaked workflow
+// marker would make those CLI commands fail at the workflow safety gate before
+// they can reach their own cleanup boundary.
+scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -3375,10 +3388,9 @@ const server = createServer(async (req, res) => {
       const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
       const installManager = detectGlobalInstallManager(packageRoot);
       const installPlan = tryResolveGlobalInstallPlan(packageRoot);
-      // Compare against the npm `latest` dist-tag (always stable; the update
-      // button installs `@latest`). isNewerVersion uses semver precedence, so a
-      // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
-      // 2.86.0) is NOT flagged behind — exactly the canary case we want.
+      // Compare against the stable personal-channel manifest. The managed
+      // source installer stays pinned to the same repo/ref, so Dashboard must
+      // never infer a version from synchronized upstream tags in the fork.
       const latestResult = await cachedLatestVersion(url.searchParams.get('refresh') === '1');
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];

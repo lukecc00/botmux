@@ -743,6 +743,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
   'ai.followup.reminder': 'When a reply is needed, use `botmux send`; when none is needed, do not explain the silence and make the final exactly BOTMUX_NO_REPLY.',
   'ai.followup.reminder_no_resend': 'When a reply is needed, use `botmux send`; when none is needed, do not explain the silence and make the final exactly BOTMUX_NO_REPLY. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark topic via `botmux send`; what and how many to send is your call. Only when no reply is needed make the final exactly BOTMUX_NO_REPLY.',
   'ai.followup.codex_structured_delivery': 'Write key stages as user-facing commentary and finish with a final answer; each is mirrored automatically as a separate in-thread Lark card. For long tasks, write commentary after every verifiable stage, before a long build/test/wait, and when a finding changes the next step; briefly state verified facts, the selected path and rationale, and the next step. Do not wait for final, merge milestones, or expose private chain-of-thought, scratch notes, raw command logs, or repetitive micro-status. Do not duplicate ordinary progress/results with `botmux send`; attachments, @mentions, and cross-chat delivery are exceptions.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
@@ -1296,6 +1297,15 @@ export const messages: Record<string, string> = {
   'cli_update.command': 'Run on the host: {command}',
   'cli_update.manual_only': 'botmux only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
   'cli_update.dashboard': 'Dashboard: {url}',
+
+  // Personal Botmux distribution update monitor
+  'botmux_update.card_title': 'Personal Botmux update available',
+  'botmux_update.available': '⬆️ **A new personal Botmux version is available**',
+  'botmux_update.version_delta': 'Version: {current} → {latest}',
+  'botmux_update.source': 'Update source: `{repo}@{ref}`',
+  'botmux_update.command': 'Upgrade in Dashboard under Version & Update, or run on the host: {command}',
+  'botmux_update.manual_only': 'This notice only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
+  'botmux_update.dashboard': 'Dashboard: {url}',
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',

@@ -89,7 +89,7 @@ Role + 能力标签是[多机器人协作](/multi-bot)的基础设施：给每�
 
 ## 角色切换（role switch）
 
-> ⚠️ 进阶功能，需先部署「角色库」，且目前只支持 Claude Code。部署步骤见仓库的 [角色系统部署 runbook](https://github.com/deepcoldy/botmux/blob/master/docs/roles/deploy-runbook.md)；下面讲**部署好之后终端用户怎么用**。
+> ⚠️ 进阶功能，需先部署「角色库」，且目前只支持 Claude Code。部署步骤见仓库的 [角色系统部署 runbook](../../../docs/roles/deploy-runbook.md)；下面讲**部署好之后终端用户怎么用**。
 
 和上面的 `/role`（同一个人设、按群覆盖）不同，**角色切换**让一个 bot 拥有**多个完整角色**，每个角色有自己的人设**和独立记忆**——切到「售后客服」它就带着售后的人设 + 只属于售后的记忆积累，切到「产品经理」又是另一套。角色**按话题生效**，新话题从默认角色开始。
 

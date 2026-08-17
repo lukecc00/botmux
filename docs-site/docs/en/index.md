@@ -4,7 +4,7 @@
 
 botmux is a bridge: a persistent **daemon** listens to Lark messages and automatically launches a dedicated AI coding CLI process (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity, etc.) for each new topic. It renders terminal output into Lark **streaming cards** in real time, and provides an interactive **Web Terminal**. Phone, computer, and Lark stay in sync — wherever you are, your coding session follows.
 
-> Project: <https://github.com/deepcoldy/botmux> ｜ npm: `npm install -g botmux`
+> Install: `npm install -g botmux`
 
 ## Design philosophy: not an SDK wrapper — bridge the CLI directly
 

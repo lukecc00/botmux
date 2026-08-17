@@ -226,7 +226,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
-    expect(mockLoadTopicGroupMemoryBlock).toHaveBeenCalledWith(ds);
+    expect(mockLoadTopicGroupMemoryBlock).toHaveBeenCalledWith(ds, expect.stringContaining('alerts'));
     expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[11]).toMatchObject({
       topicGroupMemoryBlock: '<topic_group_memory>shared context</topic_group_memory>',
     });

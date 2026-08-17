@@ -31,6 +31,13 @@ import {
   type TopicGroupMemoryFact,
   type TopicGroupMemoryResource,
 } from './topic-group-memory-store.js';
+import {
+  resolveTencentDbMemoryIsolation,
+  shouldAttemptTencentDbMemory,
+  tencentDbClientForConfig,
+  tencentDbMemoryAvailable,
+} from './tencentdb-agent-memory-client.js';
+import { captureTencentDbTurnOnce } from './tencentdb-agent-memory-ledger.js';
 
 export interface TopicGroupMemoryFinalInput {
   turnId: string;
@@ -315,7 +322,7 @@ export function applyTopicGroupMemoryUpdatePatch(
   return current;
 }
 
-export async function maybeUpdateTopicGroupMemoryFromFinal(
+async function maybeUpdateLocalTopicGroupMemoryFromFinal(
   ds: DaemonSession,
   output: TopicGroupMemoryFinalInput,
   deps: TopicGroupMemoryUpdateDeps = {},
@@ -382,6 +389,72 @@ export async function maybeUpdateTopicGroupMemoryFromFinal(
     + (result.provider ? ` provider=${result.provider}` : '')
     + (result.fallbackReason ? ` fallback=${result.fallbackReason}` : ''),
   );
+}
+
+async function maybeCaptureTencentDbMemoryFromFinal(
+  ds: DaemonSession,
+  output: TopicGroupMemoryFinalInput,
+): Promise<void> {
+  const scope = await resolveTopicGroupMemoryScope(topicGroupMemoryScopeInputFromSession(ds), { purpose: 'update' });
+  if (!scope.enabled || !shouldAttemptTencentDbMemory(scope.config)) return;
+  const userPrompt = output.userPrompt?.trim();
+  if (!userPrompt || !output.content.trim()) {
+    logger.debug(`[topic-group-memory:${scope.key}] tencentdb capture skipped reason=missing_turn_content`);
+    return;
+  }
+  const client = tencentDbClientForConfig(scope.config);
+  const isolation = resolveTencentDbMemoryIsolation(scope.config.tencentdb, {
+    larkAppId: scope.larkAppId,
+    chatId: scope.chatId,
+    sessionId: scope.rootMessageId,
+  });
+  if (!await tencentDbMemoryAvailable(client, isolation)) {
+    logger.debug(`[topic-group-memory:${scope.key}] tencentdb capture skipped reason=unavailable; local shadow remains active`);
+    return;
+  }
+  const now = new Date();
+  const capture = await captureTencentDbTurnOnce(scope.key, output.turnId, () => client.addConversation(isolation, [
+    { role: 'user', content: userPrompt, timestamp: new Date(now.getTime() - 1).toISOString() },
+    { role: 'assistant', content: output.content, timestamp: now.toISOString() },
+  ]));
+  if (!capture.captured) {
+    logger.debug(`[topic-group-memory:${scope.key}] tencentdb capture skipped reason=duplicate_turn turn=${output.turnId.substring(0, 8)}`);
+    return;
+  }
+  logger.info(`[topic-group-memory:${scope.key}] captured provider=tencentdb turn=${output.turnId.substring(0, 8)}`);
+}
+
+/**
+ * Persist every successful final into the legacy local store even when the
+ * TencentDB provider is preferred. The local document is the hot fallback, so
+ * a later Gateway outage never rolls the bot back to an empty/stale memory.
+ */
+export async function maybeUpdateTopicGroupMemoryFromFinal(
+  ds: DaemonSession,
+  output: TopicGroupMemoryFinalInput,
+  deps: TopicGroupMemoryUpdateDeps = {},
+): Promise<void> {
+  if (ds.session.status === 'closed' || ds.adoptedFrom || ds.session.vcMeetingReceiver) {
+    // Keep provider behavior aligned with the legacy updater. These session
+    // types were intentionally excluded before TencentDB was introduced.
+    return;
+  }
+  // Run both providers independently. A slow or failed MemoryCore write must
+  // never delay refreshing the legacy hot shadow (and vice versa).
+  await Promise.all([
+    maybeCaptureTencentDbMemoryFromFinal(ds, output).catch(error => {
+      logger.warn(
+        `[topic-group-memory:${ds.larkAppId}:${ds.chatId}] tencentdb capture failed; local shadow remains active: `
+        + (error instanceof Error ? error.message : String(error)),
+      );
+    }),
+    maybeUpdateLocalTopicGroupMemoryFromFinal(ds, output, deps).catch(error => {
+      logger.warn(
+        `[topic-group-memory:${ds.larkAppId}:${ds.chatId}] local shadow update failed: `
+        + (error instanceof Error ? error.message : String(error)),
+      );
+    }),
+  ]);
 }
 
 export function scheduleTopicGroupMemoryUpdate(ds: DaemonSession, output: TopicGroupMemoryFinalInput): void {

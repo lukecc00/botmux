@@ -109,6 +109,7 @@ export function buildDocWatchWarmupTurnInput(args: {
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
   topicGroupMemoryBlock?: string;
+  turnId?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocWatchWarmupPrompt(promptInput);
@@ -141,6 +142,7 @@ export function buildDocWatchWarmupTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      turnId: args.turnId,
       topicGroupMemoryBlock: args.topicGroupMemoryBlock,
       codexAppText,
       codexAppApplicationContext: promptContent,
@@ -262,6 +264,7 @@ export function buildDocCommentTurnInput(args: {
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
   topicGroupMemoryBlock?: string;
+  turnId?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocCommentPrompt(promptInput);
@@ -309,6 +312,7 @@ export function buildDocCommentTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      turnId: args.turnId,
       topicGroupMemoryBlock: args.topicGroupMemoryBlock,
       ...cleanContext,
     }),

@@ -134,14 +134,42 @@ export interface TopicGroupMemoryHttpLlmConfig {
   api?: 'auto' | 'responses' | 'chat-completions';
   timeoutMs?: number;
 }
+export interface TopicGroupMemoryTencentDbConfig {
+  /** Local managed-runtime directory used by `provider=auto`. */
+  runtimeDir?: string;
+  /** MemoryCore Gateway base URL, for example http://127.0.0.1:8420. */
+  endpoint?: string;
+  /** Gateway Bearer token. Standalone installs commonly use `local`. */
+  apiKey?: string;
+  /** MemoryCore instance / tenant id sent as x-tdai-service-id. */
+  serviceId?: string;
+  /**
+   * v3 isolation templates. `{chatId}`, `{larkAppId}`, `{scopeHash}`, and
+   * `{appHash}` are expanded per request. The hashed defaults keep topic
+   * groups isolated without exposing raw Lark identifiers to storage paths.
+   */
+  teamId?: string;
+  agentId?: string;
+  userId?: string;
+  /** Number of L1 atomic memories recalled for each turn. */
+  maxResults?: number;
+  includePersona?: boolean;
+  includeScenes?: boolean;
+  timeoutMs?: number;
+  /** Optional Memory Hub URL shown in the dashboard for human management. */
+  panelUrl?: string;
+}
 export interface TopicGroupMemoryConfig {
   /** Disabled by default so upgrades never change prompt behavior implicitly. */
   enabled?: boolean;
+  /** `auto` prefers a healthy managed runtime, then falls back to local. */
+  provider?: 'auto' | 'local' | 'tencentdb';
   injectMode?: 'off' | 'summary' | 'summary-and-facts';
   updateMode?: 'off' | 'manual' | 'auto';
   maxPromptChars?: number;
   maxSummaryChars?: number;
   httpLlm?: TopicGroupMemoryHttpLlmConfig;
+  tencentdb?: TopicGroupMemoryTencentDbConfig;
 }
 /** Where a bot shows native Context / Token usage on its Session cards. */
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
@@ -2881,6 +2909,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
         const out: TopicGroupMemoryConfig = {};
         if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled;
+        if (raw.provider === 'auto' || raw.provider === 'local' || raw.provider === 'tencentdb') out.provider = raw.provider;
         if (raw.injectMode === 'off' || raw.injectMode === 'summary' || raw.injectMode === 'summary-and-facts') out.injectMode = raw.injectMode;
         if (raw.updateMode === 'off' || raw.updateMode === 'manual' || raw.updateMode === 'auto') out.updateMode = raw.updateMode;
         if (Number.isInteger(raw.maxPromptChars) && raw.maxPromptChars > 0) out.maxPromptChars = Math.min(raw.maxPromptChars, 8_000);
@@ -2894,6 +2923,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           if (raw.httpLlm.api === 'auto' || raw.httpLlm.api === 'responses' || raw.httpLlm.api === 'chat-completions') http.api = raw.httpLlm.api;
           if (Number.isInteger(raw.httpLlm.timeoutMs) && raw.httpLlm.timeoutMs > 0) http.timeoutMs = Math.min(raw.httpLlm.timeoutMs, 300_000);
           if (Object.keys(http).length) out.httpLlm = http;
+        }
+        if (raw.tencentdb && typeof raw.tencentdb === 'object' && !Array.isArray(raw.tencentdb)) {
+          const tencentdb: TopicGroupMemoryTencentDbConfig = {};
+          for (const key of ['runtimeDir', 'endpoint', 'apiKey', 'serviceId', 'teamId', 'agentId', 'userId', 'panelUrl'] as const) {
+            if (typeof raw.tencentdb[key] === 'string' && raw.tencentdb[key].trim()) tencentdb[key] = raw.tencentdb[key].trim();
+          }
+          if (Number.isInteger(raw.tencentdb.maxResults) && raw.tencentdb.maxResults > 0) tencentdb.maxResults = Math.min(raw.tencentdb.maxResults, 20);
+          if (typeof raw.tencentdb.includePersona === 'boolean') tencentdb.includePersona = raw.tencentdb.includePersona;
+          if (typeof raw.tencentdb.includeScenes === 'boolean') tencentdb.includeScenes = raw.tencentdb.includeScenes;
+          if (Number.isInteger(raw.tencentdb.timeoutMs) && raw.tencentdb.timeoutMs > 0) tencentdb.timeoutMs = Math.min(raw.tencentdb.timeoutMs, 60_000);
+          if (Object.keys(tencentdb).length) out.tencentdb = tencentdb;
         }
         return Object.keys(out).length ? out : undefined;
       })(),

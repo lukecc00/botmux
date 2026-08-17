@@ -142,6 +142,8 @@ v2.95.0 起 botmux 会检测这种"会话没真正起来"的情况并发一张�
 
 `botmux upgrade`。会话内的 `botmux` wrapper 版本始终跟 daemon 一致，无需单独升级。
 
+个人开发版必须先通过 `lukecc00/botmux@p/ai_open` 的 `install.sh` 安装；daemon 会按个人分支的 `dev-version.json` 每日检查，发现新版后由主 Bot 私聊 owner，同一目标版本只提醒一次。npm 安装仍属于官方通道，不会被自动切换。完整发布与检测规则见仓库的 `docs/personal-release-channel.md`。
+
 ## CoCo 忙时发消息丢失？
 
 升级到 **CoCo ≥ 0.120.32**——type-ahead（忙时消息进 CoCo 自己的队列）依赖该版本行为。

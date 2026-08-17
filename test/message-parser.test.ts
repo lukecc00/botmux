@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
+import { REPLY_CARD_FOOTER_MARKER_URL } from '../src/im/lark/reply-card-footer-signature.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -348,6 +349,40 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 
     expect(parseApiMessage(makeMsg('interactive', formatA)).content).toContain('botmux');
     expect(parseApiMessage(makeMsg('interactive', formatB)).content).toContain('[botmux]');
+  });
+
+  it('drops neutral v2 footer markers in both simplified and original card formats', () => {
+    const formatA = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: '上下文 12.3K ' },
+          { tag: 'a', text: '·', href: REPLY_CARD_FOOTER_MARKER_URL },
+          { tag: 'text', text: ' 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const formatB = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        {
+          tag: 'markdown',
+          element_id: 'botmux_reply_footer',
+          text_size: 'notation_small_v2',
+          content: `<font color='grey'>上下文 12.3K [·](${REPLY_CARD_FOOTER_MARKER_URL}) 发送给：<at id=ou_owner></at></font>`,
+        },
+      ] },
+    };
+
+    for (const card of [formatA, formatB]) {
+      const content = parseApiMessage(makeMsg('interactive', card)).content;
+      expect(content).toContain('正文内容');
+      expect(content).not.toContain('上下文 12.3K');
+      expect(content).not.toContain('发送给');
+      expect(content).not.toContain('localhost');
+    }
   });
 
   it('drops a Format A usage-only footer when the bot brand is disabled', () => {

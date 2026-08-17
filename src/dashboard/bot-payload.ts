@@ -102,6 +102,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
     topicGroupMemory: {
       enabled: j?.topicGroupMemory?.enabled === true,
+      provider: j?.topicGroupMemory?.provider === 'local' || j?.topicGroupMemory?.provider === 'tencentdb'
+        ? j.topicGroupMemory.provider : 'auto',
       injectMode: j?.topicGroupMemory?.injectMode === 'off' || j?.topicGroupMemory?.injectMode === 'summary-and-facts'
         ? j.topicGroupMemory.injectMode : 'summary',
       updateMode: j?.topicGroupMemory?.updateMode === 'off' || j?.topicGroupMemory?.updateMode === 'manual'
@@ -109,6 +111,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       maxPromptChars: Number.isInteger(j?.topicGroupMemory?.maxPromptChars) ? j.topicGroupMemory.maxPromptChars : 8000,
       maxSummaryChars: Number.isInteger(j?.topicGroupMemory?.maxSummaryChars) ? j.topicGroupMemory.maxSummaryChars : 10000,
       httpLlm: j?.topicGroupMemory?.httpLlm,
+      tencentdb: j?.topicGroupMemory?.tencentdb,
     },
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)

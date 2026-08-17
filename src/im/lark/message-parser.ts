@@ -3,6 +3,7 @@ import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER_URL,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 
@@ -745,12 +746,14 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
  * indistinguishable from an ordinary repository link.
  */
 const LEGACY_DEFAULT_FOOTER_URL = 'https://github.com/deepcoldy/botmux';
-const FOOTER_MARKER_HASHES = new Set(['#reply-card-footer', '#reply-card-footer-v1']);
+const LEGACY_FOOTER_MARKER_HASHES = new Set(['#reply-card-footer', '#reply-card-footer-v1']);
 
 function isBotmuxFooterMarkerUrl(value: unknown): boolean {
   if (typeof value !== 'string') return false;
   try {
     const url = new URL(value);
+    const current = new URL(REPLY_CARD_FOOTER_MARKER_URL);
+    if (url.href === current.href) return true;
     return url.protocol === 'https:'
       && url.hostname === 'github.com'
       && url.port === ''
@@ -758,7 +761,7 @@ function isBotmuxFooterMarkerUrl(value: unknown): boolean {
       && url.password === ''
       && url.search === ''
       && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
-      && FOOTER_MARKER_HASHES.has(url.hash);
+      && LEGACY_FOOTER_MARKER_HASHES.has(url.hash);
   } catch {
     return false;
   }

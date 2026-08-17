@@ -12,6 +12,21 @@ function labelsContainingCustomDropdown(source: string): string[] {
 }
 
 describe('dashboard master feature integration', () => {
+  it('does not render the upstream product brand or hard-coded release links', () => {
+    const app = dashboardSource('app.tsx');
+    const html = dashboardSource('index.html');
+    const css = dashboardSource('style.css');
+
+    expect(app).not.toContain('brand-logo.png');
+    expect(app).not.toContain('brand-wordmark">Botmux');
+    expect(app).not.toContain('https://github.com/deepcoldy/botmux/releases');
+    expect(app).not.toContain('通过 Botmux 平台校验');
+    expect(html).not.toContain('brand-logo.png');
+    expect(html).toContain('<title>Dashboard</title>');
+    expect(css).not.toContain('.brand-logo-img');
+    expect(css).not.toContain('.brand-wordmark');
+  });
+
   it('keeps the default-off Codex App clean-history switch wired into Bot defaults', () => {
     const page = dashboardSource('bot-defaults-page.tsx');
     const types = dashboardSource('bot-defaults.ts');
@@ -129,6 +144,12 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('className="bd-section tgm-memory-section"');
     expect(page).toContain('className="tgm-memory-help"');
     expect(page).toContain("tr('botDefaults.topicGroupMemoryHelpSummary')");
+    expect(page).toContain('dataInput="topicGroupMemoryProvider"');
+    expect(page).toContain('className="bd-subsection tgm-memory-tencentdb"');
+    expect(page).toContain("tr('botDefaults.topicGroupMemoryTencentOpenPanel')");
+    expect(page).toContain('const tencentPanelHref = useMemo(() => safeHttpExternalUrl(tencentPanelUrl)');
+    expect(page).toContain('href={tencentPanelHref}');
+    expect(page).not.toContain('href={tencentPanelUrl.trim()}');
     expect(page).toContain('className="tgm-memory-status-strip"');
     expect(page).toContain('data-topic-group-memory-detail-dialog');
     expect(page).toContain('dialog.showModal()');
@@ -161,6 +182,8 @@ describe('dashboard master feature integration', () => {
 
     expect(messages).toContain("'botDefaults.topicGroupMemoryChatId': '话题群'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryHelpSummary': '适用范围说明'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryProviderAuto': '自动（腾讯优先，旧方案兜底）'");
+    expect(messages).toContain("'botDefaults.topicGroupMemoryTencentTitle': 'TencentDB Agent Memory / MemoryCore'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryDelete': '删除'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryClearAll': '清空全部记忆'");
     expect(messages).toContain("'botDefaults.topicGroupMemoryDetailClose': '收起'");

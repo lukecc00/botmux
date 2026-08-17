@@ -2,6 +2,7 @@ import type { DaemonSession } from './types.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 import { sessionRuntimeStatus } from './session-runtime-status.js';
+import { tryWithBotTurnMutation } from './bot-turn-mutation-gate.js';
 
 /**
  * Default per-bot live-session cap applied when a bot has no explicit

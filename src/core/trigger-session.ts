@@ -686,7 +686,7 @@ async function buildExistingSessionContent(
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
-  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds);
+  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, prompt);
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
     cliId: ds.session.cliId ?? botCfg.cliId,
@@ -1104,16 +1104,16 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  if (ds?.worker && !ds.worker.killed) {
-    const content = await buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
-
-    if (req.options?.waitForFinalOutput) {
-      return waitForSessionFinalOutput(
-        ds,
+  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    // The target must still be the live, registered occupant before dispatch.
+    // A session may be reached through a non-canonical routing key, so accept it
+    // when the same object is still registered anywhere in the active map.
+    const targetKey = activeSessionKey(target);
+    const stillRegistered = deps.activeSessions.get(targetKey) === target
+      || [...deps.activeSessions.values()].includes(target);
+    if (!stillRegistered || target.session.status !== 'active') {
+      return {
+        ok: false,
         triggerId,
         errorCode: 'session_not_found',
         error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
@@ -1139,7 +1139,7 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
-    const content = buildExistingSessionContent(
+    const content = await buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
     );
     const queuedBehindActivation = workerIsLive
@@ -1427,33 +1427,7 @@ async function triggerSessionTurnAdmitted(
       };
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, false);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    armLoudFinalSuppression(ds);
-    if (!sendWorkerInput(ds, content, stableTurnId ? triggerId : loudTurnId, {
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    })) {
-      disarmLoudFinalSuppression(ds);
-    }
-    return {
-      ok: true,
-      triggerId,
-      action: 'delivered',
-      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
-      message: 'delivered to existing session',
-    };
-  }
-
-  // An explicit session target stays bound to that session even while its
-  // worker is dormant. The old rootMessageId-only condition accidentally fell
-  // through to createSession for chat-scope sessions, which is unsafe for a
-  // durable meeting receiver whose projection pins one receiverSessionId.
-  if (ds) {
-    const content = await buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
+    recordAcceptedInput();
 
     // An explicit session target stays bound to that session even while its
     // worker is dormant. The old rootMessageId-only condition accidentally
@@ -1738,7 +1712,7 @@ async function triggerSessionTurnAdmitted(
   const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
     ? await getAvailableBots(larkAppId, chatId)
     : [];
-  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs);
+  const topicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs, prompt);
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -1782,6 +1756,7 @@ async function triggerSessionTurnAdmitted(
     newDs.pendingCodexAppText = undefined;
     newDs.pendingCodexAppApplicationContext = undefined;
     newDs.pendingCodexAppMessageContext = undefined;
+    newDs.pendingTopicGroupMemoryBlock = undefined;
   };
 
   // Idempotency claim (fresh async virtual only — validator guarantees this is

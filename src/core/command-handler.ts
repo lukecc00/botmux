@@ -20,6 +20,10 @@ import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
+import {
+  configuredRuntimeDisplayName,
+  sessionConfiguredRuntimeDisplayName,
+} from './cli-runtime-display.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -97,6 +101,9 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
 import { notifySessionStopped } from './session-stop-notice.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -1339,30 +1346,45 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          // Capture the closed-session card BEFORE killWorker/closeSession —
-          // it reads the live session's identity off `ds`.
-          const card = buildClosedSessionCard(ds, loc);
-          try {
-            // A previous failed/partial close attempt must not suppress the
-            // explicit user-requested terminal notice for this successful close.
-            ds.stopNoticeSent = false;
-            ds.stopNoticeInFlight = undefined;
-            ds.stopNoticeLifecycleId = undefined;
-            await closeSession(ds.session.sessionId);
-          } catch (err) {
-            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${err}`);
+          const targetSessionId = ds.session.sessionId;
+          const closed = await withBotTurnMutation(ds.larkAppId, async () => {
+            // Re-resolve the exact session after all peer admissions drain. A
+            // relay may have moved it to another key while this command was
+            // admitted; closeSession removes its current identity, never the
+            // stale root key from this message.
+            const current = [...activeSessions.values()].find(
+              candidate => candidate.session.sessionId === targetSessionId,
+            );
+            if (!current) return undefined;
+            // Capture the closed-session card BEFORE closeWorkerPoolSession —
+            // it reads the live session's identity off `current`.
+            const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            try {
+              // closeWorkerPoolSession proves fail-closed backing teardown
+              // before mutating any registry/store state, throwing when it
+              // cannot verify it. Surface that so the active record is kept
+              // for retry instead of being silently dropped.
+              await closeWorkerPoolSession(targetSessionId);
+            } catch (err) {
+              return { status: 'teardown_failed' as const, err };
+            }
+            return { status: 'closed' as const, current, card };
+          });
+          if (!closed) {
+            await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+            break;
+          }
+          if (closed.status === 'teardown_failed') {
+            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${closed.err}`);
             await sessionReply(
               rootId,
               `⚠️ 会话关闭失败，已保留 active 记录以便重试：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
             );
             break;
           }
-          for (const [key, current] of activeSessions.entries()) {
-            if (current === ds) activeSessions.delete(key);
-          }
-          // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
-          // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
-          // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
+          // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
+          // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
+          // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           await deliverEphemeralOrReply(
             closed.current,
             message.senderId,
@@ -1371,10 +1393,6 @@ export async function handleCommand(
             () => sessionReply(rootId, closed.card, 'interactive'),
             deps.invocationReplyTarget,
           );
-          await notifySessionStopped(ds, deps.sessionReply, 'ended', {
-            recipientOpenId: message.senderType === 'user' ? message.senderId : undefined,
-            turnId: message.messageId,
-          });
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -1722,6 +1740,7 @@ export async function handleCommand(
             current.pendingCodexAppText = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
+            current.pendingTopicGroupMemoryBlock = undefined;
             current.pendingChatContext = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;

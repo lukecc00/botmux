@@ -114,6 +114,32 @@ export function resolveInboundReplyTarget(args: {
  * still matches exactly; it never borrows a later turn's sender. */
 export const REPLY_TARGETS_MAX = 32;
 
+/** Prune `targets` down to REPLY_TARGETS_MAX oldest-first, in place, and
+ * return the newest eviction watermark. All reply-target writers share this
+ * helper so mention-back ambiguity remains conservative after eviction. */
+export function pruneReplyTargets(
+  targets: Record<string, ReplyTargetEntry>,
+  prevPrunedThrough: string | undefined,
+): string | undefined {
+  const keys = Object.keys(targets);
+  if (keys.length <= REPLY_TARGETS_MAX) return prevPrunedThrough;
+  const evict = keys
+    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
+    .slice(0, keys.length - REPLY_TARGETS_MAX);
+  let watermark = prevPrunedThrough;
+  for (const key of evict) {
+    const updatedAt = targets[key].updatedAt;
+    if (!watermark || watermark < updatedAt) watermark = updatedAt;
+    delete targets[key];
+  }
+  return watermark;
+}
+
+export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
+  turnId: string;
+  updatedAt?: string;
+}
+
 export function rememberTurnCaller(
   ds: DaemonSession,
   turnId: string,

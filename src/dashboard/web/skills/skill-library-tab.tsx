@@ -2,7 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { extractSkillsInstallCommandSource } from '../../../core/skills/install-command.js';
 import { useT } from '../react-hooks.js';
 import type { SkillGraph } from './shared.js';
-import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, SkillsNavIntent, StatusMessage } from './types.js';
+import type {
+  InstallSkillCandidate,
+  NativeSkillGroup,
+  SkillInstallHistoryRow,
+  SkillRemovalReference,
+  SkillRow,
+  SkillsNavIntent,
+  StatusMessage,
+} from './types.js';
 
 interface SkillLibraryTabProps {
   skills: SkillRow[];
@@ -17,10 +25,15 @@ interface SkillLibraryTabProps {
   installSelectionOpen: boolean;
   installCandidates: InstallSkillCandidate[];
   selectedInstallSkills: Set<string>;
+  installHistory?: SkillInstallHistoryRow[];
+  selectedInstallHistoryId?: string;
+  installHistoryBusy?: boolean;
   onInstallSourceChange: (v: string) => void;
   onInstallPathChange: (v: string) => void;
   onInstallRefChange: (v: string) => void;
   onInstallFullDepthChange: (v: boolean) => void;
+  onSelectInstallHistory?: (id: string) => void;
+  onUpdateInstallHistory?: () => void;
   onToggleInstallSkill: (name: string) => void;
   onSelectAllInstallSkills: (selected: boolean) => void;
   onConfirmInstallSelection: () => Promise<string[] | null>;
@@ -34,7 +47,7 @@ interface SkillLibraryTabProps {
   removingNames: Set<string>;
   removalDialogOpen: boolean;
   pendingRemoval: string[] | null;
-  removalReferences: Array<{ name: string; bots: string[] }>;
+  removalReferences: SkillRemovalReference[];
   removalError: string | null;
   skillBusy: string | null;
   installedStatus: StatusMessage;
@@ -97,10 +110,15 @@ export function SkillLibraryTab(props: SkillLibraryTabProps) {
           installSelectionOpen={props.installSelectionOpen}
           installCandidates={props.installCandidates}
           selectedInstallSkills={props.selectedInstallSkills}
+          installHistory={props.installHistory}
+          selectedInstallHistoryId={props.selectedInstallHistoryId}
+          installHistoryBusy={props.installHistoryBusy}
           onInstallSourceChange={props.onInstallSourceChange}
           onInstallPathChange={props.onInstallPathChange}
           onInstallRefChange={props.onInstallRefChange}
           onInstallFullDepthChange={props.onInstallFullDepthChange}
+          onSelectInstallHistory={props.onSelectInstallHistory}
+          onUpdateInstallHistory={props.onUpdateInstallHistory}
           onClearInstallTarget={props.onClearInstallTarget}
           onToggleInstallSkill={props.onToggleInstallSkill}
           onSelectAllInstallSkills={props.onSelectAllInstallSkills}

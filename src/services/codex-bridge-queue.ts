@@ -103,6 +103,9 @@ export interface CodexPendingTurn {
   terminalEvidence?: string;
   terminalViewportEvidence?: string;
   submittedInputAtTerminal?: string;
+  /** RPC turns have no local transcript start edge. Keep lifecycle ownership
+   * explicit until their app-server terminal is observed. */
+  rpcActive?: boolean;
 }
 
 /** Clean model-authored progress prose attributed to one exact pending turn. */
@@ -591,6 +594,7 @@ export class CodexBridgeQueue {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         target.terminalStatus = ev.terminalStatus;
         target.terminalErrorCode = ev.terminalErrorCode;
+        target.terminalErrorSummary = ev.terminalErrorSummary;
         if (this.collecting === target) {
           target.finalText ??= ev.text;
           this.collecting = null;
@@ -605,6 +609,7 @@ export class CodexBridgeQueue {
         this.collecting.finalText = ev.text;
         this.collecting.terminalStatus = ev.terminalStatus;
         this.collecting.terminalErrorCode = ev.terminalErrorCode;
+        this.collecting.terminalErrorSummary = ev.terminalErrorSummary;
         this.collecting.terminalEvidence = ev.terminalEvidence;
         this.collecting.terminalViewportEvidence = ev.terminalViewportEvidence;
         this.collecting.submittedInputAtTerminal = ev.submittedInputAtTerminal;

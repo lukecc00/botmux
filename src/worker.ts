@@ -149,8 +149,10 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, classifyCodexTerminalDiagnostic, type CodexBridgeEvent } from './services/codex-transcript.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, classifyCodexTerminalDiagnostic, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -1256,7 +1258,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
             cfg.prompt,
             firstIdentity.turnId,
             firstIdentity.dispatchAttempt,
-            awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
+            { markTimeMs: awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration) },
           );
           installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
           deferredFreshRpcTurn = {
@@ -1299,7 +1301,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cfg.prompt,
           firstIdentity.turnId,
           firstIdentity.dispatchAttempt,
-          awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
+          { markTimeMs: awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration) },
         );
         installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
         deferredFreshRpcTurn = {
@@ -2359,13 +2361,33 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       });
     }
 
-  // Follow-up rides on the same IPC and is enqueued only after this command's
-  // Enter lands. sendToPty also observes commandLineWritesPending, so another
-  // raw command's text -> Enter window cannot be interrupted by the follow-up.
-  if (sent && msg.followUpContent) {
-    sendToPty(msg.followUpContent, msg.followUpTurnId, {
-      codexAppInput: msg.followUpCodexAppInput,
-      requireIdle: msg.followUpAfterIdle,
+    const accepted = finalizeRawCommandDelivery({
+      accepted: sent,
+      durableActivation: !!msg.queuedActivationToken,
+      acknowledgeActivation: !!msg.queuedActivationToken,
+      hasFollowUp: !!onFollowUp,
+      onAccepted: () => {
+        isPromptReady = false;
+        idleDetector?.reset();
+        log(`Passthrough slash command: ${msg.content}`);
+      },
+      // Non-adopt follows the normal busy queue. Adopt keeps the complete
+      // adapter lifecycle in runAdoptRawInputSequence below.
+      onFollowUp: () => onFollowUp?.(),
+      // Pending-repo raw openings are durable too. ACK only after text + Enter.
+      onActivationAck: () => send({
+        type: 'queued_activation_submitted',
+        sessionId,
+        activationToken: msg.queuedActivationToken!,
+      }),
+      onDurableFailure: () => {
+        isPromptReady = false;
+        log('Durable raw activation write rejected; retiring worker generation');
+        void sendFatalWorkerErrorAndExit(
+          new Error('durable raw activation was not accepted by the backend'),
+          msg.turnId,
+        );
+      },
     });
     if (!accepted && !msg.queuedActivationToken) {
       log(`Passthrough slash command was not accepted by the backend: ${msg.content}`);
@@ -2440,6 +2462,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         ? () => {
             sendToPty(msg.followUpContent!, msg.followUpTurnId, {
               codexAppInput: msg.followUpCodexAppInput,
+              requireIdle: msg.followUpAfterIdle,
             });
             log(`Enqueued follow-up after raw input (${msg.followUpContent!.length} chars)`);
           }
@@ -3892,6 +3915,37 @@ let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+/** Settings are observed on the same append-only cursor as bridge output.
+ *  The tracker owns rollout-generation clear/update semantics and publishes a
+ *  dedicated IPC event, independent of PTY redraw frequency. */
+const codexServiceTierTracker = new CodexServiceTierTracker(
+  resolveCodexServiceTierSnapshot,
+  snapshot => send({ type: 'codex_service_tier', snapshot }),
+);
+
+function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
+  const normalized: TraexRuntimeSnapshot = {
+    ...(runtime.model?.trim() ? { model: runtime.model.trim() } : {}),
+    ...(runtime.reasoningEffort?.trim()
+      ? { reasoningEffort: runtime.reasoningEffort.trim() }
+      : {}),
+  };
+  if (
+    activeRuntimePublished
+    && normalized.model === publishedActiveRuntime.model
+    && normalized.reasoningEffort === publishedActiveRuntime.reasoningEffort
+  ) {
+    return;
+  }
+  activeRuntimePublished = true;
+  publishedActiveRuntime = normalized;
+  send({
+    type: 'active_runtime',
+    model: normalized.model ?? null,
+    reasoningEffort: normalized.reasoningEffort ?? null,
+  });
+}
+
 let codexAmbiguousTerminalTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
@@ -5455,6 +5509,7 @@ function hermesBridgeIngest(): void {
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   ingestStructuredBridgeEvents(filtered.events);
+  pruneExpiredStructuredHeadsAndEmit('Hermes ingest');
   if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
@@ -5468,6 +5523,7 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
     ingestStructuredBridgeEvents(live);
+    pruneExpiredStructuredHeadsAndEmit('MTR split-live attach');
     mtrBridgeOffset = result.newOffset;
     mtrBridgeBaselineDone = true;
     log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
@@ -5493,6 +5549,7 @@ function mtrBridgeIngest(): void {
   mtrBridgeOffset = result.newOffset;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   ingestStructuredBridgeEvents(result.events);
+  pruneExpiredStructuredHeadsAndEmit('MTR ingest');
   if (result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
@@ -5521,6 +5578,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const { history, live } = splitCodexEventsByCutoff(result.events, liveSince);
     codexBridgeQueue.absorb(history);
     ingestStructuredBridgeEvents(live);
+    pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
+    // Late attach can discover an already-completed live turn in the same
+    // drain. Re-drive readiness now rather than waiting for the poll timer.
+    if (live.some(event => event.kind === 'assistant_final')) {
+      idleDetector?.fireIdle();
+    }
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
@@ -6043,18 +6106,20 @@ function codexBridgeIngest(opts: {
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   ingestStructuredBridgeEvents(result.events);
+  pruneExpiredStructuredHeadsAndEmit('structured ingest');
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
+  const sawAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
   const sawAmbiguousTerminal = result.events.some(e =>
     e.kind === 'assistant_final'
     && 'terminalErrorCode' in e
     && e.terminalErrorCode === CODEX_MISSING_FINAL_CANDIDATE
   );
-  if (opts.signalIdle !== false && result.events.some(e =>
+  if (opts.signalIdle !== false && sawAssistantFinal && result.events.some(e =>
     e.kind === 'assistant_final'
     && (!('terminalErrorCode' in e)
       || e.terminalErrorCode !== CODEX_MISSING_FINAL_CANDIDATE)
@@ -6097,11 +6162,17 @@ function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
-  userGoal?: string,
-): boolean {
-  if (!codexBridgeFallbackActive()) return false;
+  options: { markTimeMs?: number; userGoal?: string } = {},
+): string | undefined {
+  if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt, userGoal);
+  codexBridgeQueue.mark(
+    turnId,
+    messageText,
+    options.markTimeMs ?? Date.now(),
+    dispatchAttempt,
+    options.userGoal,
+  );
   // Handles the transcript-before-mark race: mark() can replay buffered
   // commentary immediately after attribution becomes available.
   for (const progress of codexBridgeQueue.drainProgressOutputs()) {
@@ -6111,6 +6182,369 @@ function codexBridgeMarkPendingTurn(
       dispatchAttempt: progress.dispatchAttempt,
     });
   }
+  return turnId;
+}
+
+function finalizeRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+  dropPending: boolean,
+): void {
+  const { identity } = terminal;
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    settlingRpcTerminalOwners.get(ownerKey),
+    generation,
+  )) return;
+  const timer = rpcTerminalHydrationTimers.get(ownerKey);
+  if (timer) clearTimeout(timer);
+  rpcTerminalHydrationTimers.delete(ownerKey);
+  if (sameRpcGeneration(rpcTerminalHydrationOwners.get(ownerKey), generation)) {
+    rpcTerminalHydrationOwners.delete(ownerKey);
+    rpcTerminalHydrationTerminals.delete(ownerKey);
+  }
+  settlingRpcTerminalOwners.delete(ownerKey);
+  clearAwaitingRpcActivation(identity, generation);
+  clearRpcLifecycleFailClosedOwner(identity, generation);
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
+  if (dropPending) {
+    codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
+  }
+
+  // RPC `aborted` means the turn had already started executing before it was
+  // interrupted, so its side effects may have already run. Map it to
+  // `ambiguous` (fail-closed, no auto-retry) to match the transcript path
+  // (codex-transcript.ts turn_aborted -> ambiguous). Only a genuine app-server
+  // `failed` is retryable. Otherwise durable delivery would auto-redispatch and
+  // re-run already-executed side effects — exactly what this PR guards against.
+  const status = terminal.status === 'completed' ? 'completed'
+    : terminal.status === 'failed' ? 'failed'
+      : 'ambiguous';
+  const errorCode = terminal.errorCode
+    ?? (terminal.status === 'engine-dead' ? 'rpc_engine_dead'
+      : terminal.status === 'stopped' ? 'rpc_engine_stopped'
+        : terminal.status === 'aborted' ? 'rpc_turn_aborted'
+          : terminal.status === 'failed' ? 'rpc_turn_failed'
+            : undefined);
+  emitTurnTerminal(identity.turnId, status, errorCode, identity.dispatchAttempt);
+  log(
+    `Codex RPC terminal ${terminal.status}: native=${terminal.nativeTurnId.slice(0, 12)} `
+    + `turn=${identity.turnId.slice(0, 12)} attempt=${identity.dispatchAttempt ?? '-'}`,
+  );
+  redriveRejectedStructuredReady();
+  idleDetector?.fireIdle();
+}
+
+/** turn/completed can race ahead of rollout fs visibility even though it is an
+ *  authoritative execution terminal. Release rpcActive immediately, but retain
+ *  a short non-ready hydration gate while polling the structured transcript.
+ *  This preserves fallback final output without allowing the stale fingerprint
+ *  to head-of-line block a new RPC turn indefinitely. */
+function hydrateCompletedRpcTurn(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+  attempt = 0,
+): void {
+  const { identity } = terminal;
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    settlingRpcTerminalOwners.get(ownerKey),
+    generation,
+  )) return;
+  // restartCliProcess advances the generation before its asynchronous teardown.
+  // Do not let an old hydration timer touch a bridge queue that may already be
+  // owned by the replacement. stopCodexRpcEngine will synchronously retire the
+  // old generation when teardown reaches the engine.
+  if (cliSpawnGeneration !== generation.cliGeneration
+    || codexRpcEngine !== generation.engine) return;
+  try {
+    codexBridgeDrainAndMaybeEmit({
+      signalIdle: false,
+      hydrationOwnerKey: ownerKey,
+    });
+  } catch { /* retry */ }
+  if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
+    // Structured ingest already emitted final_output + terminal in the canonical
+    // order. The explicit native terminal below is idempotently suppressed.
+    finalizeRpcTurnTerminal(terminal, generation, false);
+    return;
+  }
+  // The native terminal can beat rollout persistence by seconds on a cold or
+  // busy filesystem. Keep this bounded (~11.6s), aligned with the fresh-turn
+  // 12s positive-evidence probe, rather than dropping fallback output after the
+  // previous 1.55s window.
+  const delays = CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS;
+  if (attempt >= delays.length) {
+    finalizeRpcTurnTerminal(terminal, generation, true);
+    return;
+  }
+  const timer = setTimeout(() => {
+    rpcTerminalHydrationTimers.delete(ownerKey);
+    hydrateCompletedRpcTurn(terminal, generation, attempt + 1);
+  }, delays[attempt]);
+  timer.unref?.();
+  rpcTerminalHydrationTimers.set(ownerKey, timer);
+}
+
+function settleRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(terminal.identity);
+  const existingSettlement = settlingRpcTerminalOwners.get(ownerKey);
+  if (existingSettlement) {
+    if (!sameRpcGeneration(existingSettlement, generation)) {
+      log(`Ignored stale Codex RPC terminal settlement for ${terminal.identity.turnId}`);
+    }
+    return;
+  }
+  settlingRpcTerminalOwners.set(ownerKey, generation);
+  clearAwaitingRpcActivation(terminal.identity, generation);
+  clearRpcLifecycleFailClosedOwner(terminal.identity, generation);
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  codexBridgeQueue.stopRpcActive(
+    terminal.identity.turnId,
+    terminal.identity.dispatchAttempt,
+  );
+  if (terminal.status === 'completed'
+    && codexBridgeQueue.hasPendingTurn(
+      terminal.identity.turnId,
+      terminal.identity.dispatchAttempt,
+    )) {
+    rpcTerminalHydrationOwners.set(ownerKey, generation);
+    rpcTerminalHydrationTerminals.set(ownerKey, { terminal, generation });
+    hydrateCompletedRpcTurn(terminal, generation);
+    return;
+  }
+  finalizeRpcTurnTerminal(terminal, generation, true);
+}
+
+function handleRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(terminal.identity);
+  const awaiting = rpcTurnsAwaitingActivation.get(ownerKey);
+  if (awaiting && sameRpcGeneration(awaiting, generation)) {
+    // Response + turn/completed can be decoded before the await continuation
+    // installs rpcActive. The exact terminal is replayed immediately after that
+    // activation, never against a guessed/latest queue entry.
+    pendingRpcTurnTerminals.set(ownerKey, { terminal, generation });
+    return;
+  }
+  if (awaiting && !sameRpcGeneration(awaiting, generation)) {
+    log(`Ignored stale Codex RPC terminal from replaced engine for ${terminal.identity.turnId}`);
+    return;
+  }
+  const activeGeneration = rpcActiveOwners.get(ownerKey);
+  const failedClosedGeneration = rpcLifecycleFailClosedOwners.get(ownerKey);
+  if (!sameRpcGeneration(activeGeneration, generation)
+    && !sameRpcGeneration(failedClosedGeneration, generation)) {
+    // The structured bridge may already have consumed the same turn and emitted
+    // its terminal, or a replacement generation may own the same logical
+    // delivery key. In either case this callback has no queue state to mutate.
+    log(
+      `Codex RPC terminal already retired: native=${terminal.nativeTurnId.slice(0, 12)} `
+      + `turn=${terminal.identity.turnId.slice(0, 12)}`,
+    );
+    return;
+  }
+  settleRpcTurnTerminal(terminal, generation);
+}
+
+/** Install the exact bridge mark + rpcActive hand-off after turn/start is known
+ *  accepted. Failure is fail-closed: a separate lifecycle gate remains asserted
+ *  for this owner until its native terminal/engine teardown, so a bookkeeping
+ *  bug cannot publish false idle. */
+function activateRpcTurnLifecycle(
+  identity: CodexRpcTurnIdentity,
+  messageText: string,
+  alreadyMarked: boolean,
+  generation: RpcTurnGeneration,
+  deferTerminal = false,
+): boolean {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    rpcTurnsAwaitingActivation.get(ownerKey),
+    generation,
+  )) {
+    log(`Refused stale Codex RPC lifecycle activation for ${identity.turnId}`);
+    return false;
+  }
+  const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(identity, generation);
+  let marked = alreadyMarked
+    && (codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)
+      || codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt));
+  if (!alreadyMarked) {
+    const bridgeTurnId = codexBridgeMarkPendingTurn(
+      messageText,
+      identity.turnId,
+      identity.dispatchAttempt,
+      { markTimeMs: replayAnchorMs },
+    );
+    marked = bridgeTurnId === identity.turnId;
+  }
+  // An older turn's terminal hydration may have drained and buffered this
+  // successor's complete user/final pair while turn/start ACK was still
+  // pending. mark() replays that pair synchronously. Treat the exact transcript
+  // terminal as an already-retired activation instead of failing closed merely
+  // because markRpcActive correctly refuses a completed queue entry.
+  const transcriptTerminalObserved = marked
+    && codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt);
+  const activated = transcriptTerminalObserved
+    || (marked && codexBridgeQueue.markRpcActive(
+      identity.turnId,
+      identity.dispatchAttempt,
+    ));
+  if (activated && !transcriptTerminalObserved) {
+    rpcActiveOwners.set(ownerKey, generation);
+  }
+  if (transcriptTerminalObserved) emitReadyCodexTurns();
+  if (!deferTerminal
+    && sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    rpcTurnsAwaitingActivation.delete(ownerKey);
+    rpcTurnsAwaitingActivationIdentities.delete(ownerKey);
+    rpcTurnsAwaitingActivationReplayAnchors.delete(ownerKey);
+  }
+  if (!activated) {
+    if (marked) codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
+    installRpcLifecycleFailClosedOwner(identity, generation);
+    log(
+      `Codex RPC lifecycle failed closed: mark=${marked} active=${activated} `
+      + `turn=${identity.turnId.slice(0, 12)} attempt=${identity.dispatchAttempt ?? '-'}`,
+    );
+    send({
+      type: 'user_notify',
+      message: 'Codex RPC 已接收消息，但本地生命周期登记失败；在原生终态到达前保持忙碌，未自动重发。',
+      turnId: identity.turnId,
+      ...(identity.dispatchAttempt !== undefined
+        ? { dispatchAttempt: identity.dispatchAttempt }
+        : {}),
+    });
+  }
+  const pendingTerminal = pendingRpcTurnTerminals.get(ownerKey);
+  if (pendingTerminal
+    && sameRpcGeneration(pendingTerminal.generation, generation)
+    && !deferTerminal) {
+    settleRpcTurnTerminal(pendingTerminal.terminal, generation);
+  }
+  return activated;
+}
+
+function releaseRpcTurnTerminalDeferral(
+  identity: CodexRpcTurnIdentity,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    rpcTurnsAwaitingActivation.delete(ownerKey);
+    rpcTurnsAwaitingActivationIdentities.delete(ownerKey);
+    rpcTurnsAwaitingActivationReplayAnchors.delete(ownerKey);
+  }
+  const pendingTerminal = pendingRpcTurnTerminals.get(ownerKey);
+  if (pendingTerminal && sameRpcGeneration(pendingTerminal.generation, generation)) {
+    settleRpcTurnTerminal(pendingTerminal.terminal, generation);
+  }
+}
+
+function retireRpcLifecycleFromStructuredTerminal(
+  identity: CodexRpcTurnIdentity,
+): void {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  // Native completion hydration owns its own finalization after this canonical
+  // drain returns. Do not tear down that generation's settlement underneath it.
+  if (settlingRpcTerminalOwners.has(ownerKey)) return;
+  const generation = rpcActiveOwners.get(ownerKey)
+    ?? rpcLifecycleFailClosedOwners.get(ownerKey)
+    ?? rpcTurnsAwaitingActivation.get(ownerKey);
+  if (!generation) return;
+  clearAwaitingRpcActivation(identity, generation);
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  clearRpcLifecycleFailClosedOwner(identity, generation);
+  codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
+}
+
+/** Expire confirmed or attribution-only unstarted queue heads at an explicit worker
+ *  lifecycle boundary. Pruning can replay a buffered successor user+final and
+ *  thereby produce an immediately emittable completion, so query/projection
+ *  methods must never do this mutation invisibly: every removal funnels
+ *  through this helper and drains ready output in the same call stack. */
+function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
+  let fenceCurrentRpcEngine = false;
+  const dropped = pruneExpiredPreStartHeadsAndEmit(
+    codexBridgeQueue,
+    emitReadyCodexTurns,
+    undefined,
+    turns => {
+      // A bounded pre-start lease is also the terminal boundary for a durable
+      // delivery attempt that the CLI accepted but never wrote to transcript.
+      // Settle N before the prune replay drains successor N+1; ordinary IM
+      // turns have no dispatchAttempt and remain log-only as before.
+      for (const turn of turns) {
+        const identity: CodexRpcTurnIdentity = {
+          turnId: turn.turnId,
+          ...(turn.dispatchAttempt !== undefined
+            ? { dispatchAttempt: turn.dispatchAttempt }
+            : {}),
+        };
+        const ownerKey = rpcTurnOwnerKey(identity);
+        const failedClosedGeneration = rpcLifecycleFailClosedOwners.get(ownerKey);
+        const retiredRpcOwner = failedClosedGeneration
+          ? clearRpcLifecycleFailClosedOwner(identity, failedClosedGeneration)
+          : false;
+        let shouldFenceRpcEngine = false;
+        if (retiredRpcOwner && failedClosedGeneration) {
+          clearAwaitingRpcActivation(identity, failedClosedGeneration);
+          if (deferredFreshRpcTurn
+            && rpcTurnOwnerKey(deferredFreshRpcTurn.identity) === ownerKey
+            && sameRpcGeneration(deferredFreshRpcTurn.generation, failedClosedGeneration)) {
+            deferredFreshRpcTurn = undefined;
+          }
+          if (codexRpcEngine === failedClosedGeneration.engine
+            && cliSpawnGeneration === failedClosedGeneration.cliGeneration
+            && !cliRestartInProgress) {
+            fenceCurrentRpcEngine = true;
+            shouldFenceRpcEngine = true;
+          }
+        }
+        if (retiredRpcOwner || turn.dispatchAttempt !== undefined) {
+          emitTurnTerminal(
+            turn.turnId,
+            'ambiguous',
+            retiredRpcOwner
+              ? 'rpc_delivery_ambiguous_timeout'
+              : 'structured_start_timeout',
+            turn.dispatchAttempt,
+          );
+        }
+        // Publish/retire N before a synchronous immediate restart can clear the
+        // current exact identity in killCli(). The callback still installs the
+        // restart fence before it returns, so the helper cannot emit buffered
+        // successor N+1 against this ambiguous engine generation.
+        if (shouldFenceRpcEngine) {
+          void restartCliProcess(
+            'Codex RPC ambiguous delivery exceeded its bounded attribution lease',
+            { immediate: true, preservePending: true },
+          );
+        }
+      }
+    },
+  );
+  if (dropped.length === 0) return false;
+  log(`${source}: expired ${dropped.length} structured head(s) without transcript start (${dropped.map(turn => turn.turnId).join(', ')})`);
+  if (fenceCurrentRpcEngine) log('Fenced ambiguous Codex RPC generation before structured successor replay');
+  // A rejected prompt-ready signal may be waiting on this exact pre-start
+  // lease. Re-evaluate it after both the queue mark and its separate RPC
+  // fail-closed owner have retired; otherwise the projector can stay busy
+  // forever even though there is no remaining terminal source.
+  redriveRejectedStructuredReady();
   return true;
 }
 
@@ -6181,6 +6615,7 @@ function emitReadyCodexTurns(): void {
   }
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  const nothingToSendTurns = new Set<(typeof ready)[number]>();
   const finalEmittedTurnIds = new Set<string>();
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
@@ -8002,7 +8437,7 @@ async function handleTrustedCodexAppMarker(
   if (kind === 'replay_ack') {
     appRunnerReplayAccepted++;
     log(`Codex App runner replay acknowledged (count=${String(payload.count ?? '?')})`);
-    return;
+    return true;
   }
 
   if (kind === 'lifecycle') {
@@ -8053,7 +8488,7 @@ async function handleTrustedCodexAppMarker(
     const marker = normalizeAppRunnerProgressMarker(payload);
     if (!marker) {
       log(`${cliName()} rejected malformed progress marker`);
-      return;
+      return true;
     }
     const trustedReplyTurnId = marker.replyTurnId
       && submittedCodexAppReplyTurnIds.has(marker.replyTurnId)
@@ -8064,7 +8499,7 @@ async function handleTrustedCodexAppMarker(
         `${cliName()} ignored unsubmitted progress reply route `
         + `(replyTurn=${shortCorrelationId(marker.replyTurnId)})`,
       );
-      return;
+      return true;
     }
     const dispatchAttempt = currentBotmuxDispatchAttempt;
     send({
@@ -8076,14 +8511,17 @@ async function handleTrustedCodexAppMarker(
       turnId: trustedReplyTurnId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
-    return;
+    return true;
   }
 
-  if (kind === 'final') {
-    const marker = normalizeAppRunnerFinalMarker(payload);
-    if (!marker) {
-      log(`${cliName()} rejected malformed final marker`);
-      return;
+  if (kind === 'state' && lastInitConfig?.cliId === 'codex-app') {
+    const readiness = codexAppSignedStateReadiness(payload);
+    if (readiness === 'invalid') {
+      rejectCodexAppControlMarker('signed state missing boolean acceptingInput');
+      failCodexAppControlGeneration(
+        'Codex App runner published signed state without boolean acceptingInput',
+      );
+      return false;
     }
     if (readiness === 'waiting') {
       if (typeof payload.busy !== 'boolean') {
@@ -9949,10 +10387,18 @@ async function flushPending(): Promise<void> {
             item.turnId,
             item.dispatchAttempt,
           );
-        } else if (codexBridgeActive) {
+        } else if (codexBridgeActive && !writeRpcEngine) {
           currentCodexSubmittedInput = logicalMsg;
           currentCodexTerminalOutputTail = '';
-          codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, item.userGoal);
+          bridgeTurnId = codexBridgeMarkPendingTurn(
+            logicalMsg,
+            item.turnId,
+            item.dispatchAttempt,
+            { userGoal: item.userGoal },
+          );
+          if (bridgeTurnId) {
+            codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
+          }
           if (item.turnId) {
             send({
               type: 'bridge_turn_written',
@@ -10198,7 +10644,7 @@ async function flushPending(): Promise<void> {
             msg,
             rpcTurnIdentity.turnId,
             rpcTurnIdentity.dispatchAttempt,
-            replayAnchorMs,
+            { markTimeMs: replayAnchorMs },
           );
           installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration);
           log(
@@ -10483,6 +10929,7 @@ function sendToPty(
     replyTurnId?: string;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     requireIdle?: boolean;
+    atMostOnce?: boolean;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -10687,10 +11134,8 @@ function startScreenUpdates(): void {
             return null;
           }
           lastContent = content;
+          latestFilteredScreenContent = content;
         }
-        lastContent = content;
-        latestFilteredScreenContent = content;
-      }
 
         return { content, changed };
       }, projectedRuntimeScreenStatus);
@@ -13532,7 +13977,9 @@ async function spawnCli(
       if (rolloutPath) {
         codexBridgeAttach(
           rolloutPath,
-          writtenRecovered.length > 0 ? 'recover-active' : 'baseline-existing',
+          writtenRecovered.length > 0
+            ? 'recover-active'
+            : effectiveResume ? 'baseline-existing' : 'fresh-empty',
         );
       } else {
         codexBridgePendingSessionId = effectiveCliSessionId;
@@ -15545,7 +15992,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  bridgeFinalEmitted?: boolean,
+  completionEvidence?: boolean | 'nothing_to_send',
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -15565,7 +16012,10 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
-    ...(bridgeFinalEmitted ? { bridgeFinalEmitted: true } : {}),
+    ...(completionEvidence === true ? { bridgeFinalEmitted: true } : {}),
+    ...(completionEvidence === 'nothing_to_send'
+      ? { outputDisposition: 'nothing_to_send' as const }
+      : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },

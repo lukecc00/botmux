@@ -37,6 +37,7 @@ import * as backendTypeStore from '../services/backend-type-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
+import * as persistentBackend from './persistent-backend.js';
 import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as topicGroupMemoryStore from '../services/topic-group-memory-store.js';
@@ -645,7 +646,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename|progress-card)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename|progress-card|prompt-ctx\/claim)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // A sandboxed report cannot read the host HMAC secret. This narrow route
@@ -1754,7 +1755,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   const activeDs = findActiveBySessionId(params.sessionId);
   let activationTransferred = false;
   if (column === 'in_progress' && activeDs?.session.queued) {
-    await activateQueuedSession(activeDs, { preserveManualColumn: true });
+    const activated = await activateQueuedSession(activeDs, { preserveManualColumn: true });
+    if (!activated.ok) return jsonRes(res, 500, activated);
+    activationTransferred = true;
   } else if (column) {
     currentSession.kanbanColumn = column;
   }
@@ -3810,7 +3813,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
-    overloadAlert?: unknown;
+    overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     topicGroupMemory?: unknown;
   };
   try { body = await readJsonBody(req); }
@@ -3823,7 +3826,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
-    overloadAlert?: boolean;
+    overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     topicGroupMemory?: import('../bot-registry.js').TopicGroupMemoryConfig;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;

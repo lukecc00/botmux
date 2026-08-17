@@ -5,7 +5,12 @@ import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
 import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
 import type { GithubGitFallback } from '../src/core/github-source.js';
-import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
+import {
+  commitRestartIntentAttemptTo,
+  restartIntentPathIn,
+  writeRestartAttemptIntentTo,
+  writeRestartIntentTo,
+} from '../src/services/restart-intent-store.js';
 
 function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
   writeFileSync(join(dir, name), JSON.stringify(sessions));

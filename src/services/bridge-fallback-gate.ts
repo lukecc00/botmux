@@ -299,6 +299,19 @@ export function shouldSuppressBridgeEmit(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  // A trailing standalone sentinel is an explicit declaration that any prose
+  // left in the transcript was not meant to become another visible reply. If
+  // this turn already sent even one in-window message, suppress regardless of
+  // the normal material-length heuristic; otherwise long narration can leak as
+  // a duplicate final. With no marker we still forward the stripped prose so a
+  // model that forgot to call `botmux send` does not ghost the user.
+  if (
+    turn.finalText !== undefined
+    && hasTrailingBridgeSentinelLine(turn.finalText)
+    && markersInWindow.length > 0
+  ) {
+    return true;
+  }
   return markerSetCoversFinal(markersInWindow, turn.finalText, turn.progressTexts);
 }
 

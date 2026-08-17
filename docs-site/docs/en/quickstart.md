@@ -6,6 +6,8 @@
 
 ## Step 1 · Install
 
+> To use the `lukecc00/botmux@p/ai_open` personal build and receive its Dashboard badge plus owner DM update notices, run `curl -fsSL https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh`. The npm command below installs the official channel; the personal build never switches it to the fork silently.
+
 ```bash
 npm install -g botmux
 ```

@@ -31,7 +31,7 @@ export function deriveKanbanColumn(s: KanbanRowLike): SessionKanbanColumn {
   // stuck in progress after upgrade. Real user drags persist kanbanPosition, so
   // keep honoring those.
   if (manual && !(manual === 'in_progress' && !hasManualPosition)) return manual;
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'in_review';
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'in_review';
   // Legacy rows may expose persisted `active`, which means open, not busy.
   // Only explicit runtime states belong in the automatic in-progress column.
   if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing') {

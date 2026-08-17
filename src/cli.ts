@@ -226,8 +226,21 @@ import {
   buildBridgeSendPreviewText,
 } from './services/bridge-fallback-gate.js';
 import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
-import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
-import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
+import {
+  bindRestartLeaseTo,
+  commitRestartIntentAttemptTo,
+  consumeRestartIntentTo,
+  removeRestartIntentAttemptTo,
+  type RestartIntent,
+  writeManualIntentIfAbsentTo,
+  writeRestartAttemptIntentTo,
+} from './services/restart-intent-store.js';
+import {
+  loadAllSessionsSnapshot,
+  mutateSessionRowOffline,
+  repairMissingChatScope,
+  stripLegacyPendingCardFields,
+} from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -6929,7 +6942,7 @@ botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 
 提示: 多数子命令支持 \`botmux <子命令> --help\` 查看完整参数。
 
 配置目录: ~/.botmux/
-文档: https://github.com/deepcoldy/botmux
+文档: docs-site/docs/zh/
 `);
 }
 

@@ -1,27 +1,18 @@
 # botmux
 
 <p align="center">
-  <img src="cover.svg" alt="botmux" width="760">
-</p>
-
-<p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
-  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
 <p align="center"><b>在飞书里遥控你的 AI 编程 CLI。</b>一条消息启动一个会话，每个会话一个独立 CLI 进程，实时流式回传——手机、电脑、终端三端同步。</p>
 
 <p align="center">
-  <a href="https://deepcoldy.github.io/botmux/"><b>📖 文档</b></a> ·
+  <a href="docs-site/docs/zh/index.md"><b>📖 文档</b></a> ·
   <a href="#5-分钟接入"><b>🚀 快速接入</b></a> ·
   <a href="https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg"><b>✨ 效果展示</b></a> ·
   <a href="README.en.md">English</a>
-</p>
-
-<p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux 产品全景：飞书话题连接实时卡片、Web 终端、多 Bot 编排与 20+ CLI / Agent">
 </p>
 
 ---
@@ -38,25 +29,27 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 
 > 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
+> **个人开发版**：若要安装 `lukecc00/botmux@p/ai_open` 并接收个人版 Dashboard 红点与飞书 owner 私聊更新提醒，请使用 `curl -fsSL https://raw.githubusercontent.com/lukecc00/botmux/p/ai_open/install.sh | sh`，不要使用下面的官方 npm 包。发布规则与检测边界见 [个人版发布与更新提醒](docs/personal-release-channel.md)。
+
 ```bash
 npm install -g botmux        # 需要 Node >= 22
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
-然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
+然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](docs-site/docs/zh/quickstart.md)**。
 
 ## 核心场景
 
-- **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
-- **[多机器人协作](https://deepcoldy.github.io/botmux/multi-bot)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
-- **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
-- **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
-- **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
-- **[定时任务](https://deepcoldy.github.io/botmux/schedule) & [外部触发](https://deepcoldy.github.io/botmux/webhook)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](https://deepcoldy.github.io/botmux/webhook) 或 [API 任务触发](https://deepcoldy.github.io/botmux/api-task-trigger)。
-- **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
+- **[实时流式卡片](docs-site/docs/zh/cards.md)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
+- **[多机器人协作](docs-site/docs/zh/multi-bot.mdx)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
+- **[多话题并行编排](docs-site/docs/zh/multi-topic.md)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
+- **[可交互 Web 终端](docs-site/docs/zh/web-terminal.md)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
+- **[会话接入 & 接力](docs-site/docs/zh/adopt.mdx)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
+- **[定时任务](docs-site/docs/zh/schedule.md) & [外部触发](docs-site/docs/zh/webhook.md)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](docs-site/docs/zh/webhook.md) 或 [API 任务触发](docs-site/docs/zh/api-task-trigger.md)。
+- **[Oncall 模式](docs-site/docs/zh/oncall.md) & [语音总结](docs-site/docs/zh/voice.mdx)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
-更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
+更多：[角色与团队](docs-site/docs/zh/roles.md) · [文件沙盒](docs-site/docs/zh/sandbox.md) · [Dashboard 管控面](docs-site/docs/zh/dashboard.md) · [tmux 会话常驻](docs-site/docs/zh/tmux.md) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
 ## 支持的 CLI / Agent
 
@@ -64,7 +57,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 `claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) …
 
-当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](docs-site/docs/zh/adapters.md)。
 
 ### 最终回答反馈（按 bot、默认关闭）
 
@@ -90,7 +83,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 也可在 Dashboard 的「Bot 配置 → 卡片 → 最终回答反馈」编辑，或用 `/botconfig set feedback '<json>'` 热更新。策略支持本地团队 → bot → bot-scoped chat 分层，优先级为 chat > bot > team；Dashboard 可预览最终生效策略。策略修改只影响之后交付的新卡；已发送卡片继续使用发送时快照。Agent 主动发送可声明 `botmux send --response-kind progress ...` 或 `botmux send --response-kind final ...`；未声明时默认按 progress/非 final 发送，只有显式 final 才挂反馈。数据仅落在本机 `botmux-feedback.sqlite`；可选 webhook 通过 durable outbox 投递 `turn.completed` 与 `feedback.revised` 事件。完整实现和边界见 [`docs/feedback-capability-current-implementation.md`](docs/feedback-capability-current-implementation.md)。
 
-严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
+严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](docs-site/docs/zh/adapters.md#codex-兼容发行版)。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 
@@ -107,13 +100,10 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 | 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
 | 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
 
-## 文档 · 社区 · 贡献
+## 文档 · 贡献
 
-- 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>**
+- 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<docs-site/docs/zh/index.md>**
 - ✨ **效果展示**（图文 + 视频演示）：[《5 分钟创建一个真正好用的飞书助理》](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)
-- ❓ **常见问题 / 排错**：[FAQ](https://deepcoldy.github.io/botmux/faq) · [常见踩坑](https://deepcoldy.github.io/botmux/pitfalls)
-- 💬 **交流群**：[关于 & 资源](https://deepcoldy.github.io/botmux/about) 页有内部 / 外部「Botmux 交流群」的扫码入群入口。
-- 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+- ❓ **常见问题 / 排错**：[FAQ](docs-site/docs/zh/faq.md) · [常见踩坑](docs-site/docs/zh/pitfalls.md)
+- 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](docs-site/docs/zh/adapters.md)。
 - 📄 **License**：[MIT](LICENSE)
-
-<p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>

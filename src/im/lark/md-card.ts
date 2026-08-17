@@ -322,20 +322,20 @@ export function normalizeLocalHomeLinks(
   return outputParts.join('');
 }
 
-/** Default footer brand when a bot has no custom `brandLabel` configured. */
-export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
+/** The unconfigured footer is intentionally brand-free. */
+export const DEFAULT_BRAND_LABEL = '';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
- *   • `undefined` (unset)  → the default botmux link
+ *   • `undefined` (unset)  → `null` (no signature)
  *   • `''` / whitespace    → `null` (brand suppressed)
  *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
  * recipient, the whole footer (HR included) — so an empty brand reads clean.
  */
 export function brandFooterSegment(brand: string | undefined): string | null {
-  if (brand === undefined) return DEFAULT_BRAND_LABEL;
+  if (brand === undefined) return null;
   const normalized = brand
     .trim()
     .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
@@ -507,11 +507,9 @@ export function buildReplyCardFooter(opts: {
   // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
   // common case now that usageDisplay defaults to the streaming card body and
   // the reply-card footer is context-only) needs no marker: appending it renders
-  // a dangling "botmux ·". The default/repository brand is plain link text with
+  // a dangling separator. A custom brand-only footer is plain link text with
   // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
-  // ownership marker (the parser already treats a bare repo link as ordinary
-  // content, matching the long-standing "brand-only is undecidable, keep it"
-  // contract). Any footer carrying usage or a recipient is still signed.
+  // ownership marker. Any footer carrying usage or a recipient is still signed.
   const signMarker = hasUsage || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
@@ -1041,6 +1039,7 @@ export function buildCanonicalFinalReplyCard(opts: {
   markdown: string;
   feedback?: { policy: FeedbackPolicy };
   recipientOpenId?: string;
+  recipientMentionMode?: RecipientMentionMode;
   brand?: string;
   locale?: Locale;
   workingDir?: string;
@@ -1050,10 +1049,16 @@ export function buildCanonicalFinalReplyCard(opts: {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
     : [];
+  const recipientMentionMode = opts.recipientMentionMode ?? 'footer';
+  if (opts.recipientOpenId && recipientMentionMode === 'body') {
+    elements.unshift({ tag: 'markdown', content: `<at id=${opts.recipientOpenId}></at>` });
+  }
   if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
   const footer = buildReplyCardFooter({
     brand: opts.brand,
-    recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
+    recipientOpenIds: opts.recipientOpenId && recipientMentionMode === 'footer'
+      ? [opts.recipientOpenId]
+      : [],
     usage: opts.usage,
     locale: opts.locale,
   });
@@ -1098,6 +1103,7 @@ export function buildContextualReplyCard(opts: {
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
   controls?: MarkdownCardSessionControls;
+  feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
     title,

@@ -209,4 +209,59 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(disk.autoStartOnNewTopic).toBe(true);
     expect(disk.regularGroupReplyMode).toBe('new-topic');
   });
+
+  it('persists TencentDB memory provider fields without losing nested values', async () => {
+    writeConfig({
+      topicGroupMemory: {
+        enabled: true,
+        provider: 'auto',
+        tencentdb: { endpoint: 'http://127.0.0.1:8420', serviceId: 'existing-instance' },
+      },
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const first = await store.updateBotCardPrefs('app_default', {
+      topicGroupMemory: {
+        provider: 'tencentdb',
+        tencentdb: {
+          runtimeDir: '~/harness_ai/heavy_duty_tools/tencentdb-agent-memory-runtime',
+          maxResults: 7,
+          includePersona: false,
+          timeoutMs: 9_000,
+        },
+      },
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      prefs: {
+        topicGroupMemory: {
+          provider: 'tencentdb',
+          tencentdb: {
+            endpoint: 'http://127.0.0.1:8420',
+            serviceId: 'existing-instance',
+            maxResults: 7,
+            includePersona: false,
+            timeoutMs: 9_000,
+          },
+        },
+      },
+    });
+    expect(readConfig().topicGroupMemory).toMatchObject({
+      provider: 'tencentdb',
+      tencentdb: { endpoint: 'http://127.0.0.1:8420', serviceId: 'existing-instance', maxResults: 7 },
+    });
+    expect(registry.getBot('app_default').config.topicGroupMemory).toMatchObject({
+      provider: 'tencentdb',
+      tencentdb: { endpoint: 'http://127.0.0.1:8420', serviceId: 'existing-instance', maxResults: 7 },
+    });
+
+    await store.updateBotCardPrefs('app_default', {
+      topicGroupMemory: { tencentdb: { panelUrl: 'https://memory.example.com' } },
+    });
+    expect(readConfig().topicGroupMemory.tencentdb).toMatchObject({
+      endpoint: 'http://127.0.0.1:8420',
+      panelUrl: 'https://memory.example.com',
+    });
+  });
 });

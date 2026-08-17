@@ -919,22 +919,25 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && p.type === 'task_complete'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
-      const failed = p.error !== null && p.error !== undefined;
+      const contextWindowFailure = isContextWindowErrorInfo(codexErrorInfo(p));
+      const structuredFailure = p.error !== null && p.error !== undefined;
+      const hasFinalCandidate = typeof p.last_agent_message === 'string';
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
-        text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
-        terminalStatus: isContextWindowErrorInfo(codexErrorInfo(p))
+        text: hasFinalCandidate ? p.last_agent_message : '',
+        terminalStatus: contextWindowFailure || structuredFailure
           ? 'failed'
-          : (typeof p.last_agent_message === 'string' && p.last_agent_message.trim().length > 0
+          : (hasFinalCandidate
               ? 'completed'
               : 'ambiguous'),
-        terminalErrorCode: isContextWindowErrorInfo(codexErrorInfo(p))
+        terminalErrorCode: contextWindowFailure
           ? 'codex_context_window_exceeded'
-          : (typeof p.last_agent_message === 'string' && p.last_agent_message.trim().length > 0
-              ? undefined
-              : 'codex_task_complete_without_final_candidate'),
+          : (structuredFailure
+              ? codexTaskFailureCode(p.error)
+              : (hasFinalCandidate ? undefined : 'codex_task_complete_without_final_candidate')),
+        ...(structuredFailure ? { terminalErrorSummary: safeFailureSummary(p.error) } : {}),
       });
       continue;
     }
