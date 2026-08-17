@@ -47,6 +47,22 @@ export interface TencentDbSceneEntry {
   updatedAt?: string;
 }
 
+export interface TencentDbKnowledgeAsset {
+  knowledgeId: string;
+  type: 'wiki' | 'code-graph' | string;
+  name?: string;
+  description?: string;
+  serviceUrl?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TencentDbKnowledgeTool {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
 export interface TencentDbRecallResult {
   memories: TencentDbAtomicMemory[];
   persona?: string;
@@ -137,6 +153,42 @@ function isLoopbackHostname(hostname: string): boolean {
     || /^127(?:\.\d{1,3}){3}$/u.test(normalized);
 }
 
+function validateKnowledgeServiceUrl(raw: string): string {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(raw);
+  } catch {
+    throw new TencentDbAgentMemoryError('invalid_knowledge_endpoint', 'Knowledge service_url must be a valid HTTP(S) URL');
+  }
+  if ((endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:')
+    || endpoint.username || endpoint.password || endpoint.hash || endpoint.search) {
+    throw new TencentDbAgentMemoryError('invalid_knowledge_endpoint', 'Knowledge service_url must be an HTTP(S) URL without credentials, query strings, or fragments');
+  }
+  if (endpoint.protocol === 'http:' && !isLoopbackHostname(endpoint.hostname)) {
+    throw new TencentDbAgentMemoryError('insecure_knowledge_endpoint', 'Remote Knowledge service_url endpoints must use HTTPS');
+  }
+  return endpoint.toString().replace(/\/+$/, '');
+}
+
+function normalizeKnowledgeToolName(value: string): string {
+  return value.trim().replace(/^tdai_[a-z]+_/u, '');
+}
+
+function isReadOnlyKnowledgeToolName(toolName: string): boolean {
+  const normalized = normalizeKnowledgeToolName(toolName);
+  return new Set([
+    'search',
+    'read_page',
+    'explore',
+    'callers',
+    'callees',
+    'impact',
+    'node',
+    'status',
+    'files',
+  ]).has(normalized);
+}
+
 export class TencentDbAgentMemoryClient {
   readonly endpoint: string;
   readonly apiKey: string;
@@ -220,6 +272,51 @@ export class TencentDbAgentMemoryClient {
         throw new TencentDbAgentMemoryError('timeout', `TencentDB memory request timed out after ${timeoutMs}ms`);
       }
       throw new TencentDbAgentMemoryError('network_error', error instanceof Error ? error.message : String(error));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async requestKnowledge<T>(serviceUrl: string, path: string, body: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<T> {
+    const base = validateKnowledgeServiceUrl(serviceUrl);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-tdai-service-id': this.serviceId,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const text = await response.text().catch(() => '');
+      let envelope: TencentDbEnvelope<T>;
+      try {
+        envelope = JSON.parse(text) as TencentDbEnvelope<T>;
+      } catch {
+        throw new TencentDbAgentMemoryError(
+          'invalid_knowledge_response',
+          `TencentDB Knowledge returned ${response.status} with a non-JSON response`,
+          response.status,
+        );
+      }
+      if (!response.ok || envelope.code !== 0) {
+        throw new TencentDbAgentMemoryError(
+          `knowledge_${envelope.code ?? response.status}`,
+          envelope.message || `TencentDB Knowledge request failed with HTTP ${response.status}`,
+          response.status,
+          envelope.request_id,
+        );
+      }
+      return (envelope.data ?? {}) as T;
+    } catch (error) {
+      if (error instanceof TencentDbAgentMemoryError) throw error;
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new TencentDbAgentMemoryError('timeout', `TencentDB Knowledge request timed out after ${timeoutMs}ms`);
+      }
+      throw new TencentDbAgentMemoryError('knowledge_network_error', error instanceof Error ? error.message : String(error));
     } finally {
       clearTimeout(timer);
     }
@@ -339,6 +436,99 @@ export class TencentDbAgentMemoryClient {
     if (!path.trim()) return undefined;
     const data = await this.request<{ content?: string }>('/v3/scenario/read', this.body(isolation, { path: path.trim() }));
     return sanitizeRecalledText(data.content, 4_000) || undefined;
+  }
+
+  async listKnowledge(
+    isolation: Pick<TencentDbMemoryIsolation, 'teamId'>,
+    options: { type?: 'wiki' | 'code-graph'; knowledgeIds?: string[]; limit?: number; offset?: number } = {},
+  ): Promise<TencentDbKnowledgeAsset[]> {
+    const body: Record<string, unknown> = {
+      team_id: isolation.teamId,
+      pagination: {
+        limit: Math.max(1, Math.min(options.limit ?? 50, 1_000)),
+        offset: Math.max(0, options.offset ?? 0),
+      },
+    };
+    if (options.type) body.type = options.type;
+    const knowledgeIds = (options.knowledgeIds ?? []).map(id => id.trim()).filter(Boolean).slice(0, 200);
+    if (knowledgeIds.length) body.knowledge_ids = knowledgeIds;
+    const data = await this.request<{ items?: Array<Record<string, unknown>> }>('/v3/knowledge/list', body);
+    return (data.items ?? []).flatMap((item): TencentDbKnowledgeAsset[] => {
+      const knowledgeId = sanitizeRecalledText(item.knowledge_id ?? item.knowledgeId, 300);
+      if (!knowledgeId) return [];
+      const type = sanitizeRecalledText(item.type, 80) || 'unknown';
+      return [{
+        knowledgeId,
+        type,
+        ...(sanitizeRecalledText(item.name, 300) ? { name: sanitizeRecalledText(item.name, 300) } : {}),
+        ...(sanitizeRecalledText(item.description, 1_000) ? { description: sanitizeRecalledText(item.description, 1_000) } : {}),
+        ...(typeof item.service_url === 'string' && item.service_url.trim() ? { serviceUrl: validateKnowledgeServiceUrl(item.service_url) } : {}),
+        ...(typeof item.created_at === 'string' ? { createdAt: item.created_at } : {}),
+        ...(typeof item.updated_at === 'string' ? { updatedAt: item.updated_at } : {}),
+      }];
+    });
+  }
+
+  private async findKnowledgeAsset(isolation: Pick<TencentDbMemoryIsolation, 'teamId'>, knowledgeId: string): Promise<TencentDbKnowledgeAsset> {
+    const trimmed = knowledgeId.trim();
+    if (!trimmed) throw new TencentDbAgentMemoryError('invalid_knowledge_id', 'knowledgeId is required');
+    const assets = await this.listKnowledge(isolation, { knowledgeIds: [trimmed], limit: 1 });
+    const asset = assets.find(item => item.knowledgeId === trimmed);
+    if (!asset) {
+      throw new TencentDbAgentMemoryError('knowledge_not_found', `Knowledge asset is not registered for this team: ${trimmed}`);
+    }
+    if (!asset.serviceUrl) {
+      throw new TencentDbAgentMemoryError('knowledge_service_url_missing', `Knowledge asset has no service_url: ${trimmed}`);
+    }
+    return asset;
+  }
+
+  async listKnowledgeTools(
+    isolation: Pick<TencentDbMemoryIsolation, 'teamId'>,
+    knowledgeId: string,
+  ): Promise<TencentDbKnowledgeTool[]> {
+    const asset = await this.findKnowledgeAsset(isolation, knowledgeId);
+    const data = await this.requestKnowledge<{ tools?: Array<Record<string, unknown>> }>(
+      asset.serviceUrl!,
+      '/tools/list',
+      { knowledge_id: asset.knowledgeId },
+    );
+    return (data.tools ?? []).flatMap((tool): TencentDbKnowledgeTool[] => {
+      const name = sanitizeRecalledText(tool.name, 200);
+      if (!name || !isReadOnlyKnowledgeToolName(name)) return [];
+      return [{
+        name,
+        ...(sanitizeRecalledText(tool.description, 1_000) ? { description: sanitizeRecalledText(tool.description, 1_000) } : {}),
+        ...(tool.inputSchema !== undefined ? { inputSchema: tool.inputSchema } : {}),
+        ...(tool.input_schema !== undefined ? { inputSchema: tool.input_schema } : {}),
+        ...(tool.params !== undefined ? { inputSchema: tool.params } : {}),
+      }];
+    });
+  }
+
+  async callKnowledgeTool(
+    isolation: Pick<TencentDbMemoryIsolation, 'teamId'>,
+    knowledgeId: string,
+    toolName: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const normalizedToolName = normalizeKnowledgeToolName(toolName);
+    if (!isReadOnlyKnowledgeToolName(normalizedToolName)) {
+      throw new TencentDbAgentMemoryError('knowledge_tool_not_allowed', `Knowledge tool is not allowed: ${toolName}`);
+    }
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new TencentDbAgentMemoryError('invalid_params', 'Knowledge tool params must be a JSON object');
+    }
+    const asset = await this.findKnowledgeAsset(isolation, knowledgeId);
+    const tools = await this.listKnowledgeTools(isolation, knowledgeId);
+    if (!tools.some(tool => normalizeKnowledgeToolName(tool.name) === normalizedToolName)) {
+      throw new TencentDbAgentMemoryError('knowledge_tool_not_found', `Knowledge tool is not exposed by this asset: ${toolName}`);
+    }
+    return this.requestKnowledge<unknown>(asset.serviceUrl!, '/tools/call', {
+      knowledge_id: asset.knowledgeId,
+      tool_name: normalizedToolName,
+      params,
+    });
   }
 
   async recall(

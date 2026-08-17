@@ -223,6 +223,7 @@ describe('topic-group memory store', () => {
   it('lists per-bot memory statistics with file size and entry counts', async () => {
     const dir = await dataDir();
     await mutateTopicGroupMemory('cli_a', 'oc_one', doc => {
+      doc.chatName = 'Release Planning';
       doc.summary = 'shared summary';
       doc.facts.push({ id: 'fact_1', text: 'fact', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), confidence: 'confirmed' });
       doc.resources.push({ id: 'resource_1', kind: 'prd', title: 'PRD', url: 'https://docs.example.com/prd', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), confidence: 'confirmed' });
@@ -232,7 +233,7 @@ describe('topic-group memory store', () => {
     const listed = await listTopicGroupMemories('cli_a', { dataDir: dir });
     expect(listed).toHaveLength(1);
     expect(listed[0]).toMatchObject({
-      larkAppId: 'cli_a', chatId: 'oc_one', exists: true, hasContent: true,
+      larkAppId: 'cli_a', chatId: 'oc_one', chatName: 'Release Planning', exists: true, hasContent: true,
       revision: 1, summaryChars: 14, facts: 1, resources: 1,
     });
     expect(listed[0].sizeBytes).toBeGreaterThan(0);

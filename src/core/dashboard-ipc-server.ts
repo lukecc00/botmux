@@ -43,6 +43,7 @@ import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as topicGroupMemoryStore from '../services/topic-group-memory-store.js';
 import { compactTopicGroupMemoryWithHttp, resolveTopicGroupMemoryHttpContext } from '../services/topic-group-memory-http-distiller.js';
 import { resolveTopicGroupMemoryConfig } from '../services/topic-group-memory-config.js';
+import { buildMemoryHubLoginUrl, MemoryHubAccessError } from '../services/memory-hub-access.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -3709,6 +3710,25 @@ ipcRoute('GET', '/api/topic-group-memory', async (_req, res) => {
     limits: { maxSummaryChars: memoryConfig.maxSummaryChars },
   });
   jsonRes(res, 200, { ok: true, larkAppId: cachedLarkAppId, config: memoryConfig, count: memories.length, memories });
+});
+
+// POST keeps the Hub admin user_key behind the dashboard write-auth boundary.
+// The key is read from the runtime's mode-0600 file only for this one click and
+// is returned inside a URL fragment, never persisted into Botmux config.
+ipcRoute('POST', '/api/topic-group-memory/hub-link', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const memoryConfig = resolveTopicGroupMemoryConfig(getBot(cachedLarkAppId).config.topicGroupMemory);
+    const url = buildMemoryHubLoginUrl(memoryConfig.tencentdb);
+    res.setHeader('cache-control', 'no-store');
+    jsonRes(res, 200, { ok: true, url });
+  } catch (error) {
+    res.setHeader('cache-control', 'no-store');
+    jsonRes(res, 400, {
+      ok: false,
+      error: error instanceof MemoryHubAccessError ? error.code : 'hub_link_failed',
+    });
+  }
 });
 
 ipcRoute('POST', '/api/topic-group-memory/clear', async (_req, res) => {

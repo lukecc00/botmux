@@ -159,6 +159,7 @@ describe('topic-group memory final update pipeline', () => {
       turnId: 'turn_1',
       sessionId: 'session_1',
       rootMessageId: 'om_root',
+      chatName: 'Memory Hub 验收话题群',
       now: '2026-07-27T00:00:00.000Z',
       maxSummaryChars: 6_000,
     });
@@ -173,6 +174,7 @@ describe('topic-group memory final update pipeline', () => {
     });
     expect(updated.resources[0]).toMatchObject({ kind: 'prd', title: '需求 PRD', url: 'https://bytedance.larkoffice.com/docx/PrdToken' });
     expect(updated.recentContributions[0].turnId).toBe('turn_1');
+    expect(updated.chatName).toBe('Memory Hub 验收话题群');
   });
 
   it('is a no-op for duplicate final turns', () => {

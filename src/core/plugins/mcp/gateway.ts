@@ -54,6 +54,13 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from './environment.js';
 import { readMcpGatewayAuthToken, sendMcpGatewayHandshake } from './socket-auth.js';
+import {
+  BOTMUX_MEMORY_MCP_INSTRUCTIONS,
+  builtinMemoryToolRoutes,
+  builtinMemoryToolsForSession,
+  callBuiltinMemoryTool,
+  hasBuiltinMemorySession,
+} from './builtin-memory-tools.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -87,6 +94,10 @@ interface GatewayConnection extends GatewayDescriptor {
 
 interface NamedRoute {
   connection: GatewayConnection;
+  originalName: string;
+}
+
+interface BuiltinToolRoute {
   originalName: string;
 }
 
@@ -285,6 +296,7 @@ export class PluginMcpGateway {
   private connections: GatewayConnection[] = [];
   private initializePromise?: Promise<void>;
   private toolRoutes = new Map<string, NamedRoute>();
+  private builtinToolRoutes = new Map<string, BuiltinToolRoute>();
   private promptRoutes = new Map<string, NamedRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private resourceTemplateRoutes: ResourceRoute[] = [];
@@ -304,7 +316,9 @@ export class PluginMcpGateway {
           completions: {},
           logging: {},
         },
-        instructions: 'Aggregates MCP servers contributed by the plugins enabled for this Botmux session.',
+        instructions: hasBuiltinMemorySession(env)
+          ? `Aggregates MCP servers contributed by the plugins enabled for this Botmux session.\n\n${BOTMUX_MEMORY_MCP_INSTRUCTIONS}`
+          : 'Aggregates MCP servers contributed by the plugins enabled for this Botmux session.',
       },
     );
     this.registerHandlers();
@@ -493,6 +507,15 @@ export class PluginMcpGateway {
     for (const { tool } of entries) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
     const used = new Set<string>();
     this.toolRoutes.clear();
+    const availableBuiltinRoutes = builtinMemoryToolRoutes();
+    this.builtinToolRoutes.clear();
+    const builtinTools = builtinMemoryToolsForSession(this.env).filter((tool) => {
+      if (used.has(tool.name)) return false;
+      used.add(tool.name);
+      const route = availableBuiltinRoutes.get(tool.name);
+      if (route) this.builtinToolRoutes.set(tool.name, route);
+      return true;
+    });
     const exposed = entries.map(({ connection, tool }) => {
       const candidate = counts.get(tool.name) === 1 ? tool.name : `${connection.routeName}__${tool.name}`;
       const name = allocateName(candidate, `${connection.pluginId}__${connection.server.name}__${tool.name}`, used);
@@ -500,7 +523,7 @@ export class PluginMcpGateway {
       return name === tool.name ? tool : { ...tool, name };
     });
     this.persistDiagnostics();
-    return exposed;
+    return [...builtinTools, ...exposed];
   }
 
   private async refreshPrompts(): Promise<any[]> {
@@ -600,7 +623,9 @@ export class PluginMcpGateway {
   private registerHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await this.refreshTools() }));
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-      if (this.toolRoutes.size === 0) await this.refreshTools();
+      if (this.toolRoutes.size === 0 && this.builtinToolRoutes.size === 0) await this.refreshTools();
+      const builtinRoute = this.builtinToolRoutes.get(request.params.name);
+      if (builtinRoute) return callBuiltinMemoryTool(this.env, builtinRoute.originalName, request.params.arguments);
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
       return route.connection.client.callTool(

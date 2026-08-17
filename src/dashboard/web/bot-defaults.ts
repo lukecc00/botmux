@@ -155,6 +155,7 @@ export type BotDefaultsRow = {
 export type TopicGroupMemoryStats = {
   larkAppId: string;
   chatId: string;
+  chatName?: string;
   path: string;
   exists: boolean;
   hasContent: boolean;

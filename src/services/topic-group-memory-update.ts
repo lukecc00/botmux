@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DaemonSession } from '../core/types.js';
 import { getBot } from '../bot-registry.js';
+import { getChatName } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { distillTopicGroupMemoryLocal } from './topic-group-memory-local-compactor.js';
 import {
@@ -260,9 +261,10 @@ function removeObsoleteItems(doc: TopicGroupMemoryDoc, obsoleteItems: string[]):
 export function applyTopicGroupMemoryUpdatePatch(
   current: TopicGroupMemoryDoc,
   patch: TopicGroupMemoryUpdatePatch,
-  meta: { turnId: string; sessionId: string; rootMessageId: string; now: string; maxSummaryChars: number },
+  meta: { turnId: string; sessionId: string; rootMessageId: string; chatName?: string; now: string; maxSummaryChars: number },
 ): TopicGroupMemoryDoc | false {
   if (current.recentContributions.some(entry => entry.turnId === meta.turnId)) return false;
+  if (meta.chatName?.trim()) current.chatName = meta.chatName.trim().slice(0, 300);
   removeObsoleteItems(current, patch.obsoleteItems);
   if (patch.summaryReplacement !== undefined) {
     current.summary = cleanTopicGroupMemoryText(patch.summaryReplacement, meta.maxSummaryChars);
@@ -377,10 +379,14 @@ async function maybeUpdateLocalTopicGroupMemoryFromFinal(
     return;
   }
   const now = new Date().toISOString();
+  const chatName = ds.session.chatDisplayName?.trim()
+    || await getChatName(scope.larkAppId, scope.chatId)
+    || undefined;
   const doc = await mutateTopicGroupMemory(scope.larkAppId, scope.chatId, current => applyTopicGroupMemoryUpdatePatch(current, result.patch, {
     turnId: output.turnId,
     sessionId: ds.session.sessionId,
     rootMessageId: scope.rootMessageId,
+    chatName,
     now,
     maxSummaryChars: scope.config.maxSummaryChars,
   }), { limits: { maxSummaryChars: scope.config.maxSummaryChars } });

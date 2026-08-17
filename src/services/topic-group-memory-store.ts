@@ -95,6 +95,8 @@ export interface TopicGroupMemoryDoc {
   schemaVersion: 1;
   larkAppId: string;
   chatId: string;
+  /** Human-readable Lark topic-group name. The raw chatId remains the key. */
+  chatName?: string;
   chatMode: 'topic';
   enabled: true;
   updatedAt: string;
@@ -132,6 +134,7 @@ export interface TopicGroupMemoryStoreOptions {
 export interface TopicGroupMemoryStats {
   larkAppId: string;
   chatId: string;
+  chatName?: string;
   path: string;
   exists: boolean;
   hasContent: boolean;
@@ -255,6 +258,7 @@ function normalizeDoc(
     schemaVersion: 1,
     larkAppId,
     chatId,
+    ...(text(input.chatName, 300) ? { chatName: text(input.chatName, 300) } : {}),
     chatMode: 'topic',
     enabled: true,
     updatedAt: validIso(input.updatedAt, now),
@@ -359,6 +363,7 @@ export function trimTopicGroupMemory(
   const summary = doc.summary.trim().slice(0, limits.maxSummaryChars);
   return {
     ...doc,
+    ...(doc.chatName?.trim() ? { chatName: doc.chatName.trim().slice(0, 300) } : { chatName: undefined }),
     summary: containsTopicGroupMemorySensitiveText(summary) ? '' : summary,
     facts: trimEntries(doc.facts, limits.maxFacts),
     decisions: trimEntries(doc.decisions, limits.maxDecisions),
@@ -704,6 +709,7 @@ function topicGroupMemoryStatsFromDoc(
   return {
     larkAppId,
     chatId,
+    ...(doc?.chatName ? { chatName: doc.chatName } : {}),
     path,
     exists,
     hasContent: topicGroupMemoryHasContent(doc),

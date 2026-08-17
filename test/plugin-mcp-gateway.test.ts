@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { createServer, type Server as HttpServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -24,6 +25,33 @@ import {
 } from '../src/core/plugins/mcp/environment.js';
 import { mcpGatewayAuthTokenPath } from '../src/core/plugins/mcp/socket-auth.js';
 import { buildSeatbeltProfile } from '../src/adapters/cli/read-isolation.js';
+import { __testOnly_resetBotRegistry } from '../src/bot-registry.js';
+
+async function listenJsonServer(
+  handler: (request: { path: string; body?: any; auth?: string; service?: string }) => Promise<unknown> | unknown,
+): Promise<{ server: HttpServer; port: number }> {
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : undefined;
+    const payload = await handler({
+      path: req.url ?? '',
+      body,
+      auth: req.headers.authorization,
+      service: req.headers['x-tdai-service-id'] as string | undefined,
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(payload));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('missing test server address');
+  return { server, port: address.port };
+}
+
+function closeServer(server: HttpServer): Promise<void> {
+  return new Promise(resolve => server.close(() => resolve()));
+}
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -34,9 +62,11 @@ describe('plugin MCP Gateway', () => {
     fixture = resolve('test/fixtures/plugin-mcp-server.mjs');
     vi.stubEnv('HOME', home);
     vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+    vi.stubEnv('BOTS_CONFIG', join(home, '.botmux', 'bots.json'));
   });
 
   afterEach(() => {
+    __testOnly_resetBotRegistry();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
@@ -235,6 +265,204 @@ describe('plugin MCP Gateway', () => {
 
     expect(await listForSession('bot-a-session')).toEqual(['alpha_unique', 'echo']);
     expect(await listForSession('bot-b-session')).toEqual([]);
+  });
+
+  it('exposes session-scoped TencentDB memory tools and keeps Knowledge secrets server-side', async () => {
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(dataDir, { recursive: true });
+    const runtimeDir = join(home, 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, 'agent-integration.json'), '{}');
+    const seen: Array<{ path: string; body?: any; auth?: string; service?: string }> = [];
+    const knowledgeSeen: Array<{ path: string; body?: any; auth?: string; service?: string }> = [];
+    let knowledgeBase = '';
+
+    const knowledgeServer = await listenJsonServer(async (req) => {
+      knowledgeSeen.push(req);
+      if (req.path === '/tools/list') {
+        return { code: 0, message: 'ok', data: { tools: [
+          { name: 'search', description: 'wiki search', params: { type: 'object' } },
+          { name: 'delete', description: 'must stay hidden' },
+        ] } };
+      }
+      if (req.path === '/tools/call') {
+        return { code: 0, message: 'ok', data: { hits: [{ ref: 'adr.md', text: 'shared runtime boundary' }] } };
+      }
+      return { code: 404, message: 'not found', data: {} };
+    });
+    knowledgeBase = `http://127.0.0.1:${knowledgeServer.port}`;
+
+    const coreServer = await listenJsonServer(async (req) => {
+      seen.push(req);
+      if (req.path === '/health') return { status: 'ok' };
+      if (req.path === '/v3/atomic/count') return { code: 0, message: 'ok', data: { total: 1 } };
+      if (req.path === '/v3/atomic/search') {
+        return { code: 0, message: 'ok', data: { items: [{ id: 'm1', type: 'decision', content: 'Use shared MemoryCore' }] } };
+      }
+      if (req.path === '/v3/conversation/search') {
+        return { code: 0, message: 'ok', data: { messages: [{ id: 'c1', role: 'user', content: 'previous wording' }] } };
+      }
+      if (req.path === '/v3/knowledge/list') {
+        const ids = Array.isArray(req.body?.knowledge_ids) ? req.body.knowledge_ids : [];
+        const registered = { knowledge_id: 'wiki-docs', type: 'wiki', name: 'Docs', service_url: knowledgeBase };
+        const items = ids.length ? ids.filter((id: string) => id === 'wiki-docs').map(() => registered) : [registered];
+        return { code: 0, message: 'ok', data: { items } };
+      }
+      return { code: 0, message: 'ok', data: {} };
+    });
+
+    try {
+      writeFileSync(join(home, '.botmux', 'bots.json'), JSON.stringify([{
+        larkAppId: 'cli_mem',
+        larkAppSecret: 'secret',
+        apiOnly: true,
+        cliId: 'codex',
+        topicGroupMemory: {
+          enabled: true,
+          provider: 'auto',
+          tencentdb: {
+            runtimeDir,
+            endpoint: `http://127.0.0.1:${coreServer.port}`,
+            apiKey: 'local-token',
+            serviceId: 'svc-1',
+            teamId: 'team-{chatId}',
+            agentId: 'agent-{larkAppId}',
+            userId: 'topic-user',
+            timeoutMs: 2_000,
+          },
+        },
+      }], null, 2));
+      writeFileSync(join(dataDir, 'sessions-cli_mem.json'), JSON.stringify({
+        'mem-session': {
+          sessionId: 'mem-session',
+          larkAppId: 'cli_mem',
+          chatId: 'oc_mem',
+          chatType: 'group',
+          rootMessageId: 'om_root',
+          scope: 'thread',
+          title: 'memory',
+          status: 'active',
+          createdAt: '2026-08-17T00:00:00.000Z',
+        },
+      }, null, 2));
+
+      const gateway = new PluginMcpGateway(
+        undefined,
+        { ...process.env, HOME: home, USERPROFILE: home, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 'mem-session' },
+      );
+      const client = new Client({ name: 'gateway-memory-test', version: '1.0.0' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+      try {
+        const toolNames = (await client.listTools()).tools.map(tool => tool.name).sort();
+        expect(toolNames).toContain('botmux_memory__memory_search');
+        expect(toolNames).toContain('botmux_memory__knowledge_call');
+        const memory = await client.callTool({ name: 'botmux_memory__memory_search', arguments: { query: 'shared', limit: 3 } });
+        expect(JSON.parse((memory.content[0] as any).text)).toMatchObject({ ok: true, data: { items: [{ content: 'Use shared MemoryCore' }] } });
+        const assets = await client.callTool({ name: 'botmux_memory__knowledge_list', arguments: {} });
+        expect(JSON.parse((assets.content[0] as any).text)).toMatchObject({
+          ok: true,
+          data: { items: [{ knowledgeId: 'wiki-docs', type: 'wiki' }] },
+        });
+        expect(JSON.parse((assets.content[0] as any).text).data.items[0]).not.toHaveProperty('serviceUrl');
+        const tools = await client.callTool({
+          name: 'botmux_memory__knowledge_tools_list',
+          arguments: { knowledgeId: 'wiki-docs' },
+        });
+        expect(JSON.parse((tools.content[0] as any).text)).toMatchObject({
+          ok: true,
+          data: { tools: [{ name: 'search', inputSchema: { type: 'object' } }] },
+        });
+        expect(JSON.parse((tools.content[0] as any).text).data.tools).toHaveLength(1);
+
+        const knowledge = await client.callTool({
+          name: 'botmux_memory__knowledge_call',
+          arguments: { knowledgeId: 'wiki-docs', toolName: 'search', params: { query: 'runtime' } },
+        });
+        expect(JSON.parse((knowledge.content[0] as any).text)).toMatchObject({ ok: true, data: { hits: [{ ref: 'adr.md' }] } });
+        const rejectedWrite = await client.callTool({
+          name: 'botmux_memory__knowledge_call',
+          arguments: { knowledgeId: 'wiki-docs', toolName: 'delete', params: {} },
+        });
+        expect(JSON.parse((rejectedWrite.content[0] as any).text)).toMatchObject({ ok: false, code: 'knowledge_tool_not_allowed' });
+      } finally {
+        await client.close();
+        await gateway.close();
+      }
+
+      expect(seen.find(item => item.path === '/v3/atomic/search')?.body).toMatchObject({
+        team_id: 'team-oc_mem', agent_id: 'agent-cli_mem', user_id: 'topic-user', query: 'shared', limit: 3,
+      });
+      expect(seen.find(item => item.path === '/v3/atomic/search')?.body).not.toHaveProperty('session_id');
+      expect(knowledgeSeen.find(item => item.path === '/tools/call')?.auth).toBeUndefined();
+      expect(knowledgeSeen.find(item => item.path === '/tools/call')?.service).toBe('svc-1');
+    } finally {
+      await closeServer(coreServer.server);
+      await closeServer(knowledgeServer.server);
+    }
+  });
+
+  it('rejects unregistered Knowledge assets through built-in memory tools', async () => {
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(dataDir, { recursive: true });
+    const runtimeDir = join(home, 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, 'agent-integration.json'), '{}');
+    const coreServer = await listenJsonServer(async (req) => {
+      if (req.path === '/health') return { status: 'ok' };
+      if (req.path === '/v3/atomic/count') return { code: 0, message: 'ok', data: { total: 0 } };
+      if (req.path === '/v3/knowledge/list') return { code: 0, message: 'ok', data: { items: [] } };
+      return { code: 0, message: 'ok', data: {} };
+    });
+    try {
+      writeFileSync(join(home, '.botmux', 'bots.json'), JSON.stringify([{
+        larkAppId: 'cli_mem2',
+        larkAppSecret: 'secret',
+        apiOnly: true,
+        cliId: 'codex',
+        topicGroupMemory: {
+          enabled: true,
+          provider: 'auto',
+          tencentdb: {
+            runtimeDir,
+            endpoint: `http://127.0.0.1:${coreServer.port}`,
+            apiKey: 'local-token',
+            serviceId: 'svc-1',
+            teamId: 'team',
+            agentId: 'agent',
+            userId: 'user',
+            timeoutMs: 2_000,
+          },
+        },
+      }], null, 2));
+      writeFileSync(join(dataDir, 'sessions-cli_mem2.json'), JSON.stringify({
+        'mem-session-2': {
+          sessionId: 'mem-session-2', larkAppId: 'cli_mem2', chatId: 'oc_mem', chatType: 'group',
+          rootMessageId: 'om_root', scope: 'thread', title: 'memory', status: 'active', createdAt: '2026-08-17T00:00:00.000Z',
+        },
+      }));
+      const gateway = new PluginMcpGateway(
+        undefined,
+        { ...process.env, HOME: home, USERPROFILE: home, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 'mem-session-2' },
+      );
+      const client = new Client({ name: 'gateway-memory-reject-test', version: '1.0.0' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+      try {
+        expect((await client.listTools()).tools.map(tool => tool.name)).toContain('botmux_memory__knowledge_call');
+        const result = await client.callTool({
+          name: 'botmux_memory__knowledge_call',
+          arguments: { knowledgeId: 'other-team-wiki', toolName: 'search', params: { query: 'x' } },
+        });
+        expect(JSON.parse((result.content[0] as any).text)).toMatchObject({ ok: false, code: 'knowledge_not_found' });
+      } finally {
+        await client.close();
+        await gateway.close();
+      }
+    } finally {
+      await closeServer(coreServer.server);
+    }
   });
 
   it('keeps serving when diagnostics cannot be persisted', async () => {

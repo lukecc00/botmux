@@ -5311,6 +5311,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // POST /api/bots/:appId/topic-group-memory/hub-link — authenticated
+    // one-click access. POST deliberately keeps the Hub user_key outside the
+    // dashboard's public read-only GET surface.
+    let mBotMemoryHubLink: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mBotMemoryHubLink = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-group-memory\/hub-link$/))) {
+      const appId = decodeURIComponent(mBotMemoryHubLink[1]);
+      const upstream = await proxyToDaemon(appId, '/api/topic-group-memory/hub-link', { method: 'POST' });
+      res.writeHead(upstream.status, {
+        'content-type': 'application/json',
+        'cache-control': 'no-store',
+      });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Topic-group memory status and maintenance. The selected bot daemon owns
     // the larkAppId partition, so the public dashboard never accepts an app id
     // inside the memory-store key itself.

@@ -53,6 +53,18 @@ while read -r local_ref local_sha remote_ref _remote_sha; do
     exit 1
   fi
 
+  # 个人版仓库的 p/ai_open 通道只创建 GitHub Release，不发布 npm；版本由
+  # dev-version.json 独立管理。fork 同步官方 tags 后，其版本号可能高于个人版，
+  # 不能拿官方 tag 集合阻断个人版补丁递增。release.yml 还会二次校验 tag、
+  # manifest 和远端 p/ai_open HEAD 必须完全一致。
+  if [[ -f dev-version.json ]]; then
+    personal_version=$(node -p "require('./dev-version.json').version" 2>/dev/null || true)
+    current_branch=$(git branch --show-current 2>/dev/null || true)
+    if [[ "$current_branch" == "p/ai_open" && "$version" == "$personal_version" ]]; then
+      continue
+    fi
+  fi
+
   # 仓库现有最大稳定版本（排除带 - 后缀的 prerelease）
   current_latest=$(git tag --list 'v*' --sort=-v:refname \
     | grep -v -- '-' \

@@ -3784,8 +3784,8 @@ type TopicGroupMemorySelection = {
 
 const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10;
 
-function topicGroupMemoryChatName(chatId: string, fallback: string): string {
-  return chatDisplayTitle({ chatId })?.trim() || fallback;
+function topicGroupMemoryChatName(memory: Pick<TopicGroupMemoryStats, 'chatId' | 'chatName'>, fallback: string): string {
+  return memory.chatName?.trim() || chatDisplayTitle({ chatId: memory.chatId })?.trim() || fallback;
 }
 
 function topicGroupMemoryEditableContent(memory: TopicGroupMemoryDocument): TopicGroupMemoryEditableContent {
@@ -3823,7 +3823,7 @@ function TopicGroupMemoryDetailDialog(props: {
   );
   const [status, setStatus] = useState<StatusMessage>(null);
   const chatName = props.selected
-    ? topicGroupMemoryChatName(props.selected.stats.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))
+    ? topicGroupMemoryChatName(props.selected.stats, tr('botDefaults.topicGroupMemoryUnknownGroup'))
     : null;
   const dirty = !!draft && !!savedDraft && JSON.stringify(draft) !== JSON.stringify(savedDraft);
 
@@ -4238,7 +4238,8 @@ function TopicGroupMemorySection(props: {
   }
 
   async function deleteMemory(chatId: string): Promise<void> {
-    const chatName = topicGroupMemoryChatName(chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'));
+    const memory = memories.find(item => item.chatId === chatId) ?? { chatId };
+    const chatName = topicGroupMemoryChatName(memory, tr('botDefaults.topicGroupMemoryUnknownGroup'));
     if (!window.confirm(tr('botDefaults.topicGroupMemoryDeleteConfirm', { group: chatName }))) return;
     setMemoryBusy(true);
     setMemoryStatus(null);
@@ -4368,6 +4369,26 @@ function TopicGroupMemorySection(props: {
         panelUrl: tencentPanelHref ?? '',
       },
     });
+  }
+
+  async function openTencentDbPanel(): Promise<void> {
+    const popup = window.open('about:blank', '_blank');
+    if (popup) popup.opener = null;
+    setStatus(null);
+    try {
+      const res = await sendJson('POST', `${memoryBaseUrl}/hub-link`);
+      const url = typeof res.body?.url === 'string' ? safeHttpExternalUrl(res.body.url) : undefined;
+      if (!res.ok || !url) {
+        popup?.close();
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      if (popup) popup.location.replace(url);
+      else window.location.assign(url);
+    } catch (error) {
+      popup?.close();
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    }
   }
 
   const injectOptions: DropdownFieldOption<'off' | 'summary' | 'summary-and-facts'>[] = [
@@ -4549,7 +4570,11 @@ function TopicGroupMemorySection(props: {
         />
         <div className="actions">
           <button type="button" className="primary" disabled={busy} onClick={() => void saveTencentDb()}>{tr('botDefaults.save')}</button>
-          {tencentPanelHref ? <a href={tencentPanelHref} target="_blank" rel="noreferrer">{tr('botDefaults.topicGroupMemoryTencentOpenPanel')}</a> : null}
+          {tencentPanelHref ? (
+            <button type="button" disabled={busy} onClick={() => void openTencentDbPanel()}>
+              {tr('botDefaults.topicGroupMemoryTencentOpenPanel')}
+            </button>
+          ) : null}
         </div>
       </div>
       <div className="bd-subsection tgm-memory-http-llm">
@@ -4635,7 +4660,7 @@ function TopicGroupMemorySection(props: {
                       <tr key={memory.chatId}>
                         <td data-label={tr('botDefaults.topicGroupMemoryChatId')}>
                           <div className="tgm-memory-chat">
-                            <strong>{topicGroupMemoryChatName(memory.chatId, tr('botDefaults.topicGroupMemoryUnknownGroup'))}</strong>
+                            <strong>{topicGroupMemoryChatName(memory, tr('botDefaults.topicGroupMemoryUnknownGroup'))}</strong>
                           </div>
                           {memory.error ? <small className="hint-warn-inline">{memory.error}</small> : null}
                         </td>

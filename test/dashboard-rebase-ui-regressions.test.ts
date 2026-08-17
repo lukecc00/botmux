@@ -136,7 +136,8 @@ describe('dashboard master feature integration', () => {
     const messages = dashboardSource('i18n.ts');
 
     expect(page).toContain('const TOPIC_GROUP_MEMORY_PAGE_SIZE = 10');
-    expect(page).toContain('chatDisplayTitle({ chatId })');
+    expect(page).toContain('chatDisplayTitle({ chatId: memory.chatId })');
+    expect(page).toContain('memory.chatName?.trim()');
     expect(page).toContain('topicGroupMemoryEditableContent');
     expect(page).toContain('className="tgm-memory-chat"');
     expect(page).toContain('className="tgm-memory-table-wrap"');
@@ -148,7 +149,10 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('className="bd-subsection tgm-memory-tencentdb"');
     expect(page).toContain("tr('botDefaults.topicGroupMemoryTencentOpenPanel')");
     expect(page).toContain('const tencentPanelHref = useMemo(() => safeHttpExternalUrl(tencentPanelUrl)');
-    expect(page).toContain('href={tencentPanelHref}');
+    expect(page).toContain('openTencentDbPanel');
+    expect(page).toContain("'POST', `${memoryBaseUrl}/hub-link`");
+    expect(page).toContain('popup.location.replace(url)');
+    expect(page).not.toContain('href={tencentPanelHref}');
     expect(page).not.toContain('href={tencentPanelUrl.trim()}');
     expect(page).toContain('className="tgm-memory-status-strip"');
     expect(page).toContain('data-topic-group-memory-detail-dialog');
