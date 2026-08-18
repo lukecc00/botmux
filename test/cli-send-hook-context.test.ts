@@ -160,4 +160,19 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('baseCard: feedbackBaseCard');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
   });
+
+  it('queues same-topic explicit finals for topic-group memory after delivery', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain('buildTopicGroupMemoryFinalDeliveryPayload({');
+    expect(cmdSend).toContain('responseKind: effectiveResponseKind');
+    expect(cmdSend).toContain("path: '/api/topic-group-memory/final-delivery'");
+    expect(cmdSend).toContain('sameTopic: (shouldRecordBridgeMarker || !!deferredTopicRootMessageIdForOutput)');
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const markerWrite = cmdSend.indexOf('recordBridgeSendMarker(sentAtMs, messageId, text)');
+    const memoryPost = cmdSend.indexOf("path: '/api/topic-group-memory/final-delivery'");
+    expect(markerWrite).toBeGreaterThan(primarySend);
+    expect(memoryPost).toBeGreaterThan(markerWrite);
+  });
 });

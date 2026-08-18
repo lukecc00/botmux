@@ -133,6 +133,19 @@ describe('daemon session-scoped IPC route wiring', () => {
     );
   });
 
+  it('authenticates explicit-final memory delivery and schedules only the bound session turn', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/topic-group-memory/final-delivery'",
+      "ipcRoute('POST', '/api/session-ready'",
+    );
+    expect(route).toContain('authorizeSessionScopedIpc({');
+    expect(route).toContain('allowReceiver: false');
+    expect(route).toContain('turnId !== ds.managedTurnOrigin.turnId');
+    expect(route).toContain('scheduleTopicGroupMemoryUpdate(ds, { turnId, content })');
+    expect(route.indexOf('scheduleTopicGroupMemoryUpdate(ds, { turnId, content })'))
+      .toBeGreaterThan(route.indexOf("if (!verified.ok)"));
+  });
+
   it('binds hook identity before emitting the event', () => {
     const route = between(
       "ipcRoute('POST', '/api/hooks/emit'",

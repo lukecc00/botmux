@@ -240,6 +240,7 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { loadTopicGroupMemoryBlockForSession } from './services/topic-group-memory-runtime.js';
+import { scheduleTopicGroupMemoryUpdate } from './services/topic-group-memory-update.js';
 import {
   CODEX_HANDOFF_SUMMARY_PROMPT,
   CODEX_HANDOFF_TIMEOUT_MS,
@@ -6475,6 +6476,88 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
+});
+
+// ─── explicit final delivery → topic-group memory ──────────────────────────
+//
+// `botmux send --response-kind final` talks to Lark directly. Its transcript
+// fallback is then intentionally dedup-suppressed, so the normal
+// worker-pool `final_output` memory hook never runs. The short-lived CLI calls
+// this route only AFTER Lark accepted the final; the daemon schedules the same
+// fail-open update used by forwarded finals without delaying user delivery.
+ipcRoute('POST', '/api/topic-group-memory/final-delivery', async (req, res) => {
+  let raw: {
+    sessionId?: unknown;
+    turnId?: unknown;
+    messageId?: unknown;
+    content?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req, 128 * 1024);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId.trim() : '';
+  const turnId = typeof raw.turnId === 'string' ? raw.turnId.trim() : '';
+  const messageId = typeof raw.messageId === 'string' ? raw.messageId.trim() : '';
+  const content = typeof raw.content === 'string' ? raw.content : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
+  if (!turnId) return jsonRes(res, 400, { ok: false, error: 'missing_turn_id' });
+  if (!messageId) return jsonRes(res, 400, { ok: false, error: 'missing_message_id' });
+  if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'missing_content' });
+
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (!isTrustedHostIpcRequest(req)) {
+    const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(raw.originDispatchAttempt)
+      && raw.originDispatchAttempt > 0
+      ? raw.originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: true,
+      receiverSession: !!ds.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, { ok: false, error: verified.error });
+    }
+    if (!ds.managedTurnOrigin
+      || turnId !== ds.managedTurnOrigin.turnId
+      || raw.originTurnId !== ds.managedTurnOrigin.turnId
+      || claimedAttempt !== ds.managedTurnOrigin.dispatchAttempt) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+    const codexDecision = validateCodexAppManagedSendOrigin(
+      ds.session.codexAppDispatchLedger,
+      ds.managedTurnOrigin,
+      ds.initConfig?.cliId === 'codex-app' || ds.session.cliId === 'codex-app',
+    );
+    if (!codexDecision.ok) {
+      return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+    }
+  }
+
+  scheduleTopicGroupMemoryUpdate(ds, { turnId, content });
+  logger.info(
+    `[${sessionId.slice(0, 8)}] Explicit final queued for topic-group memory `
+    + `(turn ${turnId.slice(0, 8)}, message ${messageId.slice(0, 12)})`,
+  );
+  return jsonRes(res, 202, { ok: true });
 });
 
 // ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────

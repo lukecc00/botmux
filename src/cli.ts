@@ -225,6 +225,7 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
 } from './services/bridge-fallback-gate.js';
+import { buildTopicGroupMemoryFinalDeliveryPayload } from './services/topic-group-memory-final-delivery.js';
 import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import {
   bindRestartLeaseTo,
@@ -10460,6 +10461,38 @@ async function cmdSend(rest: string[]): Promise<void> {
     // closed a pending response card for this turn.
     if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
       recordBridgeSendMarker(sentAtMs, messageId, text);
+    }
+
+    // A successful explicit final is already the canonical user-visible
+    // delivery. The transcript bridge will suppress its duplicate fallback,
+    // so notify the long-lived daemon now instead of waiting for a
+    // `final_output` IPC that intentionally never arrives. The daemon owns the
+    // fire-and-forget memory update; failure here must never turn an accepted
+    // Lark send into exit!=0 (which would invite a duplicate resend).
+    const memoryFinalDelivery = buildTopicGroupMemoryFinalDeliveryPayload({
+      responseKind: effectiveResponseKind,
+      currentTurnId,
+      messageId,
+      content: text,
+      sameTopic: (shouldRecordBridgeMarker || !!deferredTopicRootMessageIdForOutput)
+        && !vcMeetingManagedSendOrigin,
+    });
+    if (memoryFinalDelivery) {
+      try {
+        const response = await postCurrentSessionDaemonRoute({
+          path: '/api/topic-group-memory/final-delivery',
+          sessionId: sid,
+          larkAppId: appId,
+          body: { ...memoryFinalDelivery },
+        });
+        if (!response.ok) {
+          throw new Error(`daemon HTTP ${response.status}`);
+        }
+      } catch (error) {
+        console.error(
+          `⚠️ 最终消息已发送，但共享记忆入队失败（不影响消息）：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     // Send attachments as separate messages — best-effort. The primary message
