@@ -265,6 +265,7 @@ import {
 import { recordVcMeetingListenerMessage } from './services/vc-meeting-listener-message-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import type { PluginCardActionRoutingRecord } from './core/plugins/card-actions/gateway.js';
 import {
   assertPluginBindingTransition,
   describePluginDependencyError,
@@ -3194,7 +3195,7 @@ function runInCheckout(cwd: string, command: string, args: string[]): void {
 }
 
 /**
- * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → pnpm build →
+ * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → bun run build →
  * 从本 checkout 的 dist/cli.js restart。dist/ 被 gitignore，只 pull 不 build
  * 重启后跑的还是旧代码，故 build 步不可省。定位/干净检查/命令定义与 dashboard
  * 共用 src/utils/local-dev-update.ts，避免两边逻辑漂移。
@@ -3209,7 +3210,7 @@ function cmdUpgradeLocalDev(): void {
 
   // git 干净检查 + pull + build 全程握同一把跨进程 update 锁（与 dashboard 的
   // /api/update/run 用的是同一个 target），避免 CLI 与 dashboard 同时对同一
-  // checkout 交错跑 pnpm build 而互相清理/覆盖 dist。restart 不在锁内——它有
+  // checkout 交错跑 bun run build 而互相清理/覆盖 dist。restart 不在锁内——它有
   // 自己的 restart lease。
   try {
     const lockTarget = globalInstallUpdateLockTarget();
@@ -3229,7 +3230,7 @@ function cmdUpgradeLocalDev(): void {
         err.dirtyStatus = status;
         throw err;
       }
-      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ pnpm build。
+      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ bun run build。
       for (const { command, args } of localDevUpdateSteps()) {
         console.log(`→ ${command} ${args.join(' ')}`);
         runInCheckout(dir, command, args);
@@ -6145,6 +6146,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --plugin-card-action <plugin-id>
+                                       显式允许该已启用插件声明的 callback action
        --layout result|progress|risk|blocked|handoff
                                        可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
@@ -7543,6 +7546,19 @@ async function relaySend(
   if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
+  if (flagPresentButValueMissing(rest, '--plugin-card-action')) {
+    console.error('relay: --plugin-card-action 需要 plugin id');
+    process.exit(2);
+  }
+  const pluginCardActionId = argValue(rest, '--plugin-card-action');
+  if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
+    console.error(`relay: 无效 plugin id: ${pluginCardActionId}`);
+    process.exit(2);
+  }
+  if (pluginCardActionId !== undefined && cardJsonArg === undefined && cardFile === undefined) {
+    console.error('relay: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
+    process.exit(2);
+  }
   let cardContent = '';
   if (cardJsonArg !== undefined && cardFile !== undefined) {
     console.error('relay: --card-json 与 --card-file 不能同时使用');
@@ -7624,11 +7640,12 @@ async function relaySend(
     copyOutboxAttachment(p, videoCovers);
   }
 
-  // Forward only presentation flags (must match the watcher's allowlist); path,
+  // Forward only presentation flags plus the bounded plugin-card selector
+  // identity (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -8415,9 +8432,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --card-json 需要 JSON 字符串参数');
     process.exit(2);
   }
+  if (flagPresentButValueMissing(rest, '--plugin-card-action')) {
+    console.error('botmux send: --plugin-card-action 需要 plugin id');
+    process.exit(2);
+  }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  const pluginCardActionId = argValue(rest, '--plugin-card-action');
+  if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
+    console.error(`botmux send: 无效 plugin id: ${pluginCardActionId}`);
+    process.exit(2);
+  }
+  if (pluginCardActionId !== undefined && !customCardRequested) {
+    console.error('botmux send: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
+    process.exit(2);
+  }
   const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length;
   if (responseKindOccurrences > 1) {
     console.error('botmux send: --response-kind 只能指定一次');
@@ -8793,7 +8823,68 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!existsSync(cardFile)) { console.error(`文件不存在: ${cardFile}`); process.exit(1); }
       rawCard = readFileSync(cardFile, 'utf-8');
     }
-    const normalizedCard = normalizeInteractiveCardInput(rawCard);
+    let callbackPolicy: { allowsAction(action: string): boolean } | undefined;
+    if (pluginCardActionId) {
+      const {
+        parsePluginCardActionCapabilitiesSnapshot,
+        pluginCardActionCapabilityRecords,
+        PLUGIN_CARD_ACTION_CAPABILITIES_ENV,
+      } = await import('./core/plugins/card-actions/capabilities.js');
+      const capabilityRaw = process.env[PLUGIN_CARD_ACTION_CAPABILITIES_ENV];
+      let enabledRecords: PluginCardActionRoutingRecord[];
+      if (capabilityRaw !== undefined) {
+        const snapshot = parsePluginCardActionCapabilitiesSnapshot(capabilityRaw);
+        if (!snapshot) {
+          console.error('botmux send: 当前会话的插件卡片能力快照无效');
+          process.exit(2);
+        }
+        enabledRecords = pluginCardActionCapabilityRecords(snapshot);
+        if (!enabledRecords.some(record => record.id === pluginCardActionId)) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前会话启用或未声明 cardActions`);
+          process.exit(2);
+        }
+      } else {
+        // Standalone, non-managed CLI keeps the host-file fallback. Managed
+        // local-isolated and remote sessions receive the public snapshot above
+        // and therefore never need bots.json / registry / service state here.
+        const { loadBotConfigs: loadPluginTargetBotConfigs } = await import('./bot-registry.js');
+        const pluginTargetBot = loadPluginTargetBotConfigs()
+          .find(bot => bot.larkAppId === s.larkAppId);
+        if (!pluginTargetBot) {
+          console.error(`botmux send: 找不到当前 Bot 配置 (${s.larkAppId})`);
+          process.exit(2);
+        }
+        const enabledPluginIds = resolveEffectivePluginIds(
+          pluginTargetBot,
+          readGlobalConfig(),
+        );
+        if (!enabledPluginIds.includes(pluginCardActionId)) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前 Bot 启用`);
+          process.exit(2);
+        }
+        const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+        const registry = readPluginRegistry();
+        enabledRecords = enabledPluginIds
+          .map(id => registry.plugins[id])
+          .filter((record): record is NonNullable<typeof record> => record !== undefined);
+        if (!enabledRecords.some(record => (
+          record.id === pluginCardActionId && record.contributions?.cardActions
+        ))) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未声明 cardActions`);
+          process.exit(2);
+        }
+      }
+      const { resolvePluginCardActionRoute } = await import('./core/plugins/card-actions/gateway.js');
+      const { isBotmuxCardAction } = await import('./core/card-action-namespace.js');
+      callbackPolicy = {
+        allowsAction(action: string): boolean {
+          if (isBotmuxCardAction(action)) return false;
+          const route = resolvePluginCardActionRoute(enabledRecords, action);
+          return route.kind === 'matched' && route.record.id === pluginCardActionId;
+        },
+      };
+    }
+    const normalizedCard = normalizeInteractiveCardInput(rawCard, { callbackPolicy });
     if (!normalizedCard.ok) { console.error(`botmux send: ${normalizedCard.error}`); process.exit(2); }
     customCard = normalizedCard.card;
   } else if (contentFile) {
