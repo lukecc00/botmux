@@ -40,6 +40,7 @@ import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backe
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
+import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as topicGroupMemoryStore from '../services/topic-group-memory-store.js';
 import {
@@ -106,7 +107,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, buildNativeProgressCard } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -730,7 +731,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|progress-card)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1556,6 +1557,33 @@ function sessionCliIpcAuth(
   });
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
+
+/** Return the daemon's canonical low-attention progress card without sending
+ * it. `botmux send --no-mention` uses this so explicit milestone sends retain
+ * the same Web Terminal / stop / manage callback chrome as commentary. */
+ipcRoute('POST', '/api/sessions/:sessionId/progress-card', async (req, res, params) => {
+  const body = await readJsonBody<{ content?: unknown } & Record<string, unknown>>(req)
+    .catch(() => ({} as { content?: unknown } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (typeof body.content !== 'string' || !body.content.trim() || body.content.length > 200_000) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_content' });
+  }
+  const turnId = ds.managedTurnOrigin?.turnId;
+  const dispatchAttempt = ds.managedTurnOrigin?.dispatchAttempt;
+  const providerUuid = turnId
+    ? bridgeProgressProviderUuid(params.sessionId, turnId, body.content)
+    : undefined;
+  return jsonRes(res, 200, {
+    ok: true,
+    cardJson: buildNativeProgressCard(ds, body.content),
+    ...(turnId ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(providerUuid ? { providerUuid } : {}),
+  });
+});
 
 /**
  * P1-12：会话血缘的根 pid——「谁有资格持有预览端口」的起点。

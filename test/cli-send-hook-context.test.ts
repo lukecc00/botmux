@@ -612,4 +612,29 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('baseCard: feedbackBaseCard');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
   });
+
+  it('renders ordinary no-mention progress through the daemon card endpoint only for progress', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain("const nativeProgressEligible = effectiveResponseKind === 'progress'");
+    expect(cmdSend).toContain("const path = `/api/sessions/${encodeURIComponent(sid)}/progress-card`");
+    expect(cmdSend).toContain('cardJson?: unknown');
+    expect(cmdSend).toContain('providerUuid?: unknown');
+    expect(cmdSend).toContain('ordinaryBridgeOutputUuid = payload.providerUuid');
+    expect(cmdSend).toContain("} else if (nativeProgressCardJson) {");
+    expect(cmdSend).toContain("messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive')");
+    expect(cmdSend.indexOf("} else if (nativeProgressCardJson) {")).toBeLessThan(cmdSend.indexOf("} else if (isSlashSend) {"));
+    expect(cmdSend).toMatch(/nativeProgressEligible = effectiveResponseKind === 'progress'[\s\S]*?&& noMention[\s\S]*?&& !customCardRequested[\s\S]*?&& !asVoice[\s\S]*?&& !isSlashSend[\s\S]*?&& !replyLayout[\s\S]*?&& !attention\.requested/);
+  });
+});
+
+describe('CLI source-checkout version reporting', () => {
+  it('does not expose the package.json 0.0.0 development placeholder', () => {
+    const getVersionStart = cliSource.indexOf('function getVersion(): string');
+    const mainStart = cliSource.indexOf('const command = process.argv[2]', getVersionStart);
+    const getVersion = cliSource.slice(getVersionStart, mainStart);
+    expect(getVersion).toContain("pkg.version !== '0.0.0'");
+    expect(getVersion).toContain('return resolveCurrentVersion()');
+  });
 });

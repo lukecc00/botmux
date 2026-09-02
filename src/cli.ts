@@ -240,6 +240,7 @@ import {
   buildBridgeSendPreviewText,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
+import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import {
   bindRestartLeaseTo,
   commitRestartIntentAttemptTo,
@@ -9618,6 +9619,24 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  // Same-thread progress may also arrive through transcript commentary. Share
+  // one provider UUID with that daemon delivery so whichever path wins is the
+  // only visible card. The daemon may replace this best-effort local value
+  // below with the UUID derived from its authoritative live turn.
+  let ordinaryBridgeOutputUuid = effectiveResponseKind === 'progress'
+    && shouldRecordBridgeMarker
+    && !customCardRequested
+    && !asVoice
+    && !isSlashSend
+    && !attention.requested
+    && images.length === 0
+    && files.length === 0
+    && videoAttachments.length === 0
+    && mentionArgs.length === 0
+    && noMention
+    && currentTurnId
+      ? bridgeProgressProviderUuid(sid, currentTurnId, content)
+      : undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -9707,7 +9726,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...((prepared?.providerKey ?? ordinaryBridgeOutputUuid)
+          ? { uuid: prepared?.providerKey ?? ordinaryBridgeOutputUuid }
+          : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
@@ -9783,6 +9804,72 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (managedRenderedPayloadError) {
       console.error(`botmux send refused for a managed VC turn: ${managedRenderedPayloadError}`);
       process.exit(2);
+    }
+
+    // A normal no-mention progress update must use the same canonical card as
+    // transcript-native commentary: Web Terminal / stop / manage controls and
+    // no recipient footer. Ask the owning daemon to render it from the live
+    // session, preserving all callback identities and the authoritative turn
+    // UUID. This is best-effort; specialized sends retain their existing path.
+    let nativeProgressCardJson: string | undefined;
+    const nativeProgressEligible = effectiveResponseKind === 'progress'
+      && noMention
+      && !customCardRequested
+      && !asVoice
+      && !isSlashSend
+      && !replyLayout
+      && !attention.requested
+      && images.length === 0
+      && files.length === 0
+      && videoAttachments.length === 0
+      && mentionArgs.length === 0
+      && !sendTopLevel
+      && !overrideChatId
+      && !sendInto;
+    if (nativeProgressEligible) {
+      try {
+        const daemon = findDaemon(appId);
+        if (daemon) {
+          const originClaim = readManagedOriginCapability(
+            resolveDataDir(),
+            sid,
+            process.env.BOTMUX_SEND_RELAY,
+            process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+          );
+          const request = {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              content: text,
+              originCapability: isolatedAttestationContext?.capability ?? originClaim?.capability,
+              originTurnId: isolatedManagedOriginCtx?.turnId
+                ?? originClaim?.turnId
+                ?? currentTurnId,
+              originDispatchAttempt: isolatedManagedOriginCtx?.dispatchAttempt
+                ?? originClaim?.dispatchAttempt
+                ?? trustedRelayCtx?.dispatchAttempt
+                ?? liveMarkerCtx?.dispatchAttempt
+                ?? ancestorCtx?.dispatchAttempt,
+            }),
+          } satisfies RequestInit;
+          let secret: string | undefined;
+          try { secret = loadDaemonIpcSecret(); } catch { /* isolated CLI */ }
+          const path = `/api/sessions/${encodeURIComponent(sid)}/progress-card`;
+          const response = secret
+            ? await fetchDaemonIpc(daemon.ipcPort, path, request, secret)
+            : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, request);
+          if (response.ok) {
+            const payload = await response.json() as {
+              cardJson?: unknown;
+              providerUuid?: unknown;
+            };
+            if (typeof payload.cardJson === 'string') nativeProgressCardJson = payload.cardJson;
+            if (typeof payload.providerUuid === 'string' && payload.providerUuid) {
+              ordinaryBridgeOutputUuid = payload.providerUuid;
+            }
+          }
+        }
+      } catch { /* fall back to the ordinary card and best-effort local UUID */ }
     }
 
     // Upload images only after the final rendered payload has passed the
@@ -9949,6 +10036,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (nativeProgressCardJson) {
+      messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
@@ -12946,10 +13035,11 @@ function getVersion(): string {
   const pkgPath = join(PKG_ROOT, 'package.json');
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg.version || 'unknown';
+    if (typeof pkg.version === 'string' && pkg.version !== '0.0.0') return pkg.version;
   } catch {
-    return 'unknown';
+    // Fall through to the source-checkout / managed-install resolver.
   }
+  return resolveCurrentVersion();
 }
 
 const command = process.argv[2];

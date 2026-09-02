@@ -3371,6 +3371,99 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/progress-card', () => {
+  it('returns the canonical progress card with callback controls and authoritative identity', async () => {
+    const appId = 'progress-card-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: '/tmp',
+      workingDirs: ['/tmp'],
+    } as any);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: {
+        sessionId: 'progress-session',
+        rootMessageId: 'om_root',
+        webPort: 4321,
+        cliId: 'codex',
+      },
+      scope: 'thread',
+      workerPort: 4321,
+      workerToken: 'write-token',
+      workerViewToken: 'view-token',
+      larkAppId: appId,
+      chatId: 'oc_chat',
+      chatType: 'group',
+      workingDir: '/tmp',
+      managedTurnOrigin: {
+        capability: 'a'.repeat(64),
+        turnId: 'om_turn',
+        dispatchAttempt: 3,
+      },
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/progress-session/progress-card';
+      const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          ...trustedHostHeaders('POST', path, handle.port),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ content: '阶段进度，不需要 @ 用户。' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.turnId).toBe('om_turn');
+      expect(body.dispatchAttempt).toBe(3);
+      expect(body.providerUuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
+      expect(body.cardJson).toContain('阶段进度，不需要 @ 用户。');
+      expect(body.cardJson).toContain('web终端');
+      expect(body.cardJson).toContain('reply_stop');
+      expect(body.cardJson).toContain('reply_manage');
+      expect(body.cardJson).toContain('manage_access');
+      expect(body.cardJson).toContain('progress-session');
+      expect(body.cardJson).toContain('om_root');
+      expect(body.cardJson).not.toContain('发送给');
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('rejects an unsigned request that does not hold the live turn capability', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 'progress-session' },
+      managedTurnOrigin: {
+        capability: 'b'.repeat(64),
+        turnId: 'om_turn',
+        dispatchAttempt: 1,
+      },
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/progress-session/progress-card`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: 'forged progress',
+          originCapability: 'c'.repeat(64),
+          originTurnId: 'om_turn',
+          originDispatchAttempt: 1,
+        }),
+      });
+      expect(res.status).toBe(403);
+      expect((await res.json()).ok).toBe(false);
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+});
+
 describe('GET /api/sessions/:sessionId/view-link', () => {
   it('returns the LIVE per-boot view token so the central mint can pin a generation', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
