@@ -112,8 +112,8 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
@@ -259,8 +259,6 @@ describe('session lifecycle hook helper', () => {
 
 describe('worker-pool lifecycle hook integration', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(dashboardEventBus.publish).mockClear();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
       getSessionWorkingDir: () => '/repo',
@@ -283,51 +281,6 @@ describe('worker-pool lifecycle hook integration', () => {
       newState: 'idle',
       source: 'screen_update',
     }));
-  });
-
-  it('does not publish idle while a switched Codex conversation still has an unterminated turn', async () => {
-    const worker = makeFakeWorker();
-    const ds = makeDs({ worker, lastScreenStatus: 'working' });
-    ds.session.cliId = 'codex';
-    ds.session.pendingBridgeTurns = [{
-      turnId: 'turn-after-compaction',
-      content: 'continue after switching conversations',
-      startedAt: 1_000,
-      writtenAt: 1_010,
-    }];
-    __testOnly_setupWorkerHandlers(ds, worker);
-
-    worker.emit('message', {
-      type: 'screen_update',
-      content: 'new Codex conversation prompt is visible',
-      status: 'idle',
-      turnId: 'turn-after-compaction',
-    });
-    await flush();
-
-    expect(ds.lastScreenStatus).toBe('idle');
-    expect(vi.mocked(dashboardEventBus.publish)).not.toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'session.update',
-        body: expect.objectContaining({ patch: expect.objectContaining({ status: 'idle' }) }),
-      }),
-    );
-    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.idle', expect.anything());
-
-    worker.emit('message', {
-      type: 'turn_terminal',
-      sessionId: ds.session.sessionId,
-      turnId: 'turn-after-compaction',
-      status: 'completed',
-      bridgeFinalEmitted: true,
-    });
-    await flush();
-
-    expect(ds.session.pendingBridgeTurns?.[0]?.terminalAt).toEqual(expect.any(Number));
-    expect(vi.mocked(dashboardEventBus.publish)).toHaveBeenCalledWith({
-      type: 'session.update',
-      body: { sessionId: ds.session.sessionId, patch: { status: 'idle' } },
-    });
   });
 
   it('reuses the idle transition helper for screenshot_uploaded status edges', async () => {
@@ -465,6 +418,26 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+  });
+
+  it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    ds.session.webPort = 9999;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('exit', 1);
+
+    expect(ds.workerPort).toBe(null);
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: {
+        sessionId: 'sid-lifecycle-test',
+        patch: { webPort: null, workerPid: null },
+      },
+    });
   });
 
   it('suppresses external exit events for an intentional transfer detach', async () => {

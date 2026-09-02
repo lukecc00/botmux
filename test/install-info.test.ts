@@ -10,22 +10,8 @@ import {
   botmuxVersion,
   botmuxVersionAt,
   botmuxCliEntryAt,
-  managedSourceInstallAt,
+  bakedBinaryVersion,
 } from '../src/utils/install-info.js';
-
-function writeManaged(root: string, overrides: Record<string, unknown> = {}): void {
-  writeFileSync(join(root, '.botmux-install.json'), JSON.stringify({
-    schemaVersion: 1,
-    method: 'github-source',
-    repo: 'lukecc00/botmux',
-    ref: 'p/ai_open',
-    revision: 'a'.repeat(40),
-    version: '3.1.0',
-    prefix: '/home/bot/.local',
-    installedAt: '2026-07-19T00:00:00.000Z',
-    ...overrides,
-  }));
-}
 
 describe('isLocalDevInstallAt', () => {
   let dir: string;
@@ -49,20 +35,6 @@ describe('isLocalDevInstallAt', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'botmux' }));
     expect(isLocalDevInstallAt(dir)).toBe(false);
   });
-  it('false for an installer-managed source release even though src/ is present', () => {
-    mkdirSync(join(dir, 'src'));
-    writeManaged(dir);
-    expect(isLocalDevInstallAt(dir)).toBe(false);
-    expect(managedSourceInstallAt(dir)).toMatchObject({ repo: 'lukecc00/botmux', ref: 'p/ai_open' });
-  });
-  it('fails closed on another repository or malformed revision', () => {
-    mkdirSync(join(dir, 'src'));
-    writeManaged(dir, { repo: 'deepcoldy/botmux' });
-    expect(managedSourceInstallAt(dir)).toBeNull();
-    expect(isLocalDevInstallAt(dir)).toBe(true);
-    writeManaged(dir, { revision: 'short' });
-    expect(managedSourceInstallAt(dir)).toBeNull();
-  });
 });
 
 describe('isLocalDevInstall (runtime)', () => {
@@ -77,10 +49,7 @@ describe('botmuxVersion', () => {
   it('reads the version from the package root package.json', () => {
     // resolve repo root from this test file: test/ → repo root
     const root = fileURLToPath(new URL('..', import.meta.url));
-    const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
-    const expected = packageVersion === '0.0.0'
-      ? JSON.parse(readFileSync(join(root, 'dev-version.json'), 'utf-8')).version
-      : packageVersion;
+    const expected = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
     expect(botmuxVersion()).toBe(expected);
   });
 
@@ -94,12 +63,69 @@ describe('botmuxVersion', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-  it('reads the personal source release version when package.json is the source placeholder', () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-source-version-'));
+});
+
+/**
+ * The compiled single-file executable has no package.json on disk (its module
+ * graph lives in the virtual read-only /$bunfs, and packageRoot() walks up to
+ * `/`, which has none), so every version read failed there and `botmux
+ * --version` printed `unknown` on the published 3.18.0-canary.2. The build now
+ * bakes the version in via `define`, surfaced through bakedBinaryVersion().
+ */
+describe('bakedBinaryVersion (compiled-binary version)', () => {
+  const KEY = 'BOTMUX_BAKED_VERSION';
+  let saved: string | undefined;
+  beforeEach(() => { saved = process.env[KEY]; delete process.env[KEY]; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+  });
+
+  it('undefined under Node, where nothing is baked in', () => {
+    expect(bakedBinaryVersion()).toBeUndefined();
+  });
+
+  it('returns the baked version when the build substituted one', () => {
+    process.env[KEY] = '3.18.0-canary.2';
+    expect(bakedBinaryVersion()).toBe('3.18.0-canary.2');
+  });
+
+  it('treats the unbuilt 0.0.0 placeholder as absent', () => {
+    // A locally-compiled dev binary bakes in the repo's placeholder. Reporting
+    // that as authoritative would mask the git-describe fallback, so it must be
+    // indistinguishable from "nothing baked".
+    process.env[KEY] = '0.0.0';
+    expect(bakedBinaryVersion()).toBeUndefined();
+  });
+
+  it('treats blank/whitespace as absent and trims real values', () => {
+    process.env[KEY] = '   ';
+    expect(bakedBinaryVersion()).toBeUndefined();
+    process.env[KEY] = '  3.20.1  ';
+    expect(bakedBinaryVersion()).toBe('3.20.1');
+  });
+
+  it('takes precedence over an on-disk package.json (the compiled case)', () => {
+    // In compiled mode the disk read fails; here we prove the baked value wins
+    // even when a readable package.json exists, which is what makes the single
+    // code path correct for both runtimes.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-baked-'));
     try {
-      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '0.0.0' }));
-      writeManaged(root, { version: '3.1.0' });
-      expect(botmuxVersionAt(root)).toBe('3.1.0');
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
+      expect(botmuxVersionAt(root)).toBe('1.2.3');
+      process.env[KEY] = '4.5.6';
+      expect(botmuxVersionAt(root)).toBe('4.5.6');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the disk read when the baked value is the placeholder', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-baked-ph-'));
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '7.7.7' }));
+      process.env[KEY] = '0.0.0';
+      expect(botmuxVersionAt(root)).toBe('7.7.7');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

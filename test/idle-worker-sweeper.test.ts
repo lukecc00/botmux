@@ -169,23 +169,6 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(activeSessions.get('c').worker).not.toBe(null);
   });
 
-  it('does not suspend a prompt-idle Codex worker with an unterminated bridge turn', () => {
-    const busy = ds('busy', 'tmux', now - 90 * 60_000);
-    busy.session.cliId = 'codex';
-    busy.session.pendingBridgeTurns = [{
-      turnId: 'turn-after-switch', content: 'continue', startedAt: 1, writtenAt: 2,
-    }];
-    const activeSessions = new Map<string, any>([
-      ['busy', busy],
-      ['idle', ds('idle', 'tmux', now - 60 * 60_000)],
-    ]);
-
-    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1 });
-
-    expect(suspended.map(s => s.sessionId)).toEqual(['idle']);
-    expect(activeSessions.get('busy').worker).not.toBe(null);
-  });
-
   it('never suspends a session that is mid-turn (lastScreenStatus !== idle)', () => {
     const activeSessions = new Map<string, any>([
       ['a', { ...ds('a', 'tmux', now - 90 * 60_000), lastScreenStatus: 'working' }],

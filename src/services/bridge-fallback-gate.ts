@@ -65,6 +65,30 @@ export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
  *  instruction surface moved to the new name. */
 export const BRIDGE_NO_REPLY_SENTINEL_LEGACY = 'BOTMUX_NO_REPLY';
 
+const OAI_MEMORY_CITATION_OPEN = '<oai-mem-citation>';
+const OAI_MEMORY_CITATION_SUFFIX = /^<oai-mem-citation>\s*<citation_entries>(?:(?!<\/citation_entries>)[\s\S])*?<\/citation_entries>\s*<rollout_ids>(?:(?!<\/rollout_ids>)[\s\S])*?<\/rollout_ids>\s*<\/oai-mem-citation>\s*$/;
+
+/** Remove TraeX/Codex's internal memory-attribution envelope when it is a
+ * complete suffix of an outbound answer. The rollout keeps the block in its
+ * source transcript; only the copy headed to a user-facing surface is cleaned.
+ *
+ * Deliberately conservative:
+ *   - the block must begin at a line boundary and be the final non-whitespace
+ *     content;
+ *   - both required child sections and every closing tag must be present;
+ *   - inline/mid-body mentions, malformed blocks, and fenced examples (whose
+ *     closing fence follows the XML) are preserved verbatim. */
+export function stripTrailingOaiMemoryCitation(text: string): string {
+  const start = text.lastIndexOf(OAI_MEMORY_CITATION_OPEN);
+  if (start < 0) return text;
+  if (start > 0 && text[start - 1] !== '\n' && text[start - 1] !== '\r') return text;
+  if (!OAI_MEMORY_CITATION_SUFFIX.test(text.slice(start))) return text;
+
+  // Remove the blank-line separator that belonged to the metadata suffix, but
+  // otherwise leave the visible answer byte-for-byte unchanged.
+  return text.slice(0, start).replace(/[ \t]*(?:\r?\n[ \t]*)+$/, '');
+}
+
 const BRIDGE_SENTINEL_TOKENS: readonly string[] = [
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
@@ -72,6 +96,7 @@ const BRIDGE_SENTINEL_TOKENS: readonly string[] = [
 
 export function isBridgeNothingToSendFinal(finalText: string | undefined): boolean {
   if (finalText === undefined) return false;
+  const visibleFinalText = stripTrailingOaiMemoryCitation(finalText);
   // "Genuine silence" signal: the final, after stripping a trailing sentinel
   // line, has NOTHING left. This is the #554 case the sentinel exists for — the
   // model was triggered (e.g. ambient group chatter, or a message addressed to
@@ -87,8 +112,8 @@ export function isBridgeNothingToSendFinal(finalText: string | undefined): boole
   // that already `botmux send`-ed is still suppressed, but an un-sent answer is
   // delivered instead of lost). Only a final that is EMPTY once the sentinel is
   // stripped counts as silence here.
-  return stripTrailingBridgeSentinelLine(finalText).trim().length === 0
-    && hasTrailingBridgeSentinelLine(finalText);
+  return stripTrailingBridgeSentinelLine(visibleFinalText).trim().length === 0
+    && hasTrailingBridgeSentinelLine(visibleFinalText);
 }
 
 /** True when the LAST non-empty line of `finalText` is exactly a sentinel token
@@ -154,27 +179,27 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
  *  NON-ADOPT: strip a trailing sentinel line so the literal token never reaches
  *  Lark (prose+sentinel = the "did work, forgot to send" shape → post the prose).
  *
- *  ADOPT: return the text VERBATIM. The adopted CLI is botmux-unaware, transcript
- *  drain is its only channel to Lark, and it may legitimately output the literal
- *  sentinel string as content. shouldSuppressBridgeEmit(adoptMode) already
- *  refuses to interpret the sentinel; stripping here would break that contract
- *  (a real answer ending in the token would be truncated, and a verbatim token
- *  reply would be dropped by the caller's empty-guard). Callers must gate their
- *  own "skip if empty after post" check on !adoptMode to match.
+ *  ADOPT: preserve sentinel text verbatim. The adopted CLI is botmux-unaware,
+ *  transcript drain is its only channel to Lark, and it may legitimately output
+ *  that literal sentinel as content. Internal memory-citation metadata is still
+ *  removed in both modes because it is never user-facing answer content.
  *
  *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
  *  one place and is unit-tested directly. codex-app does not use adopt and drives
  *  its own strip on the deliverable content path. */
 export function bridgePostText(finalText: string, adoptMode: boolean): string {
-  return adoptMode ? finalText : stripTrailingBridgeSentinelLine(finalText);
+  const withoutMemoryCitation = stripTrailingOaiMemoryCitation(finalText);
+  return adoptMode ? withoutMemoryCitation : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
 }
 
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
+  turnId?: string;
+  dispatchAttempt?: number;
   contentLength?: number;
-  /** Stable digest of the normalized body. Lets the fallback distinguish a
-   * manually mirrored progress card from a send of the final answer. */
+  /** Stable digest of the normalized visible body. Lets the fallback
+   * distinguish a manually mirrored progress card from a final-answer send. */
   contentHash?: string;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
@@ -229,7 +254,8 @@ export function buildBridgeSendPreviewText(content: string): string | undefined 
 export function buildBridgeSendMarkerContent(
   content: string,
 ): Pick<BridgeSendMarker, 'contentLength' | 'contentHash' | 'previewText'> | undefined {
-  const normalized = normaliseForFingerprint(content);
+  const visibleContent = stripTrailingOaiMemoryCitation(content);
+  const normalized = normaliseForFingerprint(visibleContent);
   if (!normalized) return undefined;
   return {
     // Length stays fingerprint-normalized: the fallback gate compares it against
@@ -237,7 +263,7 @@ export function buildBridgeSendMarkerContent(
     contentLength: normalized.length,
     contentHash: bridgeContentHash(normalized),
     // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
-    previewText: buildBridgeSendPreviewText(content),
+    previewText: buildBridgeSendPreviewText(visibleContent),
   };
 }
 
@@ -263,7 +289,7 @@ function markerSetCoversFinal(
   if (markers.length === 0) return false;
 
   const normalizedProgress = (progressTexts ?? [])
-    .map(text => normaliseForFingerprint(text))
+    .map(text => normaliseForFingerprint(stripTrailingOaiMemoryCitation(text)))
     .filter(Boolean);
   const progressHashes = new Set(normalizedProgress.map(bridgeContentHash));
   const progressLengths = new Set(normalizedProgress.map(text => text.length));
@@ -299,20 +325,37 @@ export function shouldSuppressBridgeEmit(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
-  // A trailing standalone sentinel is an explicit declaration that any prose
-  // left in the transcript was not meant to become another visible reply. If
-  // this turn already sent even one in-window message, suppress regardless of
-  // the normal material-length heuristic; otherwise long narration can leak as
-  // a duplicate final. With no marker we still forward the stripped prose so a
-  // model that forgot to call `botmux send` does not ghost the user.
-  if (
-    turn.finalText !== undefined
-    && hasTrailingBridgeSentinelLine(turn.finalText)
-    && markersInWindow.length > 0
-  ) {
+  // A trailing sentinel line is the model's explicit "I have nothing more to
+  // send" signal. Split the two prose+sentinel cases by whether the model
+  // ALREADY sent this turn:
+  //   · sent ≥1 in-window + trailing sentinel → the trailing prose is narration
+  //     / thinking the model deliberately kept out of chat (it explicitly ended
+  //     with the sentinel after sending). SUPPRESS — do NOT let the length
+  //     heuristic below mistake longer narration for a new substantive answer
+  //     and re-post it. This is the "already sent, then narrated, ended with
+  //     sentinel" leak.
+  //   · zero sends in-window + trailing sentinel → the prose is a real answer
+  //     the model produced but never sent (ghosting). Fall through: the
+  //     stripped prose is forwarded by the length check below (markers empty →
+  //     markerSetCoversFinal=false → not suppressed → caller posts it).
+  // A final WITHOUT a trailing sentinel keeps the pure length-based behavior.
+  const visibleFinalText = turn.finalText === undefined
+    ? undefined
+    : stripTrailingOaiMemoryCitation(turn.finalText);
+  if (visibleFinalText !== undefined
+      && hasTrailingBridgeSentinelLine(visibleFinalText)
+      && markersInWindow.length > 0) {
     return true;
   }
-  return markerSetCoversFinal(markersInWindow, turn.finalText, turn.progressTexts);
+  // Compare the SENTINEL-STRIPPED final against send markers: a prose+sentinel
+  // final is delivered as the stripped prose (callers strip before send), so the
+  // length used for the material-longer check must match what actually posts —
+  // otherwise the trailing sentinel line inflates the final past a same-content
+  // `botmux send` and defeats dedup.
+  const gatedFinal = visibleFinalText === undefined
+    ? undefined
+    : stripTrailingBridgeSentinelLine(visibleFinalText);
+  return markerSetCoversFinal(markersInWindow, gatedFinal, turn.progressTexts);
 }
 
 /** Some structured CLIs can report a durable completed turn while their

@@ -140,7 +140,7 @@ It hasn't been verified on native Windows, but WSL2 should be fine.
 
 ## How do I upgrade?
 
-`botmux upgrade`. The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately.
+`botmux upgrade` — it routes by how you installed: a curl install gets its binary replaced in place, an npm install is handed back to `npm i -g botmux@latest`. curl users can equally just re-run the install command (also an in-place upgrade, and it won't write a second PATH line). The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately. Run `botmux restart` afterwards to pick up the new version.
 
 The personal build must first be installed through the `lukecc00/botmux@p/ai_open` `install.sh`. Its primary daemon checks that branch's `dev-version.json` daily and DMs the owner once per new target version. An npm install remains on the official channel and is never switched silently. The full release contract is in `docs/personal-release-channel.md` in the repository.
 

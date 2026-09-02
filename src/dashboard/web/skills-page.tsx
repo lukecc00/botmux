@@ -5,7 +5,6 @@ import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from
 import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
-import { readSkillInstallDraft, writeSkillInstallDraft } from './skill-install-draft.js';
 import { SkillPacksTab } from './skills/skill-packs-tab.js';
 import { detectSourceType, SkillLibraryTab } from './skills/skill-library-tab.js';
 import { BotAssignmentsTab } from './skills/bot-assignments-tab.js';
@@ -22,13 +21,13 @@ import {
   sourceLabel,
 } from './skills/shared.js';
 import { useSkillsData } from './skills/use-skills-data.js';
+import { toast } from './toast.js';
 import type {
   BotRow,
   DashboardRequestError,
   DeliveryMode,
   InstallSkillCandidate,
   ProjectTrustMode,
-  SkillInstallHistoryRow,
   SkillJob,
   SkillRemovalReference,
   SkillRow,
@@ -103,9 +102,6 @@ interface SkillsInstallPanelProps {
   installStatus: StatusMessage;
   installBusy: boolean;
   installDiscovering?: boolean;
-  installHistory?: SkillInstallHistoryRow[];
-  selectedInstallHistoryId?: string;
-  installHistoryBusy?: boolean;
   installSelectionOpen?: boolean;
   installCandidates?: InstallSkillCandidate[];
   selectedInstallSkills?: Set<string>;
@@ -114,8 +110,6 @@ interface SkillsInstallPanelProps {
   onInstallRefChange: (value: string) => void;
   onInstallFullDepthChange: (value: boolean) => void;
   onClearInstallTarget?: () => void;
-  onSelectInstallHistory?: (id: string) => void;
-  onUpdateInstallHistory?: () => void;
   onToggleInstallSkill?: (name: string) => void;
   onSelectAllInstallSkills?: (selected: boolean) => void;
   onConfirmInstallSelection?: () => void;
@@ -135,9 +129,7 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const candidates = props.installCandidates ?? [];
   const selectedInstallSkills = props.selectedInstallSkills ?? new Set<string>();
   const allSelected = candidates.length > 0 && candidates.every(candidate => selectedInstallSkills.has(candidate.name));
-  const installHistory = props.installHistory ?? [];
-  const selectedHistory = installHistory.find(entry => entry.id === props.selectedInstallHistoryId);
-  const busy = props.installBusy || props.installDiscovering || props.installHistoryBusy;
+  const busy = props.installBusy || props.installDiscovering;
   const sourceType = detectSourceType(props.installSource);
   const sourceTypeLabel = sourceType === 'github'
     ? tr('skills.sourceDetectedGithub')
@@ -267,33 +259,6 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               </aside>
             ) : null}
           </div>
-          {installHistory.length > 0 ? (
-            <div className="skills-install-history-control">
-              <select
-                data-action="select-install-history"
-                aria-label={tr('skills.history')}
-                value={props.selectedInstallHistoryId ?? ''}
-                disabled={busy}
-                onChange={event => props.onSelectInstallHistory?.(event.currentTarget.value)}
-              >
-                <option value="">{tr('skills.historyPlaceholder')}</option>
-                {installHistory.map(entry => (
-                  <option value={entry.id} key={entry.id}>
-                    {entry.source}{entry.path ? ` · ${entry.path}` : ''}{entry.ref ? ` · ${entry.ref}` : ''}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                data-action="update-install-history"
-                disabled={busy || !selectedHistory || selectedHistory.installedSkillNames.length === 0}
-                title={selectedHistory && selectedHistory.installedSkillNames.length === 0 ? tr('skills.historyNoInstalled') : undefined}
-                onClick={() => props.onUpdateInstallHistory?.()}
-              >
-                {props.installHistoryBusy ? tr('skills.updating') : tr('skills.updateFromHistory')}
-              </button>
-            </div>
-          ) : null}
           <div className="skills-source-control">
             <input
               id={sourceInputId}
@@ -949,7 +914,7 @@ export function SkillsPage() {
   const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const {
-    skills, nativeSkillGroups, installHistory, bots, packs, trustProjectSkills, delivery,
+    skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
     loading, loadError, packsError, packsKnown, refresh,
     setSkills, setBots, setTrustProjectSkills, setDelivery,
   } = useSkillsData({ apiUnavailableText: tr('skills.apiUnavailable') });
@@ -969,14 +934,9 @@ export function SkillsPage() {
   }, []);
   const consumeNavIntent = useCallback(() => setNavIntent(null), []);
 
-  const initialInstallDraft = useMemo(() => readSkillInstallDraft(
-    typeof window === 'undefined' ? null : window.localStorage,
-  ), []);
-  const [installSource, setInstallSource] = useState(initialInstallDraft.source);
-  const [installPath, setInstallPath] = useState(initialInstallDraft.path);
-  const [installRef, setInstallRef] = useState(initialInstallDraft.ref);
-  const [selectedInstallHistoryId, setSelectedInstallHistoryId] = useState('');
-  const [installHistoryBusy, setInstallHistoryBusy] = useState(false);
+  const [installSource, setInstallSource] = useState('');
+  const [installPath, setInstallPath] = useState('');
+  const [installRef, setInstallRef] = useState('');
   const [installStatus, setInstallStatus] = useState<StatusMessage>(null);
   const [installBusy, setInstallBusy] = useState(false);
   const [installDiscovering, setInstallDiscovering] = useState(false);
@@ -1046,10 +1006,6 @@ export function SkillsPage() {
     };
   }, [clearTimers]);
 
-  useEffect(() => {
-    setSelectedInstallHistoryId(current => installHistory.some(entry => entry.id === current) ? current : '');
-  }, [installHistory]);
-
   // Drop native-discovery selections that became invalid after a refresh
   // (skill got installed, or its group disappeared).
   useEffect(() => {
@@ -1065,13 +1021,6 @@ export function SkillsPage() {
       return valid.size === selected.size ? selected : valid;
     });
   }, [skills, nativeSkillGroups]);
-
-  useEffect(() => {
-    writeSkillInstallDraft(
-      typeof window === 'undefined' ? null : window.localStorage,
-      { source: installSource, path: installPath, ref: installRef },
-    );
-  }, [installSource, installPath, installRef]);
 
   useEffect(() => {
     if (!installedStatus || removingNames.size > 0) return undefined;
@@ -1123,40 +1072,6 @@ export function SkillsPage() {
     setSelectedInstallSkills(new Set());
     setInstallSelectionOpen(false);
     setInstallDeepScanned(false);
-  }
-
-  function selectInstallHistory(id: string): void {
-    setSelectedInstallHistoryId(id);
-    const entry = installHistory.find(item => item.id === id);
-    if (!entry) return;
-    setInstallSource(entry.source);
-    setInstallPath(entry.path ?? '');
-    setInstallRef(entry.ref ?? '');
-    setInstallStatus(null);
-    clearInstallDiscovery();
-  }
-
-  async function updateInstallHistory(): Promise<void> {
-    const entry = installHistory.find(item => item.id === selectedInstallHistoryId);
-    if (!entry) return;
-    if (entry.installedSkillNames.length === 0) {
-      setInstallStatus({ text: tr('skills.historyNoInstalled'), ok: false });
-      return;
-    }
-    setInstallHistoryBusy(true);
-    try {
-      const body = await jsonRequest(`/api/skills/install-history/${encodeURIComponent(entry.id)}/update`, {
-        method: 'POST',
-        body: '{}',
-      });
-      if (!mountedRef.current) return;
-      setInstallStatus({ text: tr('skills.updatingCount', { count: entry.installedSkillNames.length }), ok: true });
-      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
-    } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
-    } finally {
-      if (mountedRef.current) setInstallHistoryBusy(false);
-    }
   }
 
   function sourceRequestBody(): Record<string, unknown> {
@@ -1374,7 +1289,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       setTrustProjectSkills(body.trustProjectSkills === 'all' ? 'all' : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -1391,7 +1306,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       setDelivery(body.delivery === 'prompt' || body.delivery === 'native' ? body.delivery : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -1404,7 +1319,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
@@ -1435,6 +1350,8 @@ export function SkillsPage() {
     setRemovalError(null);
     setInstalledStatus({ text: tr('skills.removingCount', { count: names.length }), ok: true });
     try {
+      // POST, not DELETE: the platform dashboard proxy drops DELETE request
+      // bodies (hangs the machine-side read until the gateway 504s).
       const body = await jsonRequest('/api/skills/remove', {
         method: 'POST',
         body: JSON.stringify({ names, force }),
@@ -1704,15 +1621,10 @@ export function SkillsPage() {
               installSelectionOpen={installSelectionOpen}
               installCandidates={installCandidates}
               selectedInstallSkills={selectedInstallSkills}
-              installHistory={installHistory}
-              selectedInstallHistoryId={selectedInstallHistoryId}
-              installHistoryBusy={installHistoryBusy}
-              onInstallSourceChange={(value) => { setInstallSource(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
-              onInstallPathChange={(value) => { setInstallPath(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
-              onInstallRefChange={(value) => { setInstallRef(value); setSelectedInstallHistoryId(''); clearInstallDiscovery(); }}
+              onInstallSourceChange={(value) => { setInstallSource(value); clearInstallDiscovery(); }}
+              onInstallPathChange={(value) => { setInstallPath(value); clearInstallDiscovery(); }}
+              onInstallRefChange={(value) => { setInstallRef(value); clearInstallDiscovery(); }}
               onInstallFullDepthChange={(value) => { setInstallForceFullDepth(value); clearInstallDiscovery(); }}
-              onSelectInstallHistory={selectInstallHistory}
-              onUpdateInstallHistory={() => void updateInstallHistory()}
               onToggleInstallSkill={toggleInstallCandidate}
               onSelectAllInstallSkills={selectAllInstallCandidates}
               onConfirmInstallSelection={confirmInstallSelection}
@@ -1754,6 +1666,7 @@ export function SkillsPage() {
                   : { tab: 'packs', focusPackIds: packIdsOfSkill });
               }}
               onShowSkillBots={name => navigateTo({ tab: 'bots', focusSkill: name })}
+              onAssignInstalledSkill={name => navigateTo({ tab: 'bots', focusSkill: name })}
             />
           )}
 

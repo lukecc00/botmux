@@ -3,11 +3,11 @@
  *
  * The worker pops each turn off its queue at emit time and never re-sends
  * the same payload, so the daemon owns retry. We verify:
- *   - transient sessionReply rejections keep retrying with bounded backoff
+ *   - transient sessionReply rejections retry up to 3 times with backoff
  *   - dedup marker is committed only after a successful send
  *   - MessageWithdrawnError aborts retries (no point), commits dedup, and
  *     closes the session
- *   - repeated failures do not commit the dedup marker and do not exhaust retries
+ *   - 3 consecutive failures give up and DO NOT commit the dedup marker
  *     (so any retransmit can still deliver)
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -56,6 +56,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
+  // Bot admin (first resolved human allowedUser) — the failure-notice fallback
+  // @ target. Tests that exercise turnFailed override this per case.
+  getOwnerOpenId: vi.fn(() => undefined),
   // Reply-card footer usage only renders in 'footer' mode; tests override this
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
@@ -103,9 +106,10 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
@@ -122,7 +126,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
 import {
   clearMessageListenerRunPreviewStore,
   createMessageListenerRunPreview,
@@ -250,6 +254,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   afterEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
@@ -300,28 +305,613 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
-  it('lets a daemon handoff consume final_output without posting it normally', async () => {
-    const sessionReply = vi.fn(async () => 'om_reply');
-    const onFinalOutput = vi.fn(async () => true);
+  it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {
+    // Bot-to-bot dispatched sessions are ownerless: a model-gateway failure
+    // card would otherwise ping nobody and scroll by silently.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); // no session.ownerOpenId → no footer recipient
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_admin_human></at>');
+  });
+
+  it('turnFailed final_output with a human footer recipient does NOT add the admin fallback mention', async () => {
+    // The owner is already addressed by the card footer's <at>; a second
+    // body mention would double-ping.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_owner_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_session_owner';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    const sent = String(sessionReply.mock.calls[0][1]);
+    expect(sent).not.toContain('ou_admin_human');
+    expect(sent).toContain('<at id=ou_session_owner></at>');
+  });
+
+  it('ordinary (non-failed) final_output never adds the admin fallback mention', async () => {
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_ok_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_admin_human');
+  });
+
+  it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_feedback_answer');
     initWorkerPool({
       sessionReply,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
-      onFinalOutput,
     });
-
     const ds = makeDs();
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      ...finalOutputMsg(),
-      sessionId: ds.session.sessionId,
-    });
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    const feedbackStore = await getSkillFeedbackStore('/tmp/test-sessions');
+    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(onFinalOutput).toHaveBeenCalledTimes(1);
+    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
+      platformMessageId: 'om_feedback_answer',
+      policy: expect.objectContaining({ enabled: true }),
+      baseCard: expect.objectContaining({ schema: '2.0' }),
+    });
+  });
+
+  it('uses the worker-start feedback policy snapshot after live config is disabled', async () => {
+    const sessionReply = vi.fn(async () => 'om_snapshot_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+    // Simulate an admin disabling feedback while this worker/session remains alive.
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String((sessionReply as any).mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('keeps feedback disabled for a worker whose startup snapshot was disabled', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_disabled_snapshot');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = undefined;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String((sessionReply as any).mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('does not render feedback when no requester identity can be proven', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_no_requester_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('keeps feedback disabled by default and does not open the store', async () => {
+    const sessionReply = vi.fn(async () => 'om_plain_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+  });
+
+  it('keeps feedback controls on ordinary local-turn output', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_local_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('keeps the terminal-local title for a traditional adopted local turn', async () => {
+    const sessionReply = vi.fn(async () => 'om_terminal_local_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('终端本地对话（在 adopted pane 中直接输入，已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('Codex App 共享对话');
+  });
+
+  it('labels a Codex App shared local turn without calling it an adopted pane', async () => {
+    const sessionReply = vi.fn(async () => 'om_codex_app_shared_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.existingAppServerEndpoint = 'unix:///tmp/codex-app-server.sock';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('Codex App 共享对话（已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('在 adopted pane 中直接输入');
+  });
+
+  it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'scheduled answer one',
+      lastUuid: 'synthetic-1',
+      turnId: 'codex-app-dispatch-synthetic-1',
+      replyTurnId: 'om_shared_route',
+      codexAppSettlement: {
+        requestId: 'request-1', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-1',
+      },
+    }, 'tag', 0);
+    __testOnly_deliverFinalOutput(ds, {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'scheduled answer two',
+      lastUuid: 'synthetic-2',
+      turnId: 'codex-app-dispatch-synthetic-2',
+      replyTurnId: 'om_shared_route',
+      codexAppSettlement: {
+        requestId: 'request-2', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-2',
+      },
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.map(call => call[4])).toEqual([
+      'om_shared_route',
+      'om_shared_route',
+    ]);
+    expect(sessionReply.mock.calls.map(call => call[5]?.uuid)).toEqual([
+      'ca_dispatch-1',
+      'ca_dispatch-2',
+    ]);
+    expect(sessionReply.mock.calls[0][5]).not.toHaveProperty('suppressHook');
+  });
+
+  it('routes sequential Codex App settlements through each ledger-frozen shared-chat root', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.cliId = 'codex-app';
+    ds.currentReplyTarget = {
+      rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: new Date().toISOString(),
+    };
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.codexAppDispatchLedger = [
+      {
+        dispatchId: 'dispatch-a', turnId: 'turn-a', state: 'prepared', content: 'A',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' },
+      },
+      {
+        dispatchId: 'dispatch-b', turnId: 'turn-b', state: 'accepted', content: 'B',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_b' },
+      },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'answer A', lastUuid: 'uuid-a', turnId: 'turn-a',
+      codexAppSettlement: {
+        requestId: 'settle-a', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-a',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    expect(sessionReply.mock.calls[0][5]?.replyTarget)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-b',
+      operation: 'submit',
+      entries: [{ dispatchId: 'dispatch-b', turnId: 'turn-b' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'answer B', lastUuid: 'uuid-b', turnId: 'turn-b',
+      codexAppSettlement: {
+        requestId: 'settle-b', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-b',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls[1][5]?.replyTarget)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_topic_b' });
+  });
+
+  it.each(['doc_comment', 'http_wait', 'http_async', 'suppressed'] as const)(
+    'fails closed instead of leaking a recovered %s settlement into Lark',
+    async deliverySink => {
+      const sessionReply = vi.fn(async () => 'om_forbidden');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.scope = 'chat';
+      ds.session.scope = 'chat';
+      ds.session.cliId = 'codex-app';
+      ds.session.codexAppDispatchLedger = [{
+        dispatchId: `dispatch-${deliverySink}`,
+        turnId: `turn-${deliverySink}`,
+        state: 'prepared',
+        content: 'recovered payload',
+        deliverySink,
+      }];
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'final_output',
+        sessionId: ds.session.sessionId,
+        content: 'must not cross channels',
+        lastUuid: `uuid-${deliverySink}`,
+        turnId: `turn-${deliverySink}`,
+        codexAppSettlement: {
+          requestId: `settle-${deliverySink}`,
+          generation: 'generation-recovered',
+          seq: 1,
+          dispatchId: `dispatch-${deliverySink}`,
+        },
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+      await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+      expect(sessionReply).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'codex_app_dispatch_persisted',
+          requestId: `settle-${deliverySink}`,
+          ok: true,
+        }),
+      ));
+    },
+  );
+
+  it.each([
+    { name: 'non-steerable head', steerable: false, sink: 'lark' as const },
+    { name: 'steerable but non-lark (http_wait) head', steerable: true, sink: 'http_wait' as const },
+    { name: 'steerable but non-lark (doc_comment) head', steerable: true, sink: 'doc_comment' as const },
+  ])(
+    'R4-B4: rejects a steer_superseded settlement on a $name (ACK false, no pop, no mutation)',
+    async ({ steerable, sink }) => {
+      const sessionReply = vi.fn(async () => 'om_forbidden');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'codex-app';
+      // Two entries so the head has a successor — isolate the steerable/sink
+      // rejection from the "no successor" rule (that is a separate worker check).
+      const headEntry: any = {
+        dispatchId: 'dispatch-sup-head', turnId: 'turn-sup-head', state: 'prepared',
+        content: 'superseded head', deliverySink: sink,
+        ...(steerable ? { codexAppSteerable: true } : {}),
+      };
+      ds.session.codexAppDispatchLedger = [
+        headEntry,
+        { dispatchId: 'dispatch-sup-next', turnId: 'turn-sup-next', state: 'accepted', content: 'next', deliverySink: 'lark', codexAppSteerable: true },
+      ];
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: ds.session.sessionId,
+        content: '', lastUuid: 'uuid-sup-head', turnId: 'turn-sup-head',
+        suppressDelivery: true,
+        disposition: 'steer_superseded',
+        codexAppSettlement: {
+          requestId: 'settle-sup-head', generation: 'gen-sup', seq: 1, dispatchId: 'dispatch-sup-head',
+        },
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+      // ACK false, no delivery, and the ledger head is NOT popped (no mutation).
+      await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'codex_app_dispatch_persisted',
+          requestId: 'settle-sup-head',
+          ok: false,
+        }),
+      ));
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-sup-head');
+      expect(ds.session.codexAppDispatchLedger?.length).toBe(2);
+    },
+  );
+
+  it('R4-B4: commits a steer_superseded settlement on a steerable Lark head with a successor (ACK true, pop, no delivery)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-ok-head', turnId: 'turn-ok-head', state: 'prepared', content: 'superseded', deliverySink: 'lark', codexAppSteerable: true },
+      { dispatchId: 'dispatch-ok-next', turnId: 'turn-ok-next', state: 'accepted', content: 'real', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-ok-head', turnId: 'turn-ok-head',
+      suppressDelivery: true,
+      disposition: 'steer_superseded',
+      codexAppSettlement: {
+        requestId: 'settle-ok-head', generation: 'gen-ok', seq: 1, dispatchId: 'dispatch-ok-head',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    // ACK true, ledger head popped (durable FIFO advanced), but never delivered.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'codex_app_dispatch_persisted',
+        requestId: 'settle-ok-head',
+        ok: true,
+      }),
+    ));
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-ok-next');
+  });
+
+  it('R5-B4-2: rejects a steer_superseded on a steerable head with an UNDEFINED sink (legacy/mixed ledger fails closed)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    // steerable=true but deliverySink MISSING — admission always writes both, so
+    // this can only be a mixed/corrupt/legacy ledger and must fail closed.
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-nosink-head', turnId: 'turn-nosink-head', state: 'prepared', content: 'x', codexAppSteerable: true },
+      { dispatchId: 'dispatch-nosink-next', turnId: 'turn-nosink-next', state: 'accepted', content: 'y', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-nosink', turnId: 'turn-nosink-head',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-nosink', generation: 'gen-ns', seq: 1, dispatchId: 'dispatch-nosink-head' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-nosink', ok: false }),
+    ));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.length).toBe(2);
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-nosink-head');
+  });
+
+  it('R5-B4-2: rejects a steer_superseded on the SOLE remaining head (no successor — a lone forged superseded must not commit)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    // A perfectly steerable Lark head — but it is the ONLY entry. A superseded
+    // member must have a real successor; the sole head can only settle as a real
+    // final. A lone forged superseded would otherwise silently commit it.
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-solo', turnId: 'turn-solo', state: 'prepared', content: 'solo', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-solo', turnId: 'turn-solo',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-solo', generation: 'gen-solo', seq: 1, dispatchId: 'dispatch-solo' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-solo', ok: false }),
+    ));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.length).toBe(1);
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-solo');
+  });
+
+  it('R7-B2 daemon half: a two-member steered group settles through the REAL daemon handler — superseded head persisted+suppressed (not delivered), real member delivered, ledger drains', async () => {
+    // DAEMON-SIDE of the round-trip: drives the real setupWorkerHandlers ledger
+    // preview → store-write → ACK path (not a worker-side fake ACK). Member 1 is
+    // steer_superseded (must commit + NOT deliver), member 2 is the real final
+    // (must deliver). Proves the daemon accepts the superseded, advances the FIFO,
+    // and only delivers the real member — the half the worker integration test
+    // stubs with a deterministic ACK.
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-grp-1', turnId: 'turn-grp-1', state: 'prepared', content: '', deliverySink: 'lark', codexAppSteerable: true, replyTarget: { mode: 'thread', rootMessageId: 'om_grp' } },
+      { dispatchId: 'd-grp-2', turnId: 'turn-grp-2', state: 'accepted', content: 'real answer', deliverySink: 'lark', codexAppSteerable: true, replyTarget: { mode: 'thread', rootMessageId: 'om_grp' } },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Member 1: superseded — persisted + suppressed (no delivery), pops the head.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-grp-1', turnId: 'turn-grp-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-grp-1', generation: 'gen-grp', seq: 1, dispatchId: 'd-grp-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-1', ok: true })));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
+    expect(sessionReply).not.toHaveBeenCalled(); // superseded head NOT delivered
+
+    // Member 2 becomes the head; the runner submits it (accepted → prepared)
+    // before its final can settle — mirror that transition through the real handler.
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-grp-2',
+      operation: 'submit',
+      entries: [{ dispatchId: 'd-grp-2', turnId: 'turn-grp-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+
+    // Member 2: the real final — delivered, ledger fully drains.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'real answer', lastUuid: 'uuid-grp-2', turnId: 'turn-grp-2',
+      codexAppSettlement: { requestId: 'settle-grp-2', generation: 'gen-grp', seq: 2, dispatchId: 'd-grp-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1)); // real member delivered
+    // codex R7 delta: assert the daemon returns the REAL final's persistence ACK
+    // too (not only the superseded head's settle-grp-1). Without this, a daemon
+    // that forgets to ACK the last member would still drain the ledger + deliver
+    // to Lark here, but the real worker would hang forever in
+    // waitForCodexAppDaemonPersistence — invisible to a delivery-only assertion.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-2', ok: true })));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+  });
+
+  it('still resolves a live HTTP wait sink without posting to Lark', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    const resolveWait = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.pendingWaitPromises = new Map([['turn-wait-live', { resolve: resolveWait }]]);
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-wait-live',
+      turnId: 'turn-wait-live',
+      state: 'prepared',
+      content: 'live payload',
+      deliverySink: 'http_wait',
+    }];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'HTTP answer', lastUuid: 'uuid-wait-live', turnId: 'turn-wait-live',
+      codexAppSettlement: {
+        requestId: 'settle-wait-live', generation: 'generation-live', seq: 1,
+        dispatchId: 'dispatch-wait-live',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect(resolveWait).toHaveBeenCalledWith('HTTP answer'));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('abandons a delayed final before external delivery when worker/session ownership changes', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    let owned = true;
+    const complete = vi.fn();
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete, () => owned);
+    owned = false;
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith(false);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('drops final_output whose worker sessionId does not match the daemon session', async () => {
@@ -644,7 +1234,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
-  it('renders a terminal final card without live session controls for a known bot owner', async () => {
+  it('does not address daemon final-output footers to a known bot owner', async () => {
     writeFileSync(
       join('/tmp/test-sessions', 'bot-openids-app_test.json'),
       JSON.stringify({ Claude: 'ou_foreign_bot' }),
@@ -669,10 +1259,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain('botmux_reply_footer');
-    expect(cardJson).not.toContain('web终端');
-    expect(cardJson).not.toContain('reply_stop');
-    expect(cardJson).not.toContain('reply_manage');
+    expect(cardJson).toContain('reply-card-footer-v2');
+    expect(cardJson).not.toContain('[botmux](');
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
   });
 
@@ -762,7 +1350,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_orch_bot></at>');
   });
 
-  it('puts a real body mention on daemon final output for a human owner', async () => {
+  it('keeps daemon final-output footer addressing for a human owner', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -782,89 +1370,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    const elements = JSON.parse(cardJson).body.elements;
-    expect(elements[0].content).toBe('<at id=ou_human></at>');
-    expect(elements[elements.length - 1]).toMatchObject({
-      tag: 'markdown',
-      element_id: 'botmux_reply_footer',
-    });
-    expect(cardJson.match(/<at id=ou_human><\/at>/g)).toHaveLength(1);
-    expect(cardJson).not.toContain('reply_stop');
-    expect(cardJson).not.toContain('reply_manage');
-    expect(cardJson).not.toContain('web终端');
-  });
-
-  it('mentions the exact turn caller instead of the topic owner', async () => {
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-
-    const ds = makeDs();
-    ds.session.ownerOpenId = 'ou_owner';
-    ds.session.lastCallerOpenId = 'ou_later_caller';
-    ds.session.turnCallers = {
-      'turn-1': { openId: 'ou_exact_caller', updatedAt: new Date().toISOString() },
-    };
-
-    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-    await vi.advanceTimersByTimeAsync(10);
-
-    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
-    expect(elements[0].content).toBe('<at id=ou_exact_caller></at>');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_owner');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_later_caller');
-  });
-
-  it('uses the exact latest-turn caller pair for a legacy session without turnCallers', async () => {
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-
-    const ds = makeDs();
-    ds.session.ownerOpenId = 'ou_owner';
-    ds.session.quoteTargetId = 'turn-1';
-    ds.session.lastCallerOpenId = 'ou_legacy_exact';
-    ds.session.quoteTargetSenderIsBot = false;
-
-    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-    await vi.advanceTimersByTimeAsync(10);
-
-    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
-    expect(elements[0].content).toBe('<at id=ou_legacy_exact></at>');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_owner');
-  });
-
-  it('does not let a stale final borrow a later legacy caller', async () => {
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-
-    const ds = makeDs();
-    ds.session.ownerOpenId = 'ou_owner';
-    ds.session.quoteTargetId = 'turn-2';
-    ds.session.lastCallerOpenId = 'ou_later_caller';
-
-    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-    await vi.advanceTimersByTimeAsync(10);
-
-    const elements = JSON.parse(sessionReply.mock.calls[0][1] as string).body.elements;
-    expect(elements[0].content).toBe('<at id=ou_owner></at>');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('ou_later_caller');
+    expect(cardJson).toContain('<at id=ou_human></at>');
   });
 
   it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
@@ -1163,6 +1669,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(providerUuid).toBeTruthy();
   });
 
+  it('unwraps a stale automatic meeting envelope before replying to a human listener-chat question', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_direct_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-envelope',
+      memberId: 'member-im-envelope', memberEpoch: 1,
+    };
+    const origin = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-envelope', memberId: 'member-im-envelope',
+      memberEpoch: 1, agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_envelope',
+    };
+    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+      memberId: origin.memberId,
+      memberEpoch: origin.memberEpoch,
+      agentAppId: origin.agentAppId,
+      ownerBootId: origin.ownerBootId,
+      ownerEpoch: origin.ownerEpoch,
+      role: 'minutes',
+      membershipGeneration: origin.membershipGeneration,
+      status: 'active',
+      responseMode: 'silent',
+      capabilities: ['meeting.read'],
+      ownedSinks: [],
+      sinkOwnerGeneration: origin.sinkOwnerGeneration,
+      joinedAtIngestSeq: 0,
+      receiverSessionId: origin.receiverSessionId,
+      outputChatId: ds.chatId,
+    })).toMatchObject({ ok: true });
+    ds.session.vcMeetingImTurnOrigins = { om_human_envelope: origin };
+    const msg = {
+      ...finalOutputMsg(),
+      content: JSON.stringify({
+        decision: 'publish',
+        content: '请根据当前已启用的能力处理会议相关请求。',
+      }),
+      turnId: 'om_human_envelope',
+      lastUuid: 'bridge-human-envelope',
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('请根据当前已启用的能力处理会议相关请求。');
+    expect(cardJson).not.toContain('&quot;decision&quot;');
+    expect(cardJson).not.toContain('publish');
+    expect(sessionReply.mock.calls[0][5]).toMatchObject({
+      quoteMessageId: 'om_human_envelope',
+    });
+  });
+
   it('blocks the plain fallback when VC IM authority expires during a withdrawn quote request', async () => {
     let plainFallbackCalls = 0;
     const sessionReply = vi.fn(async (...args: any[]) => {
@@ -1275,6 +1846,43 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect((await getSkillFeedbackStore('/tmp/test-sessions')).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
+  });
+
+  it('delivers a listener-thread result when the receiver uses its dedicated active-session key', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_receiver_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...listenerFinalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      targetChatId: ds.chatId,
+    })).toEqual(['om_vc_receiver_fallback']);
   });
 
   it('treats a valid skip decision as a successful no-message outcome', async () => {
@@ -1610,6 +2218,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cards[0]).not.toContain('Token ↑');
   });
 
+  it('keeps a stable Lark uuid across ordinary final_output retries so an ambiguous first attempt cannot duplicate the answer', async () => {
+    // Regression (duplicate-reply incident): the daemon retries final_output
+    // delivery up to 3 times on transient failure. The ordinary (non-VC,
+    // non-Codex-App) path used to carry NO Lark `uuid`, so an ambiguous first
+    // attempt — the server accepted the reply but the client saw a network
+    // error — created a brand-new copy on each retry. With 3 attempts the
+    // user saw the same answer up to 3 times. Every retry must now carry one
+    // stable uuid so the Feishu server (uuid field, 1h idempotent TTL)
+    // collapses retries into the original message.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('ambiguous: server accepted, response lost'))
+      .mockResolvedValueOnce('om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    // Attempt 1 (delay 0) — ambiguous failure.
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    // Attempt 2 (delay 5000) — success, carrying the SAME uuid as attempt 1.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    const firstOpts = sessionReply.mock.calls[0][5] as { uuid?: string } | undefined;
+    const secondOpts = sessionReply.mock.calls[1][5] as { uuid?: string } | undefined;
+    expect(firstOpts?.uuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondOpts?.uuid).toBe(firstOpts!.uuid);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('derives a distinct Lark uuid per ordinary turn so different answers are never collapsed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    __testOnly_deliverFinalOutput(
+      ds,
+      { ...finalOutputMsg(), lastUuid: 'uuid-2', turnId: 'turn-2' },
+      'tag',
+      0,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const firstUuid = (sessionReply.mock.calls[0][5] as { uuid?: string }).uuid;
+    const secondUuid = (sessionReply.mock.calls[1][5] as { uuid?: string }).uuid;
+    expect(firstUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).not.toBe(firstUuid);
+  });
+
   it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {
     const actualCostCalculator =
       await vi.importActual<typeof import('../src/core/cost-calculator.js')>(
@@ -1734,12 +2408,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(getSessionUsageSnapshot).not.toHaveBeenCalled();
     const card = sessionReply.mock.calls[0]?.[1] as string;
-    expect(card).not.toContain('botmux_reply_footer');
+    expect(card).not.toContain('[botmux](');
+    expect(card).not.toContain('reply-card-footer-v2');
     expect(card).not.toContain('上下文');
     expect(card).not.toContain('Token');
   });
 
-  it('keeps retrying after 3 failures and does NOT commit dedup before success', async () => {
+  it('gives up after 3 attempts and does NOT commit dedup', async () => {
     const sessionReply = vi.fn().mockRejectedValue(new Error('persistent'));
     const closeSession = vi.fn();
     initWorkerPool({
@@ -1756,14 +2431,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(5000);
     await vi.advanceTimersByTimeAsync(15000);
-    await vi.advanceTimersByTimeAsync(30000);
 
-    expect(sessionReply).toHaveBeenCalledTimes(4);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
     expect(closeSession).not.toHaveBeenCalled();
-    ds.session.status = 'closed' as any;
-    await vi.advanceTimersByTimeAsync(30000);
-    expect(sessionReply).toHaveBeenCalledTimes(4);
   });
 
   it('MessageWithdrawnError aborts retries, commits dedup, and closes session', async () => {
@@ -1879,453 +2550,6 @@ describe('Worker turn_terminal routing', () => {
 
     expect(onTurnTerminal).toHaveBeenCalledTimes(1);
     expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
-  });
-
-  it('sends only the core final reply card, never terminal snapshots or an idle warning', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    ds.workerPort = 12345;
-    ds.streamCardId = 'om_existing_stream';
-    ds.suppressRecoveryCard = true;
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      type: 'screen_update',
-      content: '• Ran botmux skill show botmux-workflow\n• I need to confirm the workflow',
-      status: 'working',
-      turnId: 'turn-workflow-confirm',
-    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    (ds.worker as any).emit('message', {
-      type: 'screen_update',
-      content: '已在飞书中询问是否启用 Workflow。',
-      status: 'idle',
-      turnId: 'turn-workflow-confirm',
-    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-
-    (ds.worker as any).emit('message', {
-      type: 'final_output',
-      sessionId: ds.session.sessionId,
-      content: '这个需求适合拆成一个 Workflow。要我按 Workflow 自动跑完吗？',
-      lastUuid: 'assistant-workflow-confirm',
-      turnId: 'turn-workflow-confirm',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0][2]).toBe('interactive');
-    expect(sessionReply.mock.calls[0][4]).toBe('turn-workflow-confirm');
-    expect(sessionReply.mock.calls[0][1]).toContain('这个需求适合拆成一个 Workflow');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('Ran botmux skill show');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('I need to confirm');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('异常结束');
-    vi.useRealTimers();
-  });
-
-  it('forwards only structured progress as a Markdown card and dedupes its transcript uuid', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    ds.workerPort = 12345;
-    ds.streamCardId = 'om_existing_stream';
-    const sessionReply = vi.fn(async () => 'om_progress');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'screen_update',
-      content: '• Ran pnpm build\n└ noisy terminal output\n• internal reasoning',
-      status: 'working',
-      turnId: 'turn-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-
-    const progress = {
-      type: 'progress_output',
-      sessionId: ds.session.sessionId,
-      content: '修复和边界测试都已完成，现在重启并确认 daemon。',
-      uuid: 'rollout.jsonl:1234',
-      turnId: 'turn-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>;
-    (ds.worker as any).emit('message', progress);
-    (ds.worker as any).emit('message', progress);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0][2]).toBe('interactive');
-    expect(sessionReply.mock.calls[0][4]).toBe('turn-progress');
-    expect(sessionReply.mock.calls[0][1]).toContain('修复和边界测试都已完成');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('Ran pnpm build');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('internal reasoning');
-    expect(sessionReply.mock.calls[0][1]).toContain('web终端');
-    expect(sessionReply.mock.calls[0][1]).toContain('reply_stop');
-    expect(sessionReply.mock.calls[0][1]).toContain('reply_manage');
-    expect(sessionReply.mock.calls[0][1]).not.toContain('发送给');
-    expect(sessionReply.mock.calls[0][5]?.uuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
-    vi.useRealTimers();
-  });
-
-  it('keeps tool-separated commentary in FIFO and retries past the foreground budget', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const deliveredBodies: string[] = [];
-    let calls = 0;
-    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
-      calls += 1;
-      // Card 1 sees a longer provider outage than the old three-attempt
-      // budget. Card 2 must not overtake it while the FIFO head is retrying.
-      if (calls <= 3) throw new Error('temporary Lark outage');
-      deliveredBodies.push(body);
-      return `om_progress_${calls}`;
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'progress_output',
-      sessionId: ds.session.sessionId,
-      content: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。',
-      uuid: 'commentary-before-tool',
-      turnId: 'turn-layout-build',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'progress_output',
-      sessionId: ds.session.sessionId,
-      content: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。',
-      uuid: 'commentary-after-tool',
-      turnId: 'turn-layout-build',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(sessionReply).toHaveBeenCalledTimes(3);
-    expect(deliveredBodies).toEqual([]);
-
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(deliveredBodies).toHaveLength(2);
-    expect(deliveredBodies[0]).toContain('已核对原生 XML 和 Holder');
-    expect(deliveredBodies[1]).toContain('已完成 KMP 首轮代码修复并开始 RemoteX');
-    expect(sessionReply.mock.calls.map(call => call[4])).toEqual([
-      'turn-layout-build',
-      'turn-layout-build',
-      'turn-layout-build',
-      'turn-layout-build',
-      'turn-layout-build',
-    ]);
-    const providerUuids = sessionReply.mock.calls.map(call => call[5]?.uuid);
-    expect(new Set(providerUuids.slice(0, 4)).size).toBe(1);
-    expect(providerUuids[4]).not.toBe(providerUuids[3]);
-    vi.useRealTimers();
-  });
-
-  it('waits for earlier commentary before forwarding the final answer', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const deliveryOrder: string[] = [];
-    let progressAttempts = 0;
-    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
-      if (body.includes('构建开始')) {
-        progressAttempts += 1;
-        if (progressAttempts === 1) throw new Error('progress send failed once');
-        deliveryOrder.push('progress');
-      } else if (body.includes('最终完成')) {
-        deliveryOrder.push('final');
-      }
-      return 'om_reply';
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '构建开始', uuid: 'progress-before-final', turnId: 'turn-final-order',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'final_output', sessionId: ds.session.sessionId,
-      content: '最终完成', lastUuid: 'final-after-progress', turnId: 'turn-final-order',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(deliveryOrder).toEqual([]);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(deliveryOrder).toEqual(['progress', 'final']);
-    vi.useRealTimers();
-  });
-
-  it('forwards the final answer after a bounded wait when commentary remains stuck', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const deliveryOrder: string[] = [];
-    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
-      if (body.includes('持续失败的过程卡')) throw new Error('temporary progress outage');
-      if (body.includes('必须送达的最终结论')) deliveryOrder.push('final');
-      return 'om_reply';
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '持续失败的过程卡', uuid: 'stuck-progress', turnId: 'turn-stuck-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'final_output', sessionId: ds.session.sessionId,
-      content: '必须送达的最终结论', lastUuid: 'final-after-stuck-progress', turnId: 'turn-stuck-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-
-    await vi.advanceTimersByTimeAsync(19_999);
-    expect(deliveryOrder).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(deliveryOrder).toEqual(['final']);
-    const finalCard = sessionReply.mock.calls.find(call => String(call[1]).includes('必须送达的最终结论'))?.[1] as string;
-    expect(finalCard).not.toContain('reply_stop');
-    expect(finalCard).not.toContain('reply_manage');
-    expect(finalCard).not.toContain('web终端');
-    ds.progressDeliveryClosed = true;
-    await vi.advanceTimersByTimeAsync(60_000);
-    vi.useRealTimers();
-  });
-
-  it('drops permanently rejected commentary and still forwards the final answer', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const deliveryOrder: string[] = [];
-    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
-      if (body.includes('坏进度')) {
-        throw Object.assign(new Error('Request failed with status code 400'), {
-          response: { status: 400, data: { code: 230099, msg: 'invalid card' } },
-        });
-      }
-      if (body.includes('最终仍需送达')) deliveryOrder.push('final');
-      return 'om_reply';
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '坏进度', uuid: 'permanent-progress-failure', turnId: 'turn-permanent-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'final_output', sessionId: ds.session.sessionId,
-      content: '最终仍需送达', lastUuid: 'final-after-permanent-progress', turnId: 'turn-permanent-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(deliveryOrder).toEqual(['final']);
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
-  });
-
-  it('keeps retrying Lark rate limits even when the SDK wraps them in HTTP 400', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    let attempts = 0;
-    const sessionReply = vi.fn(async () => {
-      attempts += 1;
-      if (attempts === 1) {
-        throw Object.assign(new Error('Request failed with status code 400'), {
-          response: { status: 400, data: { code: 99991400, msg: 'request trigger frequency limit' } },
-        });
-      }
-      return 'om_reply';
-    });
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '限流后重试', uuid: 'rate-limited-progress', turnId: 'turn-rate-limit',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(attempts).toBe(1);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(attempts).toBe(2);
-    vi.useRealTimers();
-  });
-
-  it('does not make one turn final wait for commentary that arrived afterward', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const deliveryOrder: string[] = [];
-    let releaseLaterProgress!: () => void;
-    const laterProgressGate = new Promise<void>(resolve => { releaseLaterProgress = resolve; });
-    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
-      if (body.includes('下一轮过程')) {
-        await laterProgressGate;
-        deliveryOrder.push('later-progress');
-      } else if (body.includes('上一轮最终')) {
-        deliveryOrder.push('final');
-      }
-      return 'om_reply';
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'final_output', sessionId: ds.session.sessionId,
-      content: '上一轮最终', lastUuid: 'final-turn-one', turnId: 'turn-one',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '下一轮过程', uuid: 'progress-turn-two', turnId: 'turn-two',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(deliveryOrder).toEqual(['final']);
-    releaseLaterProgress();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(deliveryOrder).toEqual(['final', 'later-progress']);
-    vi.useRealTimers();
-  });
-
-  it('does not retry commentary or release its waiting final after close begins', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    let calls = 0;
-    const sessionReply = vi.fn(async () => {
-      calls += 1;
-      throw new Error('temporary Lark outage');
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '关闭前过程', uuid: 'progress-before-close', turnId: 'turn-close',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
-      type: 'final_output', sessionId: ds.session.sessionId,
-      content: '关闭后不得发送的 final', lastUuid: 'final-before-close', turnId: 'turn-close',
-    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(calls).toBe(1);
-    ds.progressDeliveryClosed = true;
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(calls).toBe(1);
-    vi.useRealTimers();
-  });
-
-  it('keeps an accepted progress outbox retry alive across worker replacement', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const oldWorker = ds.worker as any;
-    let attempts = 0;
-    const sessionReply = vi.fn(async () => {
-      attempts += 1;
-      if (attempts === 1) throw new Error('temporary Lark outage');
-      return 'om_progress';
-    });
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, oldWorker);
-
-    oldWorker.emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '替换前已入队的过程', uuid: 'progress-survives-replacement', turnId: 'turn-replace',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(attempts).toBe(1);
-
-    const replacementWorker = new EventEmitter() as any;
-    replacementWorker.killed = false;
-    replacementWorker.send = vi.fn();
-    replacementWorker.kill = vi.fn();
-    replacementWorker.pid = 100002;
-    __testOnly_setupWorkerHandlers(ds, replacementWorker);
-    ds.worker = replacementWorker;
-
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(attempts).toBe(2);
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(new Set(sessionReply.mock.calls.map(call => call[5]?.uuid)).size).toBe(1);
-    vi.useRealTimers();
-  });
-
-  it('drops progress emitted by a replaced worker generation', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const oldWorker = ds.worker as any;
-    const sessionReply = vi.fn(async () => 'om_progress');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, oldWorker);
-
-    const replacementWorker = new EventEmitter() as any;
-    replacementWorker.killed = false;
-    replacementWorker.send = vi.fn();
-    replacementWorker.kill = vi.fn();
-    replacementWorker.pid = 100001;
-    __testOnly_setupWorkerHandlers(ds, replacementWorker);
-    ds.worker = replacementWorker;
-
-    oldWorker.emit('message', {
-      type: 'progress_output', sessionId: ds.session.sessionId,
-      content: 'stale progress', uuid: 'stale-progress', turnId: 'turn-stale',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-    vi.useRealTimers();
-  });
-
-  it('drops structured progress from a mismatched worker session', async () => {
-    vi.useFakeTimers();
-    const ds = makeDs();
-    const sessionReply = vi.fn(async () => 'om_progress');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      type: 'progress_output', sessionId: 'another-session', content: 'must not leak',
-      uuid: 'foreign:1', turnId: 'turn-progress',
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-    vi.useRealTimers();
   });
 
   it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {
@@ -2556,14 +2780,6 @@ describe('Worker turn_terminal routing', () => {
       dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
     (ds.worker as any).emit('message', {
-      type: 'progress_output',
-      sessionId: ds.session.sessionId,
-      content: 'meeting-derived progress must remain private',
-      uuid: 'meeting-progress:1',
-      turnId: 'delivery-stable-key',
-      dispatchAttempt: 1,
-    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
-    (ds.worker as any).emit('message', {
       type: 'tui_prompt',
       description: 'permission needed',
       options: [{ text: 'allow', selected: false }],
@@ -2639,31 +2855,6 @@ describe('Worker turn_terminal routing', () => {
     });
   });
 
-  it('notifies Lark when a ready worker process really exits unexpectedly', async () => {
-    const ds = makeDs();
-    ds.suppressRecoveryCard = true;
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-
-    (ds.worker as any).emit('message', {
-      type: 'ready', port: 4567, token: 'token', turnId: 'turn-crashed',
-    } satisfies Extract<WorkerToDaemon, { type: 'ready' }>);
-    (ds.worker as any).emit('exit', 9, 'SIGKILL');
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('异常结束'))).toBe(true);
-    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('worker exit code: 9'))).toBe(true);
-    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('当前对话因异常已经停止'))).toBe(true);
-  });
-
   it('reports a managed CLI exit even when the Node worker stays alive', async () => {
     const ds = makeDs();
     const onCliExit = vi.fn(async () => {});
@@ -2734,113 +2925,5 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'om_replacement',
     });
     expect(onCliExit).not.toHaveBeenCalled();
-  });
-});
-
-describe('Codex context exhaustion routing', () => {
-  it('routes only a matching current-worker event to the daemon handoff callback', async () => {
-    const ds = makeDs();
-    const onCodexContextExhausted = vi.fn(async () => {});
-    initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-      onCodexContextExhausted,
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    const event: Extract<WorkerToDaemon, { type: 'codex_context_exhausted' }> = {
-      type: 'codex_context_exhausted',
-      sessionId: ds.session.sessionId,
-      turnId: 'turn-full',
-      interruptedUserGoal: 'finish the migration',
-    };
-    (ds.worker as any).emit('message', event);
-    await Promise.resolve();
-    expect(onCodexContextExhausted).toHaveBeenCalledWith(ds, event);
-
-    (ds.worker as any).emit('message', { ...event, sessionId: 'wrong-session' });
-    await Promise.resolve();
-    expect(onCodexContextExhausted).toHaveBeenCalledTimes(1);
-  });
-
-  it('routes only a matching current-worker stream disconnect to recovery', async () => {
-    const ds = makeDs();
-    const onCodexStreamDisconnected = vi.fn(async () => {});
-    initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-      onCodexStreamDisconnected,
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    const event: Extract<WorkerToDaemon, { type: 'codex_stream_disconnected' }> = {
-      type: 'codex_stream_disconnected',
-      sessionId: ds.session.sessionId,
-      turnId: 'turn-stream',
-      interruptedUserGoal: 'continue the interrupted task',
-    };
-    (ds.worker as any).emit('message', event);
-    await Promise.resolve();
-    expect(onCodexStreamDisconnected).toHaveBeenCalledWith(ds, event);
-
-    (ds.worker as any).emit('message', { ...event, sessionId: 'wrong-session' });
-    await Promise.resolve();
-    expect(onCodexStreamDisconnected).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not auto-restart a Codex source that exits during handoff', async () => {
-    const ds = makeDs();
-    ds.session.cliId = 'codex';
-    ds.pendingCodexFreshHandoff = {
-      requestId: 'request-1',
-      requestedAt: Date.now(),
-      reason: 'context_window_exceeded',
-      summaryTurnId: 'summary-turn',
-      phase: 'collecting',
-    };
-    const onCodexHandoffSourceExit = vi.fn(async () => {});
-    initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-      onCodexHandoffSourceExit,
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      type: 'claude_exit', code: 1, signal: null,
-    } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
-    await Promise.resolve();
-    expect(onCodexHandoffSourceExit).toHaveBeenCalledWith(ds);
-    expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'restart' });
-  });
-
-  it('does not auto-restart a Codex App source that exits during stream recovery', async () => {
-    const ds = makeDs();
-    ds.session.cliId = 'codex-app';
-    ds.pendingCodexFreshHandoff = {
-      requestId: 'request-stream-1',
-      requestedAt: Date.now(),
-      reason: 'stream_disconnected',
-      summaryTurnId: 'stream-recovery-turn',
-      phase: 'migrating',
-    };
-    const onCodexHandoffSourceExit = vi.fn(async () => {});
-    initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/tmp',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-      onCodexHandoffSourceExit,
-    });
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    (ds.worker as any).emit('message', {
-      type: 'claude_exit', code: 1, signal: null,
-    } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
-    await Promise.resolve();
-    expect(onCodexHandoffSourceExit).toHaveBeenCalledWith(ds);
-    expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'restart' });
   });
 });

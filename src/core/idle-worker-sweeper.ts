@@ -1,7 +1,6 @@
 import type { DaemonSession } from './types.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
-import { sessionRuntimeStatus } from './session-runtime-status.js';
 import { tryWithBotTurnMutation } from './bot-turn-mutation-gate.js';
 
 /**
@@ -49,7 +48,7 @@ function liveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[
  * Deliberately has NO idle-time threshold: the policy is "while resources
  * allow, never time out an old session" — suspension only kicks in to enforce
  * an explicit per-bot count cap. The only guard kept is correctness, not a
- * timeout: a session whose effective runtime status is not idle is never
+ * timeout: a session that is mid-turn (`lastScreenStatus !== 'idle'`) is never
  * suspended so an in-flight reply is never interrupted. If every over-cap
  * session is busy, none are suspended this round and the next sweep retries.
  */
@@ -75,7 +74,7 @@ export function sweepIdleWorkers(
     .filter(ds => isSuspendableBackendType(ds.initConfig?.backendType))
     // Correctness guard (not a timeout): never suspend a session that is
     // currently producing output — that would cut off an in-flight reply.
-    .filter(ds => sessionRuntimeStatus(ds) === 'idle')
+    .filter(ds => ds.lastScreenStatus === 'idle')
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 
   const suspended: IdleWorkerSweepResult[] = [];

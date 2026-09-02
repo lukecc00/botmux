@@ -11,6 +11,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
+| `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family / Codex terminal only) |
@@ -18,11 +19,13 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
 | `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family / Codex terminal mode; invoke inside the source session's topic) |
-| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
+| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override |
+| `/cot` | Thinking-process message switch: `/cot off` mutes this chat's thinking bubble, `/cot on` restores it, `/cot show` summons a one-off peek at the current turn's bubble while the switches are off, `/cot status` reports the state (bot-level master switch `thinkingCard`, on by default; claude-code / codex only) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
+| `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
 | `/t [<text>]` `/topic [<text>]` | Force a new topic inside a regular group; text becomes the first task (starting after repository selection when needed), while the bare command opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |

@@ -54,11 +54,12 @@ describe('readComm', () => {
   it('返回子进程的 comm 名 (basename, 不含路径)', () => {
     const comm = __testOnly_readComm(child.pid!);
     expect(comm).toBeDefined();
-    // Linux /proc/<pid>/comm 通常给短名 "node"，但较新的 Node/libuv
-    // 会把主线程命名为 "MainThread"；BSD ps 给完整路径，readComm 已统一
-    // basename，所以这里都不应包含 "/"。
+    // Linux /proc/<pid>/comm 给短名 "node"；BSD ps 给完整路径，readComm
+    // 已统一 basename，所以这里都不应包含 "/"。
     expect(comm).not.toContain('/');
-    expect(comm).toMatch(/^(node|MainThread)/i);
+    // The child is `process.execPath`: Node on vitest, bun on `bun test`.
+    // Linux `/proc/<pid>/comm` is the short name of whichever runtime we spawned.
+    expect(comm).toMatch(/^(node|bun)/i);
   });
 
   it('对不存在的 PID 返回 undefined', () => {

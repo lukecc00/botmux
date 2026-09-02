@@ -15,7 +15,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { isLocalDevInstallAt, managedSourceInstallAt, botmuxVersion, botmuxInstallRoot } from './install-info.js';
+import { isLocalDevInstallAt, botmuxVersionAt, botmuxInstallRoot } from './install-info.js';
 import { detectGlobalInstallManager } from './global-install.js';
 import { parseVersion } from '../core/update-check.js';
 
@@ -38,20 +38,25 @@ export function checkNode(version: string = process.version, required = MIN_NODE
 }
 
 /**
- * The version to show in the update card. For an npm install this is the real
- * published version from package.json. A source checkout ships the unbuilt
- * `0.0.0` (CI injects the real version only at publish), so we derive a real
- * baseline from the latest git tag (`git describe --tags --abbrev=0` → the clean
- * tag, e.g. "v2.86.0", stripped of the leading v). That makes the version
- * display, "behind" comparison, and changelog range correct in dev mode too.
- * Falls back to the raw package.json version if git is unavailable.
+ * The version to show in the update card, for the install rooted at `rootDir`.
+ * For an npm install this is the real published version from package.json. A
+ * source checkout ships the unbuilt `0.0.0` (CI injects the real version only
+ * at publish), so we derive a real baseline from the latest git tag
+ * (`git describe --tags --abbrev=0` → the clean tag, e.g. "v2.86.0", stripped
+ * of the leading v). That makes the version display, "behind" comparison, and
+ * changelog range correct in dev mode too. Falls back to the raw package.json
+ * version if git is unavailable.
+ *
+ * Takes an explicit dir so the local-dev update path can report the version of
+ * the checkout it actually updated (the wrapper's checkout), which may differ
+ * from the running process's install root.
  */
-export function resolveCurrentVersion(): string {
-  const raw = botmuxVersion();
+export function resolveCurrentVersionAt(rootDir: string): string {
+  const raw = botmuxVersionAt(rootDir);
   if (raw !== '0.0.0') return raw;
   try {
     const tag = execFileSync('git', ['describe', '--tags', '--abbrev=0'], {
-      cwd: botmuxInstallRoot(),
+      cwd: rootDir,
       encoding: 'utf-8',
       timeout: 3_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -63,12 +68,16 @@ export function resolveCurrentVersion(): string {
   }
 }
 
+/** The version to show for the running install (its own package root). */
+export function resolveCurrentVersion(): string {
+  return resolveCurrentVersionAt(botmuxInstallRoot());
+}
+
 export type InstallKind =
   | 'npm-global'
   | 'pnpm-global'
   | 'yarn-global'
   | 'bun-global'
-  | 'github-source'
   | 'source-checkout'
   | 'unknown';
 
@@ -94,7 +103,6 @@ export interface InstallProbeDeps {
   realpath: (path: string) => string | null;
   /** Does `root` look like a source checkout (has .git or src)? */
   isSourceCheckout: (root: string) => boolean;
-  isManagedSource: (root: string) => boolean;
 }
 
 /** A shim under 4 KiB is a tiny `exec node "<cli.js>"` wrapper; the real cli.js
@@ -129,7 +137,6 @@ function resolveBin(binPath: string, deps: InstallProbeDeps): { cliJs: string; r
 }
 
 function classify(root: string, deps: InstallProbeDeps): InstallKind {
-  if (deps.isManagedSource(root)) return 'github-source';
   if (deps.isSourceCheckout(root)) return 'source-checkout';
   const manager = detectGlobalInstallManager(root);
   if (manager !== 'unknown') return `${manager}-global`;
@@ -172,7 +179,6 @@ const PROD_PROBE_DEPS: InstallProbeDeps = {
     try { return realpathSync(p); } catch { return null; }
   },
   isSourceCheckout: (root) => isLocalDevInstallAt(root),
-  isManagedSource: (root) => managedSourceInstallAt(root) !== null,
 };
 
 /** List every `botmux` on PATH (best-effort; [] when the lookup tool fails). */

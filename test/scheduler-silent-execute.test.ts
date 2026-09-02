@@ -181,6 +181,10 @@ function forkedTurnId(): string {
   return forkWorkerMock.mock.calls[0][2];
 }
 
+function forkedPayload(): any {
+  return forkWorkerMock.mock.calls[0][1];
+}
+
 beforeEach(() => {
   store.clear();
   sessionSeq = 0;
@@ -216,6 +220,37 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(input).toContain('检查服务状态，挂了才报警');
     // dashboard-facing lastUserPrompt keeps the raw task prompt (no hint blob)
     expect(ds.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('runs the turn as the task creator: identity + schedule_creator provenance on the payload', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toEqual({
+      requestUserOpenId: 'ou_creator',
+      requestUserUnionId: 'on_creator',
+      requestLarkAppId: APP,
+      source: 'schedule_creator',
+      taskId: 'task0001',
+    });
+  });
+
+  it('carries no identity when the task has no creator union_id (fail closed, not "runs as the bot")', async () => {
+    const active = new Map<string, DaemonSession>();
+    // ownerOpenId alone is what legacy tasks and bot-created tasks have. It is
+    // app-scoped and deliberately not enough to act as that user.
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toBeUndefined();
   });
 
   it('loud fire (control): banner reply posted in-thread, no silent flag, no hint', async () => {
@@ -515,6 +550,50 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(content).toContain('<botmux_silent_schedule');
   });
 
+  it('live injection carries the creator identity in OPTS (sendWorkerInput never reads the payload)', async () => {
+    // sendWorkerInput reads trustedCaller from its 4th argument only; forkWorker
+    // reads payload ?? opts. Putting the identity on the payload type-checks and
+    // is then silently dropped — and this is the path every recurring fire after
+    // the first one takes, so the bug would read as "worked once, then quietly
+    // ran without identity".
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({
+      trustedCaller: {
+        requestUserOpenId: 'ou_creator',
+        requestUserUnionId: 'on_creator',
+        requestLarkAppId: APP,
+        source: 'schedule_creator',
+        taskId: 'task0001',
+      },
+    });
+  });
+
+  it('live injection passes no identity when the task has no creator union_id', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    // Byte-for-byte the pre-change behaviour for legacy/bot-created tasks.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({});
+  });
+
   it('riff-backed claude-code session: scheduled fire stays inline（锁 sessionBackendType 传参）', async () => {
     // review 要求：executeScheduledTask → buildFollowUpCliInput 必须传 sessionBackendType。
     // 删掉该实参，旧代码（&& 短路）会让 riff 会话误进 hook 模式（reminder 不在 PTY 文本里，
@@ -600,10 +679,8 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, input, options] = forkWorkerMock.mock.calls[0];
     expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
-    expect(options).toMatchObject({
-      resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
-    });
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 
@@ -624,10 +701,8 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(store.size).toBe(1);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, , options] = forkWorkerMock.mock.calls[0];
-    expect(options).toMatchObject({
-      resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
-    });
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 

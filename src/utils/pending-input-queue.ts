@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
@@ -6,8 +6,6 @@ export interface PendingCliInput {
    * adapter command. Transcript bridges fingerprint this value, while the PTY
    * receives `content`. */
   logicalContent?: string;
-  /** Clean user-authored goal retained separately for recovery handoff. */
-  userGoal?: string;
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
@@ -17,14 +15,32 @@ export interface PendingCliInput {
   codexAppSteerable?: true;
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  trustedCaller?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
-  /** Administrative raw command followed by a real model turn (for example,
-   * Codex /compact handoff). Wait for a genuine prompt instead of steering
-   * this turn into the still-running command. */
-  requireIdle?: boolean;
-  /** Per-item at-most-once marker: never replay this input onto an
-   * auto-restarted CLI. It is deliberately scoped to the keyed turn rather
-   * than the whole session so ordinary follow-ups remain recoverable. */
+  /** Best-effort CLI-native title to apply after this exact user input has
+   * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
+   * does not fall back to Botmux's injected routing envelope. */
+  nativeSessionTitle?: string;
+  /** Source text for Codex App semantic title generation. Plain TUI adapters
+   * keep only nativeSessionTitle and ignore this prompt. */
+  nativeSessionTitlePrompt?: string;
+  /**
+   * mojo only: the credential snapshot that arrived WITH this turn.
+   *
+   * Carried on the queue item rather than applied at IPC-receive time because the
+   * two are not simultaneous — a turn can sit queued while later messages arrive.
+   * Applying on receipt made two queued credential turns collapse: queueing B then
+   * C executed as A → C → C instead of A → B → C, because both patches landed
+   * before either turn ran.
+   */
+  mojoLivePatch?: import('../adapters/backend/mojo-types.js').MojoLivePatch;
+  /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
+   *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
+   *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
+   *  the KEYED idempotency-lease init prompt (from init.atMostOnce); scoped
+   *  per-item so a later PLAIN follow-up turn folded into the same http_async_
+   *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
+   *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
 }
 
@@ -86,10 +102,10 @@ export function mergeQueuedCliInput(
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
-    || tail.logicalContent || next.logicalContent
-    || tail.requireIdle || next.requireIdle) return false;
+    || tail.nativeSessionTitle || next.nativeSessionTitle
+    || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
+    || tail.logicalContent || next.logicalContent) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
-  tail.userGoal = next.userGoal ?? tail.userGoal;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
 }
@@ -105,8 +121,7 @@ export function pendingInputAllowsTypeAhead(
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
     && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin
-    && !next?.requireIdle;
+    && !next?.vcMeetingImTurnOrigin;
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL
