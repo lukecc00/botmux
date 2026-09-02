@@ -2552,6 +2552,410 @@ describe('Worker turn_terminal routing', () => {
     expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
   });
 
+  it('forwards only structured progress as a Markdown card and dedupes its transcript uuid', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    ds.workerPort = 12345;
+    ds.streamCardId = 'om_existing_stream';
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: '• Ran pnpm build\n└ noisy terminal output\n• internal reasoning',
+      status: 'working',
+      turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    const progress = {
+      type: 'progress_output',
+      sessionId: ds.session.sessionId,
+      content: '修复和边界测试都已完成，现在重启并确认 daemon。',
+      uuid: 'rollout.jsonl:1234',
+      turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>;
+    (ds.worker as any).emit('message', progress);
+    (ds.worker as any).emit('message', progress);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][2]).toBe('interactive');
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-progress');
+    expect(sessionReply.mock.calls[0][1]).toContain('修复和边界测试都已完成');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('Ran pnpm build');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('internal reasoning');
+    expect(sessionReply.mock.calls[0][1]).toContain('web终端');
+    expect(sessionReply.mock.calls[0][1]).toContain('reply_stop');
+    expect(sessionReply.mock.calls[0][1]).toContain('reply_manage');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('发送给');
+    expect(sessionReply.mock.calls[0][5]?.uuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
+    vi.useRealTimers();
+  });
+
+  it('keeps tool-separated commentary in FIFO and retries past the foreground budget', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveredBodies: string[] = [];
+    let calls = 0;
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      calls += 1;
+      // Card 1 sees a longer provider outage than the old three-attempt
+      // budget. Card 2 must not overtake it while the FIFO head is retrying.
+      if (calls <= 3) throw new Error('temporary Lark outage');
+      deliveredBodies.push(body);
+      return `om_progress_${calls}`;
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output',
+      sessionId: ds.session.sessionId,
+      content: '已核对原生 XML 和 Holder：首轮明确 Bug 已定位。',
+      uuid: 'commentary-before-tool',
+      turnId: 'turn-layout-build',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output',
+      sessionId: ds.session.sessionId,
+      content: '已完成 KMP 首轮代码修复并开始 RemoteX 标准构建。',
+      uuid: 'commentary-after-tool',
+      turnId: 'turn-layout-build',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(deliveredBodies).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(deliveredBodies).toHaveLength(2);
+    expect(deliveredBodies[0]).toContain('已核对原生 XML 和 Holder');
+    expect(deliveredBodies[1]).toContain('已完成 KMP 首轮代码修复并开始 RemoteX');
+    expect(sessionReply.mock.calls.map(call => call[4])).toEqual([
+      'turn-layout-build',
+      'turn-layout-build',
+      'turn-layout-build',
+      'turn-layout-build',
+      'turn-layout-build',
+    ]);
+    const providerUuids = sessionReply.mock.calls.map(call => call[5]?.uuid);
+    expect(new Set(providerUuids.slice(0, 4)).size).toBe(1);
+    expect(providerUuids[4]).not.toBe(providerUuids[3]);
+    vi.useRealTimers();
+  });
+
+  it('waits for earlier commentary before forwarding the final answer', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    let progressAttempts = 0;
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('构建开始')) {
+        progressAttempts += 1;
+        if (progressAttempts === 1) throw new Error('progress send failed once');
+        deliveryOrder.push('progress');
+      } else if (body.includes('最终完成')) {
+        deliveryOrder.push('final');
+      }
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '构建开始', uuid: 'progress-before-final', turnId: 'turn-final-order',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '最终完成', lastUuid: 'final-after-progress', turnId: 'turn-final-order',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliveryOrder).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(deliveryOrder).toEqual(['progress', 'final']);
+    vi.useRealTimers();
+  });
+
+  it('forwards the final answer after a bounded wait when commentary remains stuck', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('持续失败的过程卡')) throw new Error('temporary progress outage');
+      if (body.includes('必须送达的最终结论')) deliveryOrder.push('final');
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '持续失败的过程卡', uuid: 'stuck-progress', turnId: 'turn-stuck-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '必须送达的最终结论', lastUuid: 'final-after-stuck-progress', turnId: 'turn-stuck-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(deliveryOrder).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deliveryOrder).toEqual(['final']);
+    const finalCard = sessionReply.mock.calls.find(call => String(call[1]).includes('必须送达的最终结论'))?.[1] as string;
+    expect(finalCard).not.toContain('reply_stop');
+    expect(finalCard).not.toContain('reply_manage');
+    expect(finalCard).not.toContain('web终端');
+    ds.progressDeliveryClosed = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    vi.useRealTimers();
+  });
+
+  it('drops permanently rejected commentary and still forwards the final answer', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('坏进度')) {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400, data: { code: 230099, msg: 'invalid card' } },
+        });
+      }
+      if (body.includes('最终仍需送达')) deliveryOrder.push('final');
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '坏进度', uuid: 'permanent-progress-failure', turnId: 'turn-permanent-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '最终仍需送达', lastUuid: 'final-after-permanent-progress', turnId: 'turn-permanent-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliveryOrder).toEqual(['final']);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('keeps retrying Lark rate limits even when the SDK wraps them in HTTP 400', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    let attempts = 0;
+    const sessionReply = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400, data: { code: 99991400, msg: 'request trigger frequency limit' } },
+        });
+      }
+      return 'om_reply';
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '限流后重试', uuid: 'rate-limited-progress', turnId: 'turn-rate-limit',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(attempts).toBe(2);
+    vi.useRealTimers();
+  });
+
+  it('does not make one turn final wait for commentary that arrived afterward', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const deliveryOrder: string[] = [];
+    let releaseLaterProgress!: () => void;
+    const laterProgressGate = new Promise<void>(resolve => { releaseLaterProgress = resolve; });
+    const sessionReply = vi.fn(async (_rootId: string, body: string) => {
+      if (body.includes('下一轮过程')) {
+        await laterProgressGate;
+        deliveryOrder.push('later-progress');
+      } else if (body.includes('上一轮最终')) {
+        deliveryOrder.push('final');
+      }
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '上一轮最终', lastUuid: 'final-turn-one', turnId: 'turn-one',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '下一轮过程', uuid: 'progress-turn-two', turnId: 'turn-two',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliveryOrder).toEqual(['final']);
+    releaseLaterProgress();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliveryOrder).toEqual(['final', 'later-progress']);
+    vi.useRealTimers();
+  });
+
+  it('does not retry commentary or release its waiting final after close begins', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    let calls = 0;
+    const sessionReply = vi.fn(async () => {
+      calls += 1;
+      throw new Error('temporary Lark outage');
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '关闭前过程', uuid: 'progress-before-close', turnId: 'turn-close',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '关闭后不得发送的 final', lastUuid: 'final-before-close', turnId: 'turn-close',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    ds.progressDeliveryClosed = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('keeps an accepted progress outbox retry alive across worker replacement', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const oldWorker = ds.worker as any;
+    let attempts = 0;
+    const sessionReply = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary Lark outage');
+      return 'om_progress';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+
+    oldWorker.emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '替换前已入队的过程', uuid: 'progress-survives-replacement', turnId: 'turn-replace',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempts).toBe(1);
+
+    const replacementWorker = new EventEmitter() as any;
+    replacementWorker.killed = false;
+    replacementWorker.send = vi.fn();
+    replacementWorker.kill = vi.fn();
+    replacementWorker.pid = 100002;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    ds.worker = replacementWorker;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(attempts).toBe(2);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(new Set(sessionReply.mock.calls.map(call => call[5]?.uuid)).size).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('drops progress emitted by a replaced worker generation', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const oldWorker = ds.worker as any;
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+
+    const replacementWorker = new EventEmitter() as any;
+    replacementWorker.killed = false;
+    replacementWorker.send = vi.fn();
+    replacementWorker.kill = vi.fn();
+    replacementWorker.pid = 100001;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    ds.worker = replacementWorker;
+
+    oldWorker.emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: 'stale progress', uuid: 'stale-progress', turnId: 'turn-stale',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('drops structured progress from a mismatched worker session', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: 'another-session', content: 'must not leak',
+      uuid: 'foreign:1', turnId: 'turn-progress',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
   it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {
     const ds = makeDs();
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 1]]);

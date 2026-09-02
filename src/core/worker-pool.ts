@@ -106,6 +106,15 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { scheduleTopicGroupMemoryUpdate } from '../services/topic-group-memory-update.js';
+import {
+  completeProgressDelivery,
+  discardProgressDeliveries,
+  listProgressDeliveries,
+  progressProviderUuid,
+  stageProgressDelivery,
+  type ProgressDeliveryRecord,
+} from '../services/progress-delivery-store.js';
+import { bridgeProgressProviderUuid } from '../services/bridge-output-dedupe.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -1859,6 +1868,39 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   } catch {
     return owner;
   }
+}
+
+/** Original two-phase card chrome for transcript-native commentary: no owner
+ * mention, plus Web Terminal / stop / manage controls. */
+export function buildNativeProgressCard(ds: DaemonSession, content: string): string {
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+  return buildMarkdownCard(
+    content,
+    undefined,
+    renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+    localeForBot(ds.larkAppId),
+    ds.workingDir,
+    daemonCardLocalHomeLinkMode(ds),
+    undefined,
+    'footer',
+    {
+      terminalUrl: readableTerminalUrlFor(ds) || undefined,
+      stopValue: {
+        action: 'close',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_stop',
+      },
+      manageValue: {
+        action: 'manage_access',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_manage',
+      },
+    },
+  );
 }
 
 /** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
@@ -6672,6 +6714,10 @@ export async function closeSession(
   }
 
   if (ds) {
+    // Fence durable progress/final continuations before the worker is killed.
+    // Timers hold this object directly, so registry deletion alone would not
+    // stop a late Lark send.
+    ds.progressDeliveryClosed = true;
     disposeOrdinaryTurnRecovery(ds.session);
     killWorker(ds, {
       ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
@@ -6785,6 +6831,10 @@ export async function closeSession(
     }
     if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
   }
+
+  // A deliberately closed conversation can never accept a replayed
+  // commentary card. Remove retained outbox entries instead of leaking them.
+  discardProgressDeliveries(config.session.dataDir, sessionId);
 
   // alreadyClosed = nothing happened on either path.
   const alreadyClosed = !killedLive && !wasOpen;
@@ -11255,6 +11305,104 @@ function setupWorkerHandlers(
     });
     return !decision.ok;
   };
+
+  /** Deliver one durable commentary record. Records are serialized per
+   * session, retried with the same provider UUID, and removed from disk only
+   * after Lark confirms the reply. */
+  const enqueueProgressDelivery = (record: ProgressDeliveryRecord): void => {
+    if (record.sessionId !== ds.session.sessionId) return;
+    if (!record.content.trim()) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (managedAuxUiSuppressed(record.turnId, record.dispatchAttempt)
+      || ds.docCommentTurns?.has(record.turnId)) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (!ds.progressOutputUuids) ds.progressOutputUuids = new Set();
+    if (!ds.progressOutputInFlight) ds.progressOutputInFlight = new Set();
+    if (ds.progressOutputUuids.has(record.transcriptUuid)) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      return;
+    }
+    if (ds.progressOutputInFlight.has(record.transcriptUuid)) return;
+    ds.progressOutputInFlight.add(record.transcriptUuid);
+
+    const run = async (): Promise<void> => {
+      const cardJson = buildNativeProgressCard(ds, record.content);
+      for (let attempt = 0; ; attempt++) {
+        const backoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
+          Math.min(attempt, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+        ] ?? 0;
+        if (backoff > 0) {
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, backoff);
+            timer.unref?.();
+          });
+        }
+        if (isProgressDeliveryClosed(ds)) {
+          completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+          return;
+        }
+        try {
+          await scopedReply(cardJson, 'interactive', record.turnId, {
+            uuid: bridgeProgressProviderUuid(record.sessionId, record.turnId, record.content)
+              ?? progressProviderUuid(record.sessionId, record.transcriptUuid),
+          });
+          ds.progressOutputUuids!.add(record.transcriptUuid);
+          while (ds.progressOutputUuids!.size > 512) {
+            const oldest = ds.progressOutputUuids!.values().next().value;
+            if (oldest === undefined) break;
+            ds.progressOutputUuids!.delete(oldest);
+          }
+          completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+          logger.info(
+            `[${t}] Structured progress forwarded `
+            + `(turn ${record.turnId.substring(0, 8)}, ${record.content.length} chars, attempt ${attempt + 1})`,
+          );
+          return;
+        } catch (err: any) {
+          if (err instanceof MessageWithdrawnError) {
+            completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+            logger.warn(`[${t}] Structured progress abandoned — root message withdrawn`);
+            killWorker(ds);
+            cb.closeSession(ds);
+            return;
+          }
+          if (isPermanentProgressDeliveryError(err)) {
+            completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+            logger.error(
+              `[${t}] Structured progress permanently rejected by Lark; dropped so later commentary/final can continue `
+              + `(HTTP ${larkHttpStatus(err)}, turn ${record.turnId.substring(0, 8)}): `
+              + `${err?.message ?? err}`,
+            );
+            return;
+          }
+          const nextBackoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
+            Math.min(attempt + 1, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
+          ];
+          logger.warn(
+            `[${t}] Structured progress attempt ${attempt + 1} failed; retained at FIFO head `
+            + `and retrying in ${nextBackoff}ms (turn ${record.turnId.substring(0, 8)}): `
+            + `${err?.message ?? err}`,
+          );
+        }
+      }
+    };
+
+    const previous = ds.progressDeliveryTail ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(run).finally(() => {
+      ds.progressOutputInFlight?.delete(record.transcriptUuid);
+    });
+    ds.progressDeliveryTail = current;
+  };
+
+  // Recovery re-forks baseline the transcript, so already-observed commentary
+  // will not be emitted by the new worker. Replay the daemon-owned outbox here.
+  for (const record of listProgressDeliveries(config.session.dataDir, ds.session.sessionId)) {
+    enqueueProgressDelivery(record);
+  }
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
@@ -13726,6 +13874,35 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'progress_output': {
+        // Progress must come from the same worker/session and exact managed
+        // attempt as the turn it describes. Unlike screen_update, its content
+        // is transcript-native assistant commentary, never a terminal scrape.
+        if (ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored progress_output from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.error(
+            `[${t}] Dropped progress_output with mismatched sessionId `
+            + `(msg=${msg.sessionId}, expected=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+          );
+          break;
+        }
+        if (isProgressDeliveryClosed(ds) || !msg.content.trim()) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (ds.docCommentTurns?.has(msg.turnId)) break;
+        const record = stageProgressDelivery(config.session.dataDir, {
+          sessionId: msg.sessionId,
+          turnId: msg.turnId,
+          transcriptUuid: msg.uuid,
+          content: msg.content,
+          ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+        });
+        enqueueProgressDelivery(record);
+        break;
+      }
+
       case 'final_output': {
         if (msg.codexAppSettlement) {
           const settlement = msg.codexAppSettlement;
@@ -13941,6 +14118,9 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
+        // Snapshot only commentary that existed when this final IPC arrived.
+        // A later turn's progress must never delay this turn's terminal reply.
+        const earlierProgress = ds.progressDeliveryTail;
         deliverFinalOutput(
           ds,
           msg,
@@ -13948,6 +14128,9 @@ function setupWorkerHandlers(
           0,
           undefined,
           ownsLifecycleMutation,
+          undefined,
+          undefined,
+          earlierProgress,
         );
         break;
       }
@@ -14146,6 +14329,70 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+/** Preserve commentary-before-final ordering during ordinary short provider
+ * hiccups, but never let the durable commentary FIFO hold the terminal answer
+ * hostage indefinitely. Commentary remains in its own outbox and can land
+ * later with the original provider UUID. */
+const FINAL_OUTPUT_PROGRESS_WAIT_MS = 20_000;
+/** Commentary is not reproducible after its transcript event has passed.
+ * Retry forever (bounded at 30s) while the session is active; the durable
+ * outbox takes over across daemon restarts. */
+const PROGRESS_OUTPUT_RETRY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+
+function larkHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const response = (error as { response?: unknown }).response;
+  const responseStatus = response && typeof response === 'object'
+    ? (response as { status?: unknown }).status
+    : undefined;
+  const status = responseStatus ?? (error as { status?: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function larkBusinessCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const response = (error as { response?: unknown }).response;
+  const data = response && typeof response === 'object'
+    ? (response as { data?: unknown }).data
+    : undefined;
+  const responseCode = data && typeof data === 'object'
+    ? (data as { code?: unknown }).code
+    : undefined;
+  const directCode = (error as { code?: unknown }).code;
+  const code = responseCode ?? directCode;
+  return typeof code === 'number' ? code : undefined;
+}
+
+function isPermanentProgressDeliveryError(error: unknown): boolean {
+  const status = larkHttpStatus(error);
+  const code = larkBusinessCode(error);
+  const rateLimited = status === 429 || code === 99991400;
+  return status !== undefined && status >= 400 && status < 500 && status !== 408 && !rateLimited;
+}
+
+function isProgressDeliveryClosed(ds: DaemonSession): boolean {
+  return ds.progressDeliveryClosed === true || ds.session.status === 'closed';
+}
+
+async function waitForEarlierProgress(
+  earlierProgress: Promise<void> | undefined,
+  timeoutMs = FINAL_OUTPUT_PROGRESS_WAIT_MS,
+): Promise<'settled' | 'timed_out'> {
+  if (!earlierProgress) return 'settled';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      earlierProgress.then(() => 'settled' as const, () => 'settled' as const),
+      new Promise<'timed_out'>(resolve => {
+        timer = setTimeout(() => resolve('timed_out'), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Shutdown-only view of the in-flight Codex App final-settlement promises. Each
  * entry is a `deliverFinalOutput` awaited inside the IPC message handler that
@@ -14337,6 +14584,7 @@ function deliverFinalOutput(
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
+  earlierProgress: Promise<void> | undefined = ds.progressDeliveryTail,
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -14406,12 +14654,26 @@ function deliverFinalOutput(
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
-    if (ds.session.status === 'closed') {
+    if (isProgressDeliveryClosed(ds)) {
       logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
       onComplete?.(true);
       return;
     }
+    let retryEarlierProgress = earlierProgress;
     try {
+      const progressWait = await waitForEarlierProgress(earlierProgress);
+      if (progressWait === 'timed_out') {
+        retryEarlierProgress = undefined;
+        logger.warn(
+          `[${t}] Bridge final_output stopped waiting for earlier commentary after `
+          + `${FINAL_OUTPUT_PROGRESS_WAIT_MS}ms; prioritizing terminal delivery `
+          + `(turn ${msg.turnId.substring(0, 8)})`,
+        );
+      }
+      if (isProgressDeliveryClosed(ds) || !isStillOwned()) {
+        logger.info(`[${t}] Bridge final_output abandoned after progress wait — session closed or stale`);
+        return;
+      }
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = managedReceiver ? undefined : resolveDocCommentTarget(ds, msg.turnId);
@@ -14824,7 +15086,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, retryEarlierProgress);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

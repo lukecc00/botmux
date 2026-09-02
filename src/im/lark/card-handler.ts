@@ -10,7 +10,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, buildManagementAccessCard } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -98,6 +98,7 @@ import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistS
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
+import { notifySessionStopped } from '../../core/session-stop-notice.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -109,6 +110,7 @@ import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktre
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
+import { buildManagementDashboardUrl } from '../../core/manage-access.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -1979,7 +1981,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'manage_access', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2014,11 +2016,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
+        if (value.action === 'get_write_link' || value.action === 'manage_access' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
             : value.action === 'open_local_cli'
               ? 'card.action.local_cli_no_permission'
+              : value.action === 'manage_access'
+                ? 'card.action.manage_access_no_permission'
               : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
@@ -2040,11 +2044,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
+        if (value.action === 'get_write_link' || value.action === 'manage_access' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
             : value.action === 'open_local_cli'
               ? 'card.action.local_cli_no_permission'
+              : value.action === 'manage_access'
+                ? 'card.action.manage_access_no_permission'
               : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
@@ -2648,6 +2654,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
       const { current, botCfg, card, patchClickedCardInPlace } = closed;
+      // Preserve the personal release's high-attention close callback. The
+      // provider UUID makes this idempotent if worker-exit and card-close race.
+      await notifySessionStopped(current, deps.sessionReply, 'ended', {
+        recipientOpenId: operatorOpenId,
+      });
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -3354,6 +3365,41 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         });
         await deliverEphemeralOrReply(ds, operatorOpenId, notReadyCard, 'interactive', () => sessionReply(rootId, notReadyCard, 'interactive'));
       }
+    }
+
+    if (actionType === 'manage_access') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (!operatorOpenId) {
+        return { toast: { type: 'warning', content: t('card.action.manage_access_no_permission', undefined, locDs) } };
+      }
+      if (!sessionSupportsWebTerminal(ds)) {
+        const unsupportedCard = JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{ tag: 'markdown', content: t('card.action.terminal_unsupported', undefined, locDs) }],
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, unsupportedCard, 'interactive', () => sessionReply(rootId, unsupportedCard, 'interactive'));
+        return;
+      }
+      if (!ds.riffAccessUrl && (!ds.workerPort || !ds.workerToken)) {
+        const notReadyCard = JSON.stringify({
+          schema: '2.0',
+          body: { elements: [{ tag: 'markdown', content: t('card.action.terminal_not_ready', undefined, locDs) }] },
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, notReadyCard, 'interactive', () => sessionReply(rootId, notReadyCard, 'interactive'));
+        return;
+      }
+      const cardJson = buildManagementAccessCard(
+        buildManagementDashboardUrl(),
+        buildTerminalUrl(ds, { write: true }),
+        locDs,
+      );
+      // Both links are privileged. Deliver only to the verified callback
+      // operator (ephemeral in normal groups, DM fallback elsewhere).
+      void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+      return { toast: { type: 'success', content: t('card.action.manage_access_sent', undefined, locDs) } };
     }
 
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias

@@ -1384,6 +1384,15 @@ export type WorkerToDaemon =
    * the daemon should treat listener-preview runs as visibly replied even
    * though transcript fallback output is suppressed to avoid duplicates. */
   | { type: 'explicit_reply_observed'; turnId: string; messageId?: string }
+  | {
+      type: 'progress_output';
+      /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */
+      sessionId: string;
+      content: string;
+      uuid: string;
+      turnId: string;
+      dispatchAttempt?: number;
+    }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; cardMessageId?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_submit_failed'; cardMessageId?: string; stuckNonce?: number; turnId?: string; dispatchAttempt?: number }

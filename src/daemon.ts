@@ -49,6 +49,10 @@ import {
   startCliRuntimeUpdateMonitor,
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
+import {
+  startBotmuxUpdateMonitor,
+  stopBotmuxUpdateMonitor,
+} from './core/botmux-update-monitor.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import {
   SUPERVISOR_SHUTDOWN_PROTOCOL,
@@ -22896,6 +22900,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
       log: (m) => logger.info(`[cli-update] ${m}`),
     });
+    startBotmuxUpdateMonitor({
+      dataDir: config.session.dataDir,
+      primaryLarkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      dashboardUrl: () => dashboardUrlForReport().url,
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
+      log: (m) => logger.info(`[botmux-update] ${m}`),
+    });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
     setTimeout(() => {
@@ -23190,6 +23202,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     deferredScheduleSettleTimers.clear();
     vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
+    stopBotmuxUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);

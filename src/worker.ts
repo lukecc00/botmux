@@ -398,9 +398,11 @@ import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.j
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
+import { bridgeProgressProviderUuid } from './services/bridge-output-dedupe.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
+  normalizeAppRunnerProgressMarker,
   normalizeCodexAppLifecycleEvent,
   normalizeFinalUsage,
 } from './services/codex-app-runner-protocol.js';
@@ -6100,6 +6102,26 @@ function structuredBridgeIngestPath(
   return drainCocoEvents(path, offset);
 }
 
+/** Forward only transcript-native assistant commentary. Tool calls, command
+ * output, reasoning, and the terminal viewport never enter this path. */
+function ingestStructuredBridgeEvents(events: CodexBridgeEvent[]): void {
+  codexBridgeQueue.ingest(events);
+  flushStructuredBridgeProgress();
+}
+
+function flushStructuredBridgeProgress(): void {
+  for (const progress of codexBridgeQueue.drainProgressOutputs()) {
+    send({
+      type: 'progress_output',
+      sessionId,
+      content: progress.content,
+      uuid: progress.uuid,
+      turnId: progress.turnId,
+      dispatchAttempt: progress.dispatchAttempt,
+    });
+  }
+}
+
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
   // Single 1s ticker that handles three jobs: late-attach (poll for the
@@ -6269,7 +6291,7 @@ function hermesBridgeIngest(): void {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(filtered.events);
+  ingestStructuredBridgeEvents(filtered.events);
   pruneExpiredStructuredHeadsAndEmit('Hermes ingest');
   if (filtered.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -6283,7 +6305,7 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     pruneExpiredStructuredHeadsAndEmit('MTR split-live attach');
     mtrBridgeOffset = result.newOffset;
     mtrBridgeBaselineDone = true;
@@ -6309,7 +6331,7 @@ function mtrBridgeIngest(): void {
   const result = drainMtrSession(mtrBridgeSource, mtrBridgeOffset);
   mtrBridgeOffset = result.newOffset;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   pruneExpiredStructuredHeadsAndEmit('MTR ingest');
   if (result.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -6345,7 +6367,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    ingestStructuredBridgeEvents(live);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
     // Late attach can discover an already-completed live turn in the same
     // drain. Re-drive prompt readiness from that terminal event immediately;
@@ -6911,7 +6933,7 @@ function codexBridgeIngest(opts: {
     maybeEmitCodexStructuredRateLimit(result.events);
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
+  ingestStructuredBridgeEvents(result.events);
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
@@ -6993,6 +7015,9 @@ function codexBridgeMarkPendingTurn(
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
+  // Handles the transcript-before-mark race: mark() can replay buffered
+  // commentary immediately after attribution becomes available.
+  flushStructuredBridgeProgress();
   return turnId;
 }
 
@@ -9267,6 +9292,36 @@ async function handleTrustedCodexAppMarker(
       type: 'steer_accepted',
       appTurnId: event.appTurnId,
       turnId: event.replyTurnId,
+    });
+    return true;
+  }
+
+  if (kind === 'progress') {
+    const marker = normalizeAppRunnerProgressMarker(payload);
+    if (!marker) {
+      log(`${cliName()} rejected malformed progress marker`);
+      return true;
+    }
+    const trustedReplyTurnId = marker.replyTurnId
+      && submittedCodexAppReplyTurnIds.has(marker.replyTurnId)
+      ? marker.replyTurnId
+      : undefined;
+    if (!trustedReplyTurnId) {
+      log(
+        `${cliName()} ignored unsubmitted progress reply route `
+        + `(replyTurn=${shortCorrelationId(marker.replyTurnId)})`,
+      );
+      return true;
+    }
+    const dispatchAttempt = currentBotmuxDispatchAttempt;
+    send({
+      type: 'progress_output',
+      sessionId,
+      content: marker.content,
+      uuid: bridgeProgressProviderUuid(sessionId, trustedReplyTurnId, marker.content)
+        ?? `app:${marker.appTurnId}:${marker.itemId}`,
+      turnId: trustedReplyTurnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
     return true;
   }

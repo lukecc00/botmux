@@ -43,7 +43,7 @@ botmux restart
 
 ```json
 {
-  "version": "3.2.10"
+  "version": "3.2.11"
 }
 ```
 
@@ -56,14 +56,14 @@ GitHub Release 仅用于更新说明和发布校验，不会覆盖 manifest 的�
 先确保 `p/ai_open` 当前 HEAD 已完成测试，且这次提交就是要交付给安装器的源码，然后：
 
 ```bash
-# 1. 修改 dev-version.json，例如 3.2.10，并提交到个人分支
+# 1. 修改 dev-version.json，例如 3.2.11，并提交到个人分支
 git add dev-version.json
-git commit -m "chore(release): 发布个人版 3.2.10"
+git commit -m "chore(release): 发布个人版 3.2.11"
 git push origin p/ai_open
 
 # 2. 在同一个 HEAD 创建 annotated tag，tag message 会成为 Release notes
-git tag -a v3.2.10 -m "个人版 3.2.10 更新内容"
-git push origin v3.2.10
+git tag -a v3.2.11 -m "个人版 3.2.11 更新内容"
+git push origin v3.2.11
 ```
 
 Release workflow 会拒绝以下情况：

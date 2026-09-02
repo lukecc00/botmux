@@ -19,12 +19,12 @@ describe('personal distribution source invariants', () => {
     expect(installer).toContain('--filter=blob:none');
     expect(installer).toContain('attempt $attempt/2');
     expect(installer).toContain('failed to download $REPO@$REF over SSH and HTTPS');
-    expect(installer).toContain('./node_modules/.bin/tsc');
-    expect(installer).toContain('node scripts/build-dashboard.mjs');
-    expect(installer).not.toContain('$PNPM build');
-    expect(installer).toContain('.cache/node/corepack/v1/pnpm/9.5.0/bin/pnpm.cjs');
-    expect(installer).toContain('elif command -v pnpm');
-    expect(installer).toContain('PNPM_CMD="npx --yes pnpm@9.5.0"');
+    expect(installer).toContain('BUN_CMD="bun"');
+    expect(installer).toContain('BUN_CMD="$HOME/.bun/bin/bun"');
+    expect(installer).toContain('$BUN_CMD install --frozen-lockfile');
+    expect(installer).toContain('$BUN_CMD run build');
+    expect(installer).not.toContain('PNPM_CMD');
+    expect(installer).not.toContain('npm publish');
     expect(installer).toContain('fs.renameSync(tmp, link)');
     expect(installer).not.toContain('mv -f "$APP_HOME/current.new"');
   });
