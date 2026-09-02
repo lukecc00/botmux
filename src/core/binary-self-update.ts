@@ -70,8 +70,15 @@ import {
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
-import { GITHUB_REPO } from './restart-report.js';
 import { getReleaseStream, resolveHttpProxy } from './release-download.js';
+
+/**
+ * Compiled binaries remain official-distribution artifacts. The personal
+ * channel is source-built from lukecc00/botmux@p/ai_open and intentionally
+ * publishes no platform binaries, so pointing this path at the personal repo
+ * would make every standalone update request resolve to a guaranteed 404.
+ */
+export const BINARY_RELEASE_REPO = 'deepcoldy/botmux';
 
 /**
  * Where the running compiled binary lives, and therefore who owns updating it.
@@ -154,7 +161,7 @@ export function releaseAssetName(
 
 /** Download base for a release tag, mirroring install.sh's URL construction. */
 export function releaseAssetBaseUrl(version: string): string {
-  return `https://github.com/${GITHUB_REPO}/releases/download/v${version.replace(/^v/i, '')}`;
+  return `https://github.com/${BINARY_RELEASE_REPO}/releases/download/v${version.replace(/^v/i, '')}`;
 }
 
 // ── The self-update itself ─────────────────────────────────────────────────────

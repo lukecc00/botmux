@@ -381,18 +381,16 @@ describe('release asset selection', () => {
     expect(releaseAssetName('linux', 'riscv64', false)).toBeNull();
   });
 
-  it('the asset names agree EXACTLY with install.sh (the two must not drift)', () => {
-    // install.sh is the other consumer of these names. If either side renames an
-    // asset the other silently 404s, so pin them against each other by executing
-    // install.sh's own construction rather than re-reading our own constant.
+  it('keeps official compiled assets separate from the personal source installer', () => {
+    // The personal channel deliberately clones and builds p/ai_open; it does not
+    // publish or download platform binaries. Standalone binary updates remain an
+    // official-distribution concern and retain the official asset convention.
     const sh = readFileSync(resolve('install.sh'), 'utf-8');
-    expect(sh).toMatch(/asset="botmux-\$\{os_tag\}-\$\{arch_tag\}"/);
-    expect(sh).toMatch(/asset="\$\{asset\}-musl"/);
+    expect(sh).toContain('REPO="lukecc00/botmux"');
+    expect(sh).toContain('REF="p/ai_open"');
+    expect(sh).not.toContain('releases/download');
     for (const [os, arch] of [['linux', 'x64'], ['linux', 'arm64'], ['darwin', 'arm64']] as const) {
-      const built = execFileSync('sh', ['-c',
-        `os_tag=${os}; arch_tag=${arch}; asset="botmux-\${os_tag}-\${arch_tag}"; printf '%s' "$asset"`,
-      ], { encoding: 'utf-8' });
-      expect(releaseAssetName(os as NodeJS.Platform, arch, false)).toBe(built);
+      expect(releaseAssetName(os as NodeJS.Platform, arch, false)).toBe(`botmux-${os}-${arch}`);
     }
   });
 
