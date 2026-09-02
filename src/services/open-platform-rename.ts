@@ -72,8 +72,30 @@ function asRecord(value: unknown): Record<string, unknown> {
   return isPlainRecord(value) ? value : {};
 }
 
+/**
+ * 开放平台的登录失效不总是以 401/403 返回。实测 console API 会返回 HTTP 400：
+ * `{ code:99991641, error:{ Code:4101, LogoutReason:15 }, msg:"...log in again" }`。
+ * 这和 missing_csrf 一样都需要用户重新扫码，不能落成普通 api_error，否则 dashboard
+ * 只会显示原始 HTTP 400，且不会给出已有的扫码入口。
+ */
+function isOpenPlatformSessionExpiredError(err: OpenPlatformApiError): boolean {
+  const payload = asRecord(err.payload);
+  const detail = asRecord(payload.error);
+  const message = [payload.msg, payload.message, err.message]
+    .filter((value): value is string => typeof value === 'string')
+    .join(' ');
+  const detailCode = detail.Code ?? detail.code;
+  const logoutReason = detail.LogoutReason ?? detail.logoutReason;
+  return (payload.code === 99991641 && (detailCode === 4101 || logoutReason === 15))
+    || (detailCode === 4101 && logoutReason === 15)
+    || /please\s+log\s+in\s+again/i.test(message);
+}
+
 function failureFromError(err: unknown, fallbackReason: OpenPlatformRenameFailureReason = 'api_error'): { reason: OpenPlatformRenameFailureReason; message: string } {
   if (err instanceof OpenPlatformApiError) {
+    if (isOpenPlatformSessionExpiredError(err)) {
+      return { reason: 'session_expired', message: '飞书开放平台登录态已失效，请扫码重新登录后重试' };
+    }
     const code = asRecord(err.payload).code;
     if (code === 10003) {
       return { reason: 'no_access', message: '当前缓存的飞书账号不是该应用的协作者，开放平台拒绝访问（code=10003）' };

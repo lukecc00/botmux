@@ -33,6 +33,8 @@ describe('FeishuLoginManager', () => {
     expect(started.status).toBe('starting');
     await flush();
 
+    expect(prepareSession).toHaveBeenCalledWith(expect.objectContaining({ forceQrLogin: true }));
+
     const scanning = mgr.get()!;
     expect(scanning.status).toBe('awaiting_scan');
     expect(scanning.qrDataUrl).toBe('data:qr:{"qrlogin":{"token":"tok"}}');

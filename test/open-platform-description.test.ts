@@ -127,6 +127,42 @@ describe('readBotDescriptionsOnOpenPlatform', () => {
     });
     expect(result).toMatchObject({ ok: false, reason: 'no_access' });
   });
+
+  it('maps the console HTTP 400 logout payload to session_expired', async () => {
+    const result = await readBotDescriptionsOnOpenPlatform('cli_x', 'feishu', {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient([], {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError(
+          'HTTP 400 /developers/v1/app/cli_x',
+          {
+            code: 99991641,
+            msg: 'Something went wrong, please log in again.',
+            error: { Code: 4101, LogoutReason: 15 },
+          },
+          400,
+        ),
+      }),
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'session_expired',
+      message: expect.stringContaining('重新登录'),
+    });
+  });
+
+  it('keeps unrelated HTTP 400 responses as api_error', async () => {
+    const result = await readBotDescriptionsOnOpenPlatform('cli_x', 'feishu', {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient([], {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError(
+          'HTTP 400 invalid request',
+          { code: 40001, msg: 'invalid request' },
+          400,
+        ),
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+  });
 });
 
 describe('updateBotDescriptionsOnOpenPlatform', () => {
