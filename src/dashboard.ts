@@ -207,6 +207,7 @@ import {
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
   isAutoUpdateSupportedInstall,
+  isRollbackSupportedPlan,
   withGlobalInstallRegistry,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
@@ -4528,7 +4529,7 @@ const server = createServer(async (req, res) => {
         // but /api/update/rollback only knows how to drive a package manager, so a
         // curl-installed binary would be offered a button that always fails.
         // Report it explicitly instead of letting the UI infer it.
-        rollbackSupported: installPlan !== null,
+        rollbackSupported: isRollbackSupportedPlan(installPlan),
         // The standalone binary is not owned by a package manager; report it as
         // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
         updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
@@ -4766,9 +4767,15 @@ const server = createServer(async (req, res) => {
       let installPlan: GlobalInstallPlan;
       try {
         const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
-        installPlan = withGlobalInstallRegistry(
-          resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
-        );
+        const candidate = resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`);
+        if (!isRollbackSupportedPlan(candidate)) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'unsupported_install_method',
+            manager: candidate.manager,
+          });
+        }
+        installPlan = withGlobalInstallRegistry(candidate);
       } catch (error) {
         if (error instanceof UnsupportedGlobalInstallError) {
           return jsonRes(res, 400, {

@@ -1984,6 +1984,11 @@ export interface BotConfig {
   disableStreamingCard?: boolean;
   /** Ordinary Claude Code/Codex replies. Absent preserves legacy delivery. */
   replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
+  /** Render each user-facing transcript commentary / milestone as a separate
+   *  Markdown card with Web Terminal / stop / manage controls. Default OFF;
+   *  this never exposes hidden chain-of-thought, only commentary the CLI has
+   *  already emitted for the user. */
+  stageConclusionCards?: boolean;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
@@ -3764,6 +3769,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
+      stageConclusionCards: entry.stageConclusionCards === true || undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

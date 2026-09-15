@@ -1954,6 +1954,49 @@ describe('PUT /api/bot-card-prefs — two reply modes', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — stage conclusion control cards', () => {
+  it('persists the per-bot opt-in and clears it when disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-stage-conclusion-cards-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-stage-conclusion-cards-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+
+      const on = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stageConclusionCards: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, stageConclusionCards: true });
+      expect(getBot(appId).config.stageConclusionCards).toBe(true);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].stageConclusionCards).toBe(true);
+
+      const off = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stageConclusionCards: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, stageConclusionCards: false });
+      expect(getBot(appId).config.stageConclusionCards).toBeUndefined();
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].stageConclusionCards).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
   it('persists known button ids canonically, clears them, and rejects unknown ids', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-streaming-buttons-'));
@@ -4856,6 +4899,100 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
     expect(typeof body.url).toBe('string');
     expect(body.url).toContain('token=secret-tok');
     spy.mockRestore();
+  });
+});
+
+describe('POST /api/sessions/:sessionId/progress-card', () => {
+  it('returns the canonical progress card with callback controls and authoritative identity when enabled', async () => {
+    const appId = 'progress-card-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      stageConclusionCards: true,
+      workingDir: '/tmp',
+      workingDirs: ['/tmp'],
+    } as any);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: {
+        sessionId: 'progress-session',
+        rootMessageId: 'om_root',
+        webPort: 4321,
+        cliId: 'codex',
+      },
+      scope: 'thread',
+      workerPort: 4321,
+      workerToken: 'write-token',
+      workerViewToken: 'view-token',
+      larkAppId: appId,
+      chatId: 'oc_chat',
+      chatType: 'group',
+      workingDir: '/tmp',
+      managedTurnOrigin: {
+        capability: 'a'.repeat(64),
+        turnId: 'om_turn',
+        dispatchAttempt: 3,
+      },
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/progress-session/progress-card';
+      const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          ...trustedHostHeaders('POST', path, handle.port),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ content: '阶段进度，不需要 @ 用户。' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.turnId).toBe('om_turn');
+      expect(body.dispatchAttempt).toBe(3);
+      expect(body.providerUuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
+      expect(body.cardJson).toContain('阶段进度，不需要 @ 用户。');
+      expect(body.cardJson).toContain('web终端');
+      expect(body.cardJson).toContain('reply_stop');
+      expect(body.cardJson).toContain('reply_manage');
+      expect(body.cardJson).toContain('manage_access');
+      expect(body.cardJson).toContain('progress-session');
+      expect(body.cardJson).toContain('om_root');
+      expect(body.cardJson).not.toContain('发送给');
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('rejects an unsigned request that does not hold the live turn capability', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 'progress-session' },
+      managedTurnOrigin: {
+        capability: 'b'.repeat(64),
+        turnId: 'om_turn',
+        dispatchAttempt: 1,
+      },
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/progress-session/progress-card`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: 'forged progress',
+          originCapability: 'c'.repeat(64),
+          originTurnId: 'om_turn',
+          originDispatchAttempt: 1,
+        }),
+      });
+      expect(res.status).toBe(403);
+      expect((await res.json()).ok).toBe(false);
+    } finally {
+      findSpy.mockRestore();
+    }
   });
 });
 

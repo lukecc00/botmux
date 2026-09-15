@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
+  isRollbackSupportedPlan,
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
@@ -12,6 +13,48 @@ import {
 } from '../src/utils/global-install.js';
 
 describe('resolveGlobalInstallPlan', () => {
+  it('reruns the trusted installer for a managed personal source release', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-managed-source-'));
+    try {
+      const prefix = join(tempRoot, 'prefix');
+      const packageRoot = join(prefix, 'share', 'botmux', 'current');
+      mkdirSync(packageRoot, { recursive: true });
+      writeFileSync(join(packageRoot, '.botmux-install.json'), JSON.stringify({
+        schemaVersion: 1,
+        method: 'github-source',
+        repo: 'lukecc00/botmux',
+        ref: 'p/ai_open',
+        revision: 'a'.repeat(40),
+        version: '3.2.14',
+        prefix,
+        installedAt: '2026-09-16T00:00:00.000Z',
+      }));
+
+      expect(detectGlobalInstallManager(packageRoot, 'linux')).toBe('unknown');
+      expect(resolveGlobalInstallPlan(packageRoot, 'linux')).toEqual({
+        manager: 'github-source',
+        command: 'sh',
+        args: [join(packageRoot, 'install.sh')],
+        env: { BOTMUX_INSTALL_PREFIX: prefix },
+        activePackageRoot: packageRoot,
+      });
+      expect(tryResolveGlobalInstallPlan(packageRoot, 'win32')).toBeNull();
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('limits rollback to package-manager installs', () => {
+    expect(isRollbackSupportedPlan(null)).toBe(false);
+    expect(isRollbackSupportedPlan({
+      manager: 'github-source', command: 'sh', args: ['/tmp/install.sh'], activePackageRoot: '/tmp/current',
+    })).toBe(false);
+    expect(isRollbackSupportedPlan(resolveGlobalInstallPlan(
+      '/home/bot/.local/lib/node_modules/botmux',
+      'linux',
+    ))).toBe(true);
+  });
+
   it('targets the exact POSIX npm prefix', () => {
     const plan = resolveGlobalInstallPlan('/home/bot/.local/lib/node_modules/botmux', 'linux');
     expect(plan).toEqual({

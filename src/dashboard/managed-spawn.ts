@@ -102,10 +102,12 @@ export function spawnStopBotLive(appId: string): Promise<BotLifecycleSpawnResult
 }
 
 /**
- * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
+ * Run the ownership-aware npm/pnpm/Bun/personal-source update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
- * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
- * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
+ * during the install). Resolves on exit 0; rejects with the tail of
+ * stdout/stderr on a non-zero exit, spawn error, or bounded timeout. Source
+ * installs rebuild locked dependencies, so they receive the longer budget.
+ * Args are
  * a fixed literal — no shell interpolation of untrusted input.
  */
 export function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
@@ -123,10 +125,11 @@ export function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
     const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
     child.stdout?.on('data', capture);
     child.stderr?.on('data', capture);
+    const timeoutMs = plan.manager === 'github-source' ? 15 * 60_000 : 180_000;
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error(`${plan.manager} install timed out after 180s`));
-    }, 180_000);
+      reject(new Error(`${plan.manager} install timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
     child.on('exit', (code) => {
       clearTimeout(timer);

@@ -30,6 +30,20 @@ describe('isLocalDevInstallAt', () => {
     mkdirSync(join(dir, 'src'));
     expect(isLocalDevInstallAt(dir)).toBe(true);
   });
+  it('false for a managed source release even when the archive contains src/', () => {
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, '.botmux-install.json'), JSON.stringify({
+      schemaVersion: 1,
+      method: 'github-source',
+      repo: 'lukecc00/botmux',
+      ref: 'p/ai_open',
+      revision: 'b'.repeat(40),
+      version: '3.2.14',
+      prefix: dir,
+      installedAt: '2026-09-16T00:00:00.000Z',
+    }));
+    expect(isLocalDevInstallAt(dir)).toBe(false);
+  });
   it('false for an npm-global-style install (only dist/, no .git/src)', () => {
     mkdirSync(join(dir, 'dist'));
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'botmux' }));
@@ -49,7 +63,10 @@ describe('botmuxVersion', () => {
   it('reads the version from the package root package.json', () => {
     // resolve repo root from this test file: test/ → repo root
     const root = fileURLToPath(new URL('..', import.meta.url));
-    const expected = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    const pkgVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    const expected = pkgVersion === '0.0.0'
+      ? JSON.parse(readFileSync(join(root, 'dev-version.json'), 'utf-8')).version
+      : pkgVersion;
     expect(botmuxVersion()).toBe(expected);
   });
 
@@ -59,6 +76,26 @@ describe('botmuxVersion', () => {
       writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '9.8.7' }));
       expect(botmuxVersionAt(root)).toBe('9.8.7');
       expect(botmuxCliEntryAt(root)).toBe(join(root, 'dist', 'cli.js'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses managed source metadata when package.json has the development placeholder', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-managed-version-at-'));
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '0.0.0' }));
+      writeFileSync(join(root, '.botmux-install.json'), JSON.stringify({
+        schemaVersion: 1,
+        method: 'github-source',
+        repo: 'lukecc00/botmux',
+        ref: 'p/ai_open',
+        revision: 'c'.repeat(40),
+        version: '3.2.14',
+        prefix: root,
+        installedAt: '2026-09-16T00:00:00.000Z',
+      }));
+      expect(botmuxVersionAt(root)).toBe('3.2.14');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

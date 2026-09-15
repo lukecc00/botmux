@@ -2848,6 +2848,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('forwards only structured progress as a Markdown card and dedupes its transcript uuid', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     ds.workerPort = 12345;
     ds.streamCardId = 'om_existing_stream';
@@ -2891,6 +2897,38 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('reply_manage');
     expect(sessionReply.mock.calls[0][1]).not.toContain('发送给');
     expect(sessionReply.mock.calls[0][5]?.uuid).toMatch(/^bmxp_[0-9a-f]{40}$/);
+    vi.useRealTimers();
+  });
+
+  it('keeps structured progress visible without footer controls when the bot switch is off', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const ds = makeDs();
+    ds.workerPort = 12345;
+    const sessionReply = vi.fn(async () => 'om_progress');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '阶段结论仍然可见', uuid: 'progress-switch-off', turnId: 'turn-progress-off',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const card = String(sessionReply.mock.calls[0][1]);
+    expect(card).toContain('阶段结论仍然可见');
+    expect(card).not.toContain('web终端');
+    expect(card).not.toContain('reply_stop');
+    expect(card).not.toContain('reply_manage');
     vi.useRealTimers();
   });
 

@@ -449,6 +449,23 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
   });
 
+  it('sets and unsets stage-conclusion control cards through /botconfig', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('stageConclusionCards')!;
+    expect(spec.kind).toBe('boolean');
+    expect(spec.defaultOn).not.toBe(true);
+
+    const enabled = await store.applyConfigField('app_default', spec, true);
+    expect(enabled.ok).toBe(true);
+    expect(readConfig().stageConclusionCards).toBe(true);
+    expect(registry.getBot('app_default').config.stageConclusionCards).toBe(true);
+
+    const disabled = await store.applyConfigField('app_default', spec, false);
+    expect(disabled.ok).toBe(true);
+    expect(readConfig().stageConclusionCards).toBeUndefined();
+    expect(registry.getBot('app_default').config.stageConclusionCards).toBeUndefined();
+  });
+
   it('defaultOn boolean (thinkingCard): inverted persistence — only explicit false is written', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('thinkingCard')!;

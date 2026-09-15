@@ -10,20 +10,23 @@
 import { spawnSync } from 'node:child_process';
 import { readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { posix, win32 } from 'node:path';
-import { botmuxInstallRoot } from './install-info.js';
+import { join, posix, win32 } from 'node:path';
+import {
+  botmuxInstallRoot,
+  managedSourceInstallAt,
+} from './install-info.js';
 // Import the SHAPE CLASSIFIER only (pure, no network / no release logic), not the
 // whole self-update module: binary-self-update.ts pulls in restart-report →
 // install-info, and importing that side of it from here would close an import
 // cycle through this very module.
 import { currentUpdateStrategy, type UpdateStrategy } from '../core/binary-install-shape.js';
 
-export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun';
-export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'unknown';
+export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun' | 'github-source';
+export type DetectedInstallManager = Exclude<GlobalInstallManager, 'github-source'> | 'yarn' | 'unknown';
 
 export interface GlobalInstallPlan {
   manager: GlobalInstallManager;
-  command: GlobalInstallManager;
+  command: string;
   args: string[];
   /** Package-manager-specific environment needed to keep the update in the
    *  install location that owns the running botmux process. */
@@ -133,6 +136,10 @@ export function detectGlobalInstallManager(
   packageRoot: string,
   platform: NodeJS.Platform = process.platform,
 ): DetectedInstallManager {
+  // Managed personal-source releases are handled before package-manager
+  // classification in resolveGlobalInstallPlan. Do not let a coincidental path
+  // shape reclassify one as npm/pnpm/Bun.
+  if (managedSourceInstallAt(packageRoot)) return 'unknown';
   const root = normalized(packageRoot).toLowerCase();
   if (!root.endsWith('/node_modules/botmux')) return 'unknown';
 
@@ -166,6 +173,22 @@ export function resolveGlobalInstallPlan(
   platform: NodeJS.Platform = process.platform,
   spec = 'botmux@latest',
 ): GlobalInstallPlan {
+  const managed = managedSourceInstallAt(packageRoot);
+  if (managed) {
+    // The source installer is POSIX-only today. Fail closed on Windows instead
+    // of handing the personal install to an unrelated npm global location.
+    if (platform === 'win32') throw new UnsupportedGlobalInstallError('unknown', packageRoot);
+    const stableRoot = join(managed.prefix, 'share', 'botmux', 'current');
+    return {
+      manager: 'github-source',
+      command: 'sh',
+      args: [join(stableRoot, 'install.sh')],
+      // install.sh pins lukecc00/botmux@p/ai_open internally. Only the prefix is
+      // supplied here so the new release replaces this exact managed install.
+      env: { BOTMUX_INSTALL_PREFIX: managed.prefix },
+      activePackageRoot: stableRoot,
+    };
+  }
   const manager = detectGlobalInstallManager(packageRoot, platform);
   const path = platform === 'win32' ? win32 : posix;
 
@@ -284,6 +307,14 @@ export function resolveAutoUpdateSupport(
 
 export function isAutoUpdateSupportedInstall(): boolean {
   return resolveAutoUpdateSupport(currentUpdateStrategy(botmuxInstallRoot())).supported;
+}
+
+/** Personal source installs can update to the channel head, but the npm
+ * packument does not describe their history. Keep rollback limited to package
+ * manager installs so an old-version request can never silently install the
+ * latest personal source release instead. */
+export function isRollbackSupportedPlan(plan: GlobalInstallPlan | null): boolean {
+  return plan !== null && plan.manager !== 'github-source';
 }
 
 /** Pin an install plan to one registry. Callers opt in explicitly (rollback only). */

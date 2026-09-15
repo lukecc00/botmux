@@ -113,6 +113,8 @@ export type BotDefaultsRow = {
   usageSupported?: boolean;
   disableStreamingCard?: boolean;
   replyCardMode?: 'legacy' | 'unified';
+  /** Emit user-facing stage conclusions as standalone cards with session controls. */
+  stageConclusionCards?: boolean;
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;

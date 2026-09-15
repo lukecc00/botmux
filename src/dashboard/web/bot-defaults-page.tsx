@@ -773,6 +773,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
+    stageConclusionCards: body.stageConclusionCards,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
@@ -4290,6 +4291,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
+  const [stageConclusionCards, setStageConclusionCards] = useState(bot.stageConclusionCards === true);
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
@@ -4304,6 +4306,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
+    setStageConclusionCards(bot.stageConclusionCards === true);
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
@@ -4311,7 +4314,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
     setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.replyCardMode, bot.stageConclusionCards, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4445,6 +4448,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               }}
             />
           </div>
+          <ToggleRow
+            checked={stageConclusionCards}
+            disabled={busy !== null}
+            dataAction="toggle-stage-conclusion-cards"
+            title={tr('botDefaults.stageConclusionCards')}
+            description={tr('botDefaults.stageConclusionCardsDescription')}
+            help={tr('botDefaults.stageConclusionCardsHelp')}
+            onChange={checked => {
+              const previous = stageConclusionCards;
+              setStageConclusionCards(checked);
+              void savePatch({ stageConclusionCards: checked }, 'stage-conclusions', () => setStageConclusionCards(previous));
+            }}
+          />
           {replyMode === 'legacy' && pinToggle}
         </section>
 

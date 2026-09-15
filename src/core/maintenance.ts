@@ -657,7 +657,7 @@ function productionDeps(): MaintenanceDeps {
       fn();
     }, { maxWaitMs: 500 }),
     currentVersion: () => installPlan
-      ? botmuxVersionAt(installPlan.activePackageRoot)
+      ? diskVersionAt(installPlan.activePackageRoot)
       : botmuxVersion(),
     runUpdate: () => {
       installedTo = '';

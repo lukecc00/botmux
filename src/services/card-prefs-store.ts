@@ -63,6 +63,9 @@ export interface BotCardPrefs {
   usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
   replyCardMode: ReplyCardMode;
+  /** User-facing stage conclusions use a standalone card with Web Terminal /
+   *  stop / manage controls. Default false; hidden reasoning is never exposed. */
+  stageConclusionCards: boolean;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
@@ -130,6 +133,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
+      stageConclusionCards: c.stageConclusionCards === true,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
@@ -159,6 +163,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
       replyCardMode: 'legacy',
+      stageConclusionCards: false,
       hiddenStreamingCardButtons: [],
       pinStreamingCard: false,
       silentTurnReactions: false,
@@ -328,6 +333,7 @@ async function updateBotCardPrefsInternal(
       if (patch.replyCardMode === 'legacy') delete entry.replyCardMode;
       else entry.replyCardMode = patch.replyCardMode;
     }
+    apply(entry, 'stageConclusionCards', patch.stageConclusionCards);
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
@@ -357,6 +363,7 @@ async function updateBotCardPrefsInternal(
         usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
+        stageConclusionCards: entry.stageConclusionCards === true,
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
@@ -400,6 +407,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.replyCardMode !== undefined) {
     bot.config.replyCardMode = patch.replyCardMode === 'legacy' ? undefined : patch.replyCardMode;
+  }
+  if (patch.stageConclusionCards !== undefined) {
+    bot.config.stageConclusionCards = patch.stageConclusionCards || undefined;
   }
   if (patch.hiddenStreamingCardButtons !== undefined) {
     bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
@@ -482,6 +492,7 @@ async function updateBotCardPrefsInternal(
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `stageConclusionCards=${r.result.stageConclusionCards} ` +
     `hiddenStreamingCardButtons=${r.result.hiddenStreamingCardButtons.join(',') || '-'} ` +
     `pinStreamingCard=${r.result.pinStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +

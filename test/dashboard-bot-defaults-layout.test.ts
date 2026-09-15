@@ -155,6 +155,15 @@ describe('bot defaults focused layout', () => {
     expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.bot-defaults-page \.bd-card-button-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr;/);
   });
 
+  it('offers a per-bot switch for stage-conclusion control cards', () => {
+    expect(page).toContain('dataAction="toggle-stage-conclusion-cards"');
+    expect(page).toContain('stageConclusionCards: body.stageConclusionCards');
+    expect(page).toContain("savePatch({ stageConclusionCards: checked }, 'stage-conclusions'");
+    expect(i18n.match(/'botDefaults\.stageConclusionCards'/g)).toHaveLength(2);
+    expect(i18n).toContain('不暴露隐藏思维链');
+    expect(i18n).toContain('Off by default and configurable per bot');
+  });
+
   it('places the Feishu description editor inside the profile header main column', () => {
     const profileStart = page.indexOf('<BotProfileIdentity');
     const tabsStart = page.indexOf('<BotDefaultsTabs', profileStart);

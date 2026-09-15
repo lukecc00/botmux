@@ -136,6 +136,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
+    stageConclusionCards: j?.stageConclusionCards === true,
     hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,

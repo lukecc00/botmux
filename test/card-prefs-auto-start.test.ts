@@ -92,6 +92,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     const prefs = store.getBotCardPrefs('app_default');
     expect(prefs.pinStreamingCard).toBe(false);
     expect(prefs.replyCardMode).toBe('legacy');
+    expect(prefs.stageConclusionCards).toBe(false);
     expect(prefs.hiddenStreamingCardButtons).toEqual([]);
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
@@ -113,6 +114,22 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(readConfig()).toMatchObject({ thinkingCard: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
     await store.updateBotCardPrefs('app_default', { replyCardMode: 'legacy' });
     expect(readConfig().replyCardMode).toBeUndefined();
+  });
+
+  it('persists the opt-in stage-conclusion control-card switch', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect((await store.updateBotCardPrefs('app_default', { stageConclusionCards: true })).ok).toBe(true);
+    expect(store.getBotCardPrefs('app_default').stageConclusionCards).toBe(true);
+    expect(readConfig().stageConclusionCards).toBe(true);
+    expect(registry.getBot('app_default').config.stageConclusionCards).toBe(true);
+
+    expect((await store.updateBotCardPrefs('app_default', { stageConclusionCards: false })).ok).toBe(true);
+    expect(store.getBotCardPrefs('app_default').stageConclusionCards).toBe(false);
+    expect(readConfig().stageConclusionCards).toBeUndefined();
+    expect(registry.getBot('app_default').config.stageConclusionCards).toBeUndefined();
   });
 
   it('preserves the retired status-card opt-out until that independent switch is changed', async () => {

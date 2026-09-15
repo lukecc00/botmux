@@ -8,7 +8,9 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { replyCardMode: 'unified' }))
       .toMatchObject({ replyCardMode: 'unified', disableStreamingCard: false });
     expect(botDefaultsPayload({ larkAppId: 'app' }, {}))
-      .toMatchObject({ replyCardMode: 'legacy', disableStreamingCard: false });
+      .toMatchObject({ replyCardMode: 'legacy', disableStreamingCard: false, stageConclusionCards: false });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { stageConclusionCards: true }))
+      .toMatchObject({ stageConclusionCards: true });
   });
 
   it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
@@ -31,7 +33,7 @@ describe('dashboard bot payload helpers', () => {
       'autoboundChatCount', 'brandLabel',
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
-      'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
+      'disableStreamingCard', 'stageConclusionCards', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
       'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',

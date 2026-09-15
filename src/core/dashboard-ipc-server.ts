@@ -1885,8 +1885,8 @@ function sessionCliIpcAuth(
 }
 
 /** Return the daemon's canonical low-attention progress card without sending
- * it. `botmux send --no-mention` uses this so explicit milestone sends retain
- * the same Web Terminal / stop / manage callback chrome as commentary. */
+ * it. `botmux send --no-mention` uses this so explicit milestone sends follow
+ * the bot's stage-conclusion control-card preference. */
 ipcRoute('POST', '/api/sessions/:sessionId/progress-card', async (req, res, params) => {
   const body = await readJsonBody<{ content?: unknown } & Record<string, unknown>>(req)
     .catch(() => ({} as { content?: unknown } & Record<string, unknown>));
@@ -5588,6 +5588,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     usageSupported: cliSupportsNativeUsage(cliId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
     replyCardMode: cardPrefs.replyCardMode,
+    stageConclusionCards: cardPrefs.stageConclusionCards,
     hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
@@ -5864,7 +5865,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; stageConclusionCards?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     thinkingCardToolResult?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
@@ -5880,7 +5881,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
+    disableStreamingCard?: boolean; stageConclusionCards?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     thinkingCardToolResult?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
@@ -5899,6 +5900,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     patch.replyCardMode = body.replyCardMode;
   }
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (typeof body.stageConclusionCards === 'boolean') patch.stageConclusionCards = body.stageConclusionCards;
   if (Array.isArray(body.hiddenStreamingCardButtons)
       && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {
     patch.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(body.hiddenStreamingCardButtons) ?? [];

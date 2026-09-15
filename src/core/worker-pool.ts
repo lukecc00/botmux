@@ -2090,9 +2090,11 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   }
 }
 
-/** Original two-phase card chrome for transcript-native commentary: no owner
- * mention, plus Web Terminal / stop / manage controls. */
+/** Transcript-native user-facing commentary card. The content is always
+ * delivered; Web Terminal / stop / manage controls are added only when this
+ * bot opts in to stage-conclusion controls. */
 export function buildNativeProgressCard(ds: DaemonSession, content: string): string {
+  const controlsEnabled = getBot(ds.larkAppId).config.stageConclusionCards === true;
   const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   return buildMarkdownCard(
     content,
@@ -2103,23 +2105,25 @@ export function buildNativeProgressCard(ds: DaemonSession, content: string): str
     daemonCardLocalHomeLinkMode(ds),
     undefined,
     'footer',
-    {
-      terminalUrl: readableTerminalUrlFor(ds) || undefined,
-      stopValue: {
-        action: 'close',
-        root_id: sessionAnchorId(ds),
-        session_id: ds.session.sessionId,
-        cli_id: effectiveCliId,
-        botmux_control: 'reply_stop',
-      },
-      manageValue: {
-        action: 'manage_access',
-        root_id: sessionAnchorId(ds),
-        session_id: ds.session.sessionId,
-        cli_id: effectiveCliId,
-        botmux_control: 'reply_manage',
-      },
-    },
+    controlsEnabled
+      ? {
+          terminalUrl: readableTerminalUrlFor(ds) || undefined,
+          stopValue: {
+            action: 'close',
+            root_id: sessionAnchorId(ds),
+            session_id: ds.session.sessionId,
+            cli_id: effectiveCliId,
+            botmux_control: 'reply_stop',
+          },
+          manageValue: {
+            action: 'manage_access',
+            root_id: sessionAnchorId(ds),
+            session_id: ds.session.sessionId,
+            cli_id: effectiveCliId,
+            botmux_control: 'reply_manage',
+          },
+        }
+      : undefined,
   );
 }
 
