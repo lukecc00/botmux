@@ -1,9 +1,13 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
+import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -18,7 +22,9 @@ export interface DashboardBotDescriptor {
   cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
@@ -46,6 +52,19 @@ export function brandMapByAppId(
   }
 }
 
+/**
+ * Trigger-user CLI auth policy for the private Bot Defaults payload.
+ *
+ * A daemon that predates the field simply omits it, and an unregistered bot
+ * reports null — both mean "off", which is what the dashboard toggle renders as
+ * unchecked. A malformed value (hand-edited bots.json reaching an older daemon
+ * that echoed it verbatim) degrades to off rather than throwing: this aggregate
+ * builds every bot row, so one bad policy must not take the whole page down.
+ */
+function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
+  try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
+}
+
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
   return {
     larkAppId: bot.larkAppId,
@@ -66,7 +85,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     ...(bot.dshProfile ? { dshProfile: bot.dshProfile } : {}),
@@ -84,6 +105,13 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     displayName: typeof j?.displayName === 'string' ? j.displayName : null,
     larkBotName: typeof j?.larkBotName === 'string' ? j.larkBotName : null,
     defaultOncall: j?.defaultOncall,
+    scheduleWorkingDir: typeof j?.scheduleWorkingDir === 'string' && j.scheduleWorkingDir.trim()
+      ? j.scheduleWorkingDir
+      : null,
+    schedulePreconditionFileRoot: typeof j?.schedulePreconditionFileRoot === 'string'
+      && j.schedulePreconditionFileRoot.trim()
+      ? j.schedulePreconditionFileRoot
+      : null,
     defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     // 「仓库选择卡片」形态的工作目录。与 defaultWorkingDir 互斥（见 BotConfig）。
     // 克隆弹窗要用它判断源 Bot 是哪种目录形态，才能预填出与克隆结果一致的表单。
@@ -106,16 +134,20 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
-    disableStreamingCard: j?.disableStreamingCard === true,
+    disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
+    replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
+    hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     thinkingCard: j?.thinkingCard !== false,
+    thinkingCardToolResult: j?.thinkingCardToolResult !== false,
     senderTag: j?.senderTag !== false,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
+    quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',
@@ -160,6 +192,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Trigger-user CLI auth policy. No secrets in it — just which tools it
+    // covers and what to do when the sender has not authorized. Run through the
+    // SHARED parser so this door cannot drift from bots.json / /botconfig: a
+    // malformed hand edit degrades to null (feature off) instead of reaching
+    // form state as a half-shaped policy the toggle would misrender.
+    triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',

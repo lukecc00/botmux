@@ -14,6 +14,7 @@ import {
   buildSessionCard,
   buildStreamingCard,
   buildRepoSelectCard,
+  REPO_SELECT_CARD_MAX_BYTES,
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
@@ -472,7 +473,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(quotaEdit.text.content).toBe('Set message quota');
-    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(text).toContain('Default: grant card 3 / Oncall unmetered');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -483,7 +484,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(text).toContain(`${current} messages per person on grant cards (Oncall unmetered)`);
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -494,7 +495,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -519,7 +520,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(input.default_value).toBe('');
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
   });
 });
 
@@ -1301,6 +1302,44 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
+    it('hides selected streaming-card controls without affecting the others', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['terminal', 'writeLink', 'close'],
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+    });
+
+    it('treats output as one control group and omits empty action containers', () => {
+      const screenshot = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'screenshot',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output'],
+      ));
+      const screenshotActions = findActions(screenshot);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+
+      const allHidden = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
+      ));
+      expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
+    });
+
     it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
@@ -1712,6 +1751,99 @@ describe('buildRepoSelectCard', () => {
       const actionEl = card.elements.find((e: any) => e.tag === 'action');
       const selectStatic = actionEl.actions.find((a: any) => a.tag === 'select_static');
       expect(selectStatic.options).toHaveLength(0);
+    });
+  });
+
+  // ── Byte budget ────────────────────────────────────────────────────────
+
+  describe('byte budget', () => {
+    // A broad scan root (observed live: 1174 projects) serialized past Feishu's
+    // ~109 KB card limit, the send threw 230025, and the session was left
+    // waiting on a card that was never published.
+    function manyProjects(n: number): ProjectInfo[] {
+      const out: ProjectInfo[] = [];
+      for (let i = 0; i < n; i++) {
+        // Repos first, then worktrees — the scanner's own compareProjects order.
+        const isRepo = i < 40;
+        out.push({
+          name: `project-with-a-fairly-long-name-${i}`,
+          path: `/root/iserver/some/deep/path/project-with-a-fairly-long-name-${i}`,
+          type: isRepo ? 'repo' : 'worktree',
+          branch: isRepo ? 'main' : `botmux-wt-feature-branch-${i}`,
+        });
+      }
+      return out;
+    }
+
+    function switchOptions(card: any): any[] {
+      const actionEl = card.elements.find((e: any) => e.tag === 'action');
+      return actionEl.actions.find((a: any) => a.tag === 'select_static').options;
+    }
+
+    function noteContents(card: any): string[] {
+      return card.elements.filter((e: any) => e.tag === 'note').map((e: any) => e.elements[0].content);
+    }
+
+    it('keeps an oversized scan under the byte budget', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root');
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('stays under budget in multi-picker mode too', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'zh', true);
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('truncates the tail rather than the head, so 1-based numbering still matches lastRepoScan', () => {
+      const all = manyProjects(3000);
+      const options = switchOptions(parse(buildRepoSelectCard(all, '/root/iserver', 'om_root')));
+      expect(options.length).toBeGreaterThan(0);
+      expect(options.length).toBeLessThan(all.length);
+      // Every visible option keeps its index in the FULL list: `/repo <N>`
+      // indexes lastRepoScan, which the caller stores unsliced.
+      options.forEach((opt: any, i: number) => {
+        expect(opt.text.content).toMatch(new RegExp(`^${i + 1}\\.`));
+        expect(opt.value).toBe(all[i].path);
+      });
+    });
+
+    it('drops worktrees before repos (scanner sorts repos first)', () => {
+      const options = switchOptions(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const repoLabels = options.filter((o: any) => !o.text.content.includes('[worktree]'));
+      expect(repoLabels).toHaveLength(40);
+    });
+
+    it('adds a truncation note naming shown/total and the /repo escape hatch', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const hint = notes.find(n => n.includes('仅显示前'));
+      expect(hint).toBeDefined();
+      expect(hint).toContain('共 3000 个');
+      expect(hint).toContain('/repo <路径|项目名>');
+      // The ordinary usage note survives alongside it.
+      expect(notes.some(n => n.includes('/repo <编号>'))).toBe(true);
+    });
+
+    it('localizes the truncation note', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'en')));
+      expect(notes.some(n => n.includes('lists only the first') && n.includes('of 3000'))).toBe(true);
+    });
+
+    it('leaves a normally-sized scan untouched: every project shown, no truncation note', () => {
+      const few = manyProjects(30);
+      const card = parse(buildRepoSelectCard(few, '/root/iserver', 'om_root'));
+      expect(switchOptions(card)).toHaveLength(30);
+      expect(noteContents(card).some(n => n.includes('仅显示前'))).toBe(false);
+    });
+
+    it('still shows one option when even a single project would exceed the budget', () => {
+      const huge: ProjectInfo[] = Array.from({ length: 3 }, (_, i) => ({
+        name: 'x'.repeat(REPO_SELECT_CARD_MAX_BYTES),
+        path: `/p/${i}`,
+        type: 'repo',
+        branch: 'main',
+      }));
+      const options = switchOptions(parse(buildRepoSelectCard(huge, '/root/iserver', 'om_root')));
+      expect(options).toHaveLength(1);
     });
   });
 });

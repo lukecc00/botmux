@@ -26,6 +26,7 @@ import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
+import type { ModelFallbackState } from '../../types.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
@@ -99,6 +100,14 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Frozen TraeX backend variant selected for this session. */
+  modelBackendVariant?: string;
+  /** Claude model fallback in effect, rendered as its own notice line on the
+   *  live card. It rides this snapshot rather than a 23rd positional arg on
+   *  buildStreamingCard: every call site already forwards the snapshot (locked
+   *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
+   *  Not a usage metric, but the same class of runtime identity as `model`. */
+  modelFallback?: ModelFallbackState;
 }
 
 export interface ReplyCardFooter {
@@ -108,7 +117,7 @@ export interface ReplyCardFooter {
   element: {
     tag: 'markdown';
     element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
-    text_size: 'notation_small_v2';
+    text_size: 'notation';
     content: string;
   };
 }
@@ -164,6 +173,7 @@ function sessionControlElements(controls: MarkdownCardSessionControls | undefine
   }
   return [{ tag: 'hr' }, { tag: 'column_set', flex_mode: 'flow', horizontal_spacing: 'small', columns }];
 }
+
 
 interface LocalHomeCandidate {
   id: number;
@@ -357,20 +367,20 @@ export function normalizeLocalHomeLinks(
   return outputParts.join('');
 }
 
-/** The unconfigured footer is intentionally brand-free. */
-export const DEFAULT_BRAND_LABEL = '';
+/** Default footer brand when a bot has no custom `brandLabel` configured. */
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
- *   • `undefined` (unset)  → `null` (no signature)
+ *   • `undefined` (unset)  → the default botmux link
  *   • `''` / whitespace    → `null` (brand suppressed)
  *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
  * recipient, the whole footer (HR included) — so an empty brand reads clean.
  */
 export function brandFooterSegment(brand: string | undefined): string | null {
-  if (brand === undefined) return null;
+  if (brand === undefined) return DEFAULT_BRAND_LABEL;
   const normalized = brand
     .trim()
     .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
@@ -530,7 +540,7 @@ export function cardUsageFooterSegment(
 }
 
 /** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
+ * {@link cardUsageFooterSegment}'s metric text. Returns `**model** variant · effort`
  * (model bolded within the shared grey markdown) or null when there is no model.
  * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
  * standalone runtime-only row when native usage is unavailable. The
@@ -546,8 +556,95 @@ export function cardUsageRuntimeSegment(
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
   const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
   if (!model) return null;
+  const variant = usage.modelBackendVariant === 'standard'
+    ? 'Standard'
+    : usage.modelBackendVariant === 'max'
+      ? 'Max'
+      : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
+  const tail = [variant, reasoningEffort].filter(Boolean);
+  return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
+}
+
+/** Friendly Claude model name for card copy: `claude-fable-5-1[1m]` → `Fable 5.1`,
+ *  `claude-opus-5` → `Opus 5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`.
+ *  Anything that is not a recognised `claude-<family>-<major>[-<minor>][-<date>]`
+ *  id keeps its raw form.
+ *
+ *  The minor is capped at TWO digits on purpose. Date-suffixed ids without a
+ *  minor (`claude-opus-4-20250514`) otherwise let the minor group swallow the
+ *  date and render "Opus 4.20250514"; with the cap the regex backtracks into
+ *  the date branch and the id reads as plain "Opus 4". No real Claude minor has
+ *  ever been longer than two digits. */
+function claudeModelLabel(id: string): string {
+  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
+  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{6,})?$/i.exec(bare);
+  if (!m) return id.trim();
+  const family = m[1].toLowerCase();
+  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
+}
+
+/** Escape markdown control characters without the non-breaking-space rewrite
+ *  compactRuntimeLabel applies — this notice is prose, not a compact tail. */
+function escapeCardPlainText(value: string): string {
+  return value.replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`);
+}
+
+const MODEL_FALLBACK_LABEL_MAX = 32;
+/** Tighter than the model cap: `trigger` / `apiRefusalCategory` are raw
+ *  provider strings that ride in parentheses at the end of an already-full
+ *  line, and unlike a model id nothing about them is worth more than a glance.
+ *  Real values (`overloaded`, `model_not_found`, `cyber`) fit easily. */
+const MODEL_FALLBACK_REASON_MAX = 24;
+
+/** Bound one transcript-derived token of the notice and force it onto ONE line.
+ *  Every token here comes from Claude's own record, so it can carry newlines,
+ *  control characters or an arbitrarily long `/model` alias — any of which
+ *  would break the single-line footnote the notice is. Real values are well
+ *  under the caps (the longest Claude id, `claude-haiku-4-5-20251001`, is 25
+ *  chars), so this only ever bites a pathological value. */
+function compactNoticeToken(value: string, maxLength: number): string {
+  const normalized = value
+    // C0/C1 controls (newlines included) plus the Unicode line/paragraph
+    // separators, flattened to a space before whitespace is collapsed.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}\u2026`
+    : normalized;
+  return escapeCardPlainText(compact);
+}
+
+function fallbackModelText(id: string): string {
+  return compactNoticeToken(claudeModelLabel(id), MODEL_FALLBACK_LABEL_MAX);
+}
+
+/** One-line notice for a model fallback still in effect, or null when there is
+ *  none. Only the model ids and the reason are rendered — Claude's own record
+ *  carries a full paragraph of prose, which would swamp a status line. */
+export function cardModelFallbackNotice(
+  fallback: ModelFallbackState | undefined,
+  locale?: Locale,
+): string | null {
+  if (!fallback?.originalModel || !fallback.fallbackModel) return null;
+  const rawReason = fallback.kind === 'refusal'
+    ? fallback.apiRefusalCategory
+    : fallback.kind === 'unavailable' ? fallback.trigger : undefined;
+  // The reason is a raw provider string straight out of the transcript, so it
+  // gets the same one-line + bounded + escaped treatment as the model labels;
+  // a multi-line or novel-length trigger would otherwise wreck the footnote.
+  const compactReason = rawReason
+    ? compactNoticeToken(rawReason, MODEL_FALLBACK_REASON_MAX)
+    : '';
+  const reason = compactReason
+    ? t('card.model_fallback.reason', { reason: compactReason }, locale)
+    : t('card.model_fallback.no_reason', undefined, locale);
+  return t(`card.model_fallback.${fallback.kind}`, {
+    originalModel: fallbackModelText(fallback.originalModel),
+    fallbackModel: fallbackModelText(fallback.fallbackModel),
+    reason,
+  }, locale);
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.
@@ -577,23 +674,27 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  // The marker is a visible, versioned link that lets the parser identify a
-  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
-  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
-  // common case now that usageDisplay defaults to the streaming card body and
-  // the reply-card footer is context-only) needs no marker: appending it renders
-  // a dangling separator. A custom brand-only footer is plain link text with
-  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
-  // ownership marker. Any footer carrying usage or a recipient is still signed.
+  // The marker lets the parser identify a card's footer (and strip it before a
+  // bot-to-bot relay). Keep it as invisible text beside the first ordinary
+  // separator: a Markdown-link marker makes Lark render the separator dot as a
+  // clickable Botmux website link. But a BRAND-ONLY footer (no usage or
+  // recipient — the common case now that usageDisplay defaults to the streaming
+  // card body and the reply-card footer is context-only) needs no marker:
+  // appending it renders a dangling "botmux ·". The default/repository brand is
+  // plain link text with no mention, so it cannot trigger bot-to-bot pollution
+  // and does not need the ownership marker (the parser already treats a bare
+  // repo link as ordinary content, matching the long-standing "brand-only is
+  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // is still signed.
   const signMarker = hasUsage || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
   } else if (parts.length > 1) {
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+    signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
     // usage-only / recipient-only (brand disabled) — still marked for parsing.
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+    signedContent = `${parts[0]}${REPLY_CARD_FOOTER_MARKER}`;
   }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {
@@ -601,7 +702,7 @@ export function buildReplyCardFooter(opts: {
     element: {
       tag: 'markdown',
       element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content,
     },
   };
@@ -833,6 +934,7 @@ export function buildCardBodyElements(
   input: string,
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode = 'fit_horizontal',
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
@@ -844,8 +946,9 @@ export function buildCardBodyElements(
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
   const layoutBudget = { promotedHeadings: 0 };
-  for (const seg of splitImageRowSegments(input)) {
+  for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
+    else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
     else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
@@ -955,9 +1058,30 @@ function buildMarkdownElements(
   return elements;
 }
 
-/** A single uploaded image rendered full-width (legacy single-image look). */
+// Existing multi-image rows retain their legacy payload for compatibility.
 function singleImgElement(imgKey: string): any {
   return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/** Botmux width presets, not Feishu's square/cropping `size` presets. */
+function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const img = {
+    tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
+    scale_type: 'fit_horizontal', preview: true,
+  };
+  const columnCounts: Record<string, number> = { medium: 2, small: 3, tiny: 4 };
+  const count = columnCounts[mode];
+  if (!count) return img;
+  // Feishu normalizes unequal weights to 1. Use N equal columns instead:
+  // one image and N-1 empty columns. `none` preserves the fraction on narrow
+  // screens; fit_horizontal keeps the entire image without a fixed height.
+  return {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
+    columns: Array.from({ length: count }, (_, index) => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: index === 0 ? [img] : [],
+    })),
+  };
 }
 
 /**
@@ -1002,14 +1126,14 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
-type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
+type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**
  * Split a markdown body into segments, pulling out lines that consist solely of
  * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
  * inside ``` / ~~~ code blocks are never treated as image rows.
  */
-function splitImageRowSegments(input: string): BodySegment[] {
+function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): BodySegment[] {
   const segs: BodySegment[] = [];
   let buf: string[] = [];
   const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
@@ -1033,6 +1157,16 @@ function splitImageRowSegments(input: string): BodySegment[] {
       }
       buf.push(line);
       continue;
+    }
+    // Only promote standalone images for an explicit size override. Keep the
+    // legacy Markdown output, inline prose, code blocks, and image grids intact.
+    if (!fenceChar && imageMode !== 'fit_horizontal') {
+      const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
+      if (single && FEISHU_IMG_KEY.test(single[2])) {
+        flush();
+        segs.push({ type: 'img', key: single[2], alt: single[1] });
+        continue;
+      }
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
@@ -1064,14 +1198,17 @@ function splitImageRowSegments(input: string): BodySegment[] {
  * pre-pass turns multi-image lines into the actual `column_set` rows. This keeps
  * one rendering path: a caller that embeds `![](img_key)` directly and puts two
  * on a line (e.g. the menu poster) gets the same grid without using `--images`.
+ * `imageMode` overrides standalone single images only; inline Markdown images
+ * and side-by-side rows retain their existing layout.
  */
 export function buildImageCardElements(
   md: string,
   imageKeys: string[],
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode?: string,
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1102,7 +1239,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
 }
 
 /**
@@ -1137,9 +1274,9 @@ export function hasMarkdown(text: string): boolean {
  * addressing line (e.g. top-level broadcasts have no specific recipient).
  *
  * `brand` is the sending bot's configured `brandLabel` (see
- * {@link brandFooterSegment}): unset/`''` → no product brand, else custom.
- * When brand, usage, and recipient are all absent the whole footer (HR
- * included) is omitted.
+ * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
+ * suppressed, else custom. When brand, usage, and recipient are all absent the
+ * whole footer (HR included) is omitted.
  */
 export function buildMarkdownCard(
   md: string,

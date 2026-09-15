@@ -239,6 +239,8 @@ async function runNodeImpl(
     ...(req.chatBinding?.ownerOpenId ? { ownerOpenId: req.chatBinding.ownerOpenId } : {}),
     workingDir: cwd,
     cliId: req.botSnapshot.cliId,
+    cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
+    cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
     // Workflow workers require CLI bypass permissions by product contract.
@@ -264,6 +266,7 @@ async function runNodeImpl(
     let manifestCandidate: { size: number; mtimeMs: number; firstSeenMs: number } | undefined;
     let webPort: number | undefined;
     let token: string | undefined;
+    let viewToken: string | undefined;
     let cancelRequested = false;
     let initSent = false;
     let goalSent = false;
@@ -279,6 +282,7 @@ async function runNodeImpl(
         sessionId,
         ...(webPort !== undefined ? { webPort } : {}),
         ...(token ? { token } : {}),
+        ...(viewToken ? { viewToken } : {}),
       };
     }
 
@@ -405,6 +409,7 @@ async function runNodeImpl(
         case 'ready':
           webPort = event.port;
           token = event.token;
+          viewToken = event.viewToken;
           notifySessionReady();
           try {
             sendInit();

@@ -280,6 +280,23 @@ export interface Session {
   /** This chat-scoped automation deliberately has no topic seed. Prevents the
    *  chat-mode conversion guard from treating chatId as a replyable message id. */
   externalTriggerTopicless?: boolean;
+  /** Session created by `botmux headless`: no Lark chat is bound until an
+   *  explicit publish/bind command provides one. The synthetic chat/root ids
+   *  keep the existing session store and worker lifecycle reusable while every
+   *  Lark-facing path can fail closed through larkTransportEnabled(). */
+  headless?: {
+    id: string;
+    createdAt: string;
+    source: 'cli';
+    latestTriggerId?: string;
+    lastRunAt?: string;
+    lastPublishedAt?: string;
+    lastPublishedMessageId?: string;
+    boundAt?: string;
+    boundChatId?: string;
+    boundRootMessageId?: string;
+    boundScope?: 'thread' | 'chat';
+  };
   /** A silent `executionPosition='new-topic'` schedule starts without a Lark
    *  root message. `routingAnchor` is the durable daemon-internal identity for
    *  that one run; the first successful `botmux send` materializes a real root
@@ -314,6 +331,43 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /**
+   * Crash-safe host-owned state for a human message that arrived while another
+   * human's interactive turn owned this session.  The message is deliberately
+   * kept outside the CLI transcript until the proposer classifies it and, for
+   * advice, the exact original owner approves it.
+   *
+   * This record may contain only the inbound/public message envelope.  Hidden
+   * CLI transcript or tool output must never be copied into it or into an
+   * independently-created session.
+   */
+  crossPrincipalInterruptions?: CrossPrincipalInterruption[];
+  /**
+   * Narrow XPI fallback coordination for an independent child that could not
+   * obtain an isolated worktree and therefore shares its source session's cwd.
+   *
+   * This is NOT a physical-directory mutex and does NOT cover other writers to
+   * the same cwd: trigger/API sessions, scheduled tasks, document-comment
+   * sessions, or Dashboard/command-created work. Those entrances need their own
+   * product-level wait/reject/queue policy before they can join one common lock.
+   */
+  xpiSharedCwdAdmissionGroupId?: string;
+  /** Stable session row that owns this narrow XPI group's durable admission lease. */
+  xpiSharedCwdAdmissionCoordinatorSessionId?: string;
+  /** Present only on the coordinator row. Route/principal authority has a
+   * separate lifecycle and must never be released through this field. */
+  xpiSharedCwdAdmissionLease?: XpiSharedCwdAdmissionLease;
+  /** Crash-safe FIFO for turns admitted through an explicitly grouped XPI
+   * source/child session. Items remain on their own session row. */
+  xpiSharedCwdQueuedTurns?: XpiSharedCwdQueuedTurn[];
+  /** Durable owner-visible terminal notices for an in-flight grouped turn whose
+   * outcome became unknowable across a daemon restart. These records are not
+   * runnable queue items and are removed only after the notice is delivered. */
+  xpiSharedCwdDispatchUnknownNotices?: XpiSharedCwdDispatchUnknownNotice[];
+  /** Recovery containment for one malformed legacy XPI row or one ambiguous
+   * narrow admission group. Quarantined rows are skipped while other sessions
+   * restore normally. */
+  xpiSharedCwdQuarantine?: XpiSharedCwdQuarantine;
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
@@ -389,6 +443,12 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Last input from a HUMAN sender (senderType 'user', not a peer bot)
+   *  routed into this session. Unlike `lastMessageAt` it ignores bot turns
+   *  and scheduled fires, so `schedule add --follow-active` can pick the
+   *  topic where a person most recently spoke without being dragged along by
+   *  a bot's own output. */
+  lastHumanMessageAt?: string;
   closedAt?: string;
   /** Last cumulative token usage persisted at close time. Dashboard list
    *  reads this durable snapshot without rescanning historical transcripts. */
@@ -598,6 +658,10 @@ export interface Session {
   currentImageKey?: string;
   currentTurnTitle?: string;
   usageLimit?: CliUsageLimitState;
+  /** Model fallback in effect. Persisted alongside usageLimit because the
+   *  worker's baseline cursors to EOF after a restart — the switch record is
+   *  already history by then and would never be drained again. */
+  modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -666,6 +730,9 @@ export interface Session {
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
+  /** Durable account-directory routing, independent of the live bot defaults. */
+  cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  creationSource?: import('./services/codex-instance-pool.js').SessionCreationSource;
   /** Concrete CLI distribution frozen with cliId. New sessions carry this
    * structured snapshot while cliPathOverride remains shadow-written for
    * downgrade compatibility with older botmux builds. */
@@ -686,9 +753,14 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** Group defaults at topic creation; absent on legacy sessions. */
+  groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Optional TraeX backend variant frozen when this session first launches.
+   * Missing preserves the historical inherit-from-TraeX-global behavior. */
+  modelBackendVariant?: 'standard' | 'max';
   /**
    * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
@@ -823,6 +895,104 @@ export interface Session {
   };
 }
 
+export interface CrossPrincipalInterruptionMessage {
+  turnId: string;
+  text: string;
+  userPrompt: string;
+  createdAt: string;
+  proposerName?: string;
+  replyRootId?: string;
+  inThread?: boolean;
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+}
+
+export interface CrossPrincipalInterruption {
+  version: 1;
+  /** Stable identity used by restart-safe host asks and Lark send UUIDs. */
+  id: string;
+  ownerTurnId: string;
+  owner: TrustedCaller;
+  proposer: TrustedCaller;
+  phase:
+    | 'awaiting_classification'
+    | 'awaiting_owner'
+    | 'owner_approved'
+    | 'preparing_independent'
+    | 'independent_queued';
+  /** Legacy field retained for restore compatibility. New records start the
+   *  classification clock only after the classification card is delivered. */
+  classificationDeadlineAt?: number;
+  /** Separate bound for waiting until the active owner turn finishes. This is
+   *  not the owner's confirmation timeout. */
+  ownerWaitDeadlineAt?: number;
+  /** Increments whenever the proposer elects to continue waiting, giving every
+   *  recovery ask its own restart-safe request identity. */
+  waitDecisionRound?: number;
+  /** Legacy field retained for restore compatibility. New owner-confirmation
+   *  clocks are owned by the ask broker and start after card delivery. */
+  ownerDeadlineAt?: number;
+  messages: CrossPrincipalInterruptionMessage[];
+  independentRootMessageId?: string;
+  independentChildSessionId?: string;
+  independentWorkingDir?: string;
+  /** Present only when this XPI independent child fell back to the source cwd.
+   * It does not claim that non-XPI writers to the same directory participate. */
+  xpiSharedCwdAdmissionGroupId?: string;
+}
+
+export interface XpiSharedCwdAdmissionLease {
+  version: 1;
+  groupId: string;
+  holderSessionId: string;
+  turnId: string;
+  workerGeneration: number;
+  acquiredAt: string;
+}
+
+export interface XpiSharedCwdQueuedTurn {
+  version: 1;
+  id: string;
+  turnId: string;
+  caller: TrustedCaller;
+  userPrompt: string;
+  cliInput: CliTurnPayload;
+  createdAt: string;
+  resume: boolean;
+  /** `attempting` is the durable commit-unknown barrier written before worker
+   * IPC/fork. Omitted legacy values are interpreted as `queued`. */
+  dispatchState?: 'queued' | 'attempting';
+}
+
+export interface XpiSharedCwdDispatchUnknownNotice {
+  version: 1;
+  id: string;
+  turnId: string;
+  caller: TrustedCaller;
+  detectedAt: string;
+  noticePending: true;
+}
+
+export interface XpiSharedCwdQuarantine {
+  version: 1;
+  scope: 'session' | 'group';
+  reason:
+    | 'stale_legacy_xpi_record'
+    | 'authority_without_group'
+    | 'conflicting_coordinators'
+    | 'coordinator_missing'
+    | 'malformed_queue'
+    | 'lease_outside_coordinator'
+    | 'ambiguous_lease'
+    | 'inflight_lease_after_restart'
+    | 'restore_quarantined_member'
+    | 'close_migration_unproven'
+    | 'recovery_persistence_failure';
+  detail: string;
+  detectedAt: string;
+  noticePending: boolean;
+}
+
 export interface SessionCliLaunchSnapshotV1 {
   version: 1;
   state: 'pending' | 'resolved';
@@ -833,6 +1003,8 @@ export interface SessionCliLaunchSnapshotV1 {
   wrapperCli: string | null;
   model: string | null;
   reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null;
+  /** Omitted by historical snapshots; null means this /cli choice inherits. */
+  modelBackendVariant?: 'standard' | 'max' | null;
   launchShell: string | null;
   startupCommands: string[];
 }
@@ -929,6 +1101,10 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
+   *  never stored in this sandbox-writable task row. Absence does not prove
+   *  that no condition exists: runtime always checks the sidecar by task id. */
+  preconditionRef?: string;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;
@@ -936,7 +1112,12 @@ export interface ScheduledTask {
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
+  /** Primary execution chat retained for backward compatibility. For a
+   *  multi-chat task this is always the first entry of `chatIds`. */
   chatId: string;
+  /** All execution chats in deterministic dispatch order. Persisted only
+   *  when more than one chat is configured; absent means `[chatId]`. */
+  chatIds?: string[];
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
@@ -985,7 +1166,7 @@ export interface ScheduledTask {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
@@ -1004,6 +1185,50 @@ export interface ScheduledTask {
    *  and fresh-topic schedules; a silent fresh topic is created lazily by the
    *  first successful `botmux send`. */
   silent?: boolean;
+  /** `--follow-active`: resolve the target topic at fire time instead of
+   *  pinning one at creation. `rootMessageId` records the last landing point
+   *  (the creation topic until the first fire). Each fire: (1) that topic is
+   *  still open (an active session exists under its root, any bot) AND a
+   *  human has spoken in it → fire there; (2) otherwise → the thread-scope
+   *  session in `chatId` whose `lastHumanMessageAt` is newest, looked up
+   *  across every bot's session store because "where the person is" is a
+   *  property of the person, not of the bot that owns the task (this lands
+   *  inside the person's live session, so the task's own workingDir does not
+   *  apply there); (3) no human-active topic anywhere but the landing point
+   *  is still open (bot-only, e.g. the fresh topic this task opened) → stay;
+   *  (4) nothing open → this fire opens a fresh top-level topic, which then
+   *  becomes the landing point. Only meaningful with executionPosition
+   *  'topic'. */
+  followActive?: boolean;
+  /** Per-task CLI model, overriding the bot's configured one for this task's
+   *  own runs (e.g. a cheap model for a 30m sentinel next to a strong one for
+   *  the nightly review, on ONE bot).
+   *
+   *  Same fresh-spawn-only semantics as the trigger API's `options.model`, and
+   *  for the same physical reason: the model is a CLI **process launch**
+   *  argument, so only a fire that spawns a worker can apply it. A fire that
+   *  injects into the task's existing session keeps whatever that process
+   *  started with. In practice: `new-topic` tasks apply it on every run;
+   *  `topic` / `top-level` tasks apply it on the run that creates their
+   *  session and then keep it. Creation surfaces say so out loud rather than
+   *  letting the difference be discovered at fire time.
+   *
+   *  Gated at fire time on the bot's CLI actually supporting the override
+   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
+   *  warning, never a skipped run.
+   *
+   *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
+   *  session record, so a daemon restart drops it: a `topic` / `top-level` task
+   *  whose session survives the restart re-forks on the bot's model. Persisting
+   *  it is not the fix — a stored session model outranks the bot's configured one
+   *  forever, which is the bug `resolveSessionLaunchModel` exists to undo. Same
+   *  behavior as the trigger API's per-turn model. */
+  model?: string;
+  /** Per-task reasoning effort, same override + fresh-spawn-only semantics as
+   *  `model`. Dropped at fire time when the resolved model does not offer the
+   *  level (`cliModelSupportsReasoningEffort`), mirroring what sessionAgentConfig
+   *  already does to a session-level effort. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -1137,11 +1362,18 @@ export interface CliTurnPayload {
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
+  /** Daemon-authenticated stable task/session controller. This is transport
+   * authority metadata, never supplied by an IM client or model. */
+  trustedController?: TrustedCaller;
   /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
    * ONCE by the daemon at admission (real human interactive turn only) and COPIED
    * verbatim into every opening/queued/fork/restore path — never re-inferred
    * downstream, never derived from the delivery sink. Absent ⇒ forced serial. */
   codexAppSteerable?: true;
+  /** Daemon-authenticated public ingress facts retained only so a worker's
+   * deterministic pre-admission principal rejection can be durably rerouted.
+   * Never contains CLI transcript or tool output. */
+  rerouteEnvelope?: CrossPrincipalInterruptionMessage;
 }
 
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
@@ -1164,6 +1396,11 @@ export interface PendingRepoSetup {
   rawInput?: string;
   turnId?: string;
   baseDir?: string;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
+  targetSubdir?: string;
   repoCardMessageId?: string;
   codexAppText?: string;
   codexAppApplicationContext?: string;
@@ -1176,20 +1413,20 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch }
+  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -1270,18 +1507,67 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy }
+    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
     : Message
   : never;
 
 /** One node of the native CoT (thinking process) message, in transcript
- *  order. `thinking` renders as a reasoning paragraph; `tool_call` /
- *  `tool_result` render as the tool timeline (icon + args + result). The
- *  worker truncates args/results before shipping. */
+ *  order. `thinking` (the model's private reasoning) and `text` (the interim
+ *  narration it writes between tool calls) both render as reasoning
+ *  paragraphs; `tool_call` / `tool_result` render as the tool timeline
+ *  (icon + args + result). The worker truncates args/results before shipping.
+ *
+ *  `thinking` and `text` stay SEPARATE kinds even though today's renderer
+ *  treats them alike: only their distinction lets the bubble tell「模型在想」
+ *  from「模型在说」, and the placeholder logic keys off a turn having neither
+ *  at its head. Extended thinking is off by default on Claude Code, so a
+ *  plain turn ships `text` + tools and no `thinking` at all. */
 export type CotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  /** Assistant narration addressed to the user, mid-turn. Not reasoning —
+   *  it is the running commentary a long agentic turn writes between tool
+   *  calls, dropped from the final reply card by `trailingAssistantText`. */
+  | { kind: 'text'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 转写层从**未截断**的完整 input 提取的单行主题（command / file_path /
+     *  …），气泡工具节点标题的首选载体：args 会被截到 600 字符，长命令 /
+     *  大 content 的 Write 一截就解析不出主题。缺省时（旧世代 worker）渲染层
+     *  回退解析 args。已折叠为单行、≤1000 字符（超长带 `…`）。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
+
+/** A Claude model switch that is still in effect: Claude Code fell back off the
+ *  configured model and every later reply is served by `fallbackModel` until the
+ *  user runs `/model` to switch back. Observed by the worker from the session
+ *  transcript, persisted on the Session, and rendered as one notice line on the
+ *  live card. */
+export interface ModelFallbackState {
+  /** uuid of the transcript record that caused the switch — the stable key for
+   *  dedupe and for "is this still the same switch". */
+  uuid: string;
+  /** 'refusal' = safety guardrails, 'unavailable' = model not usable,
+   *  'consent' = quota/billing confirmation. */
+  kind: 'refusal' | 'unavailable' | 'consent';
+  /** Configured model, as written in the transcript (e.g. `claude-fable-5-1[1m]`). */
+  originalModel: string;
+  /** Model now serving the session (e.g. `claude-opus-4-8[1m]`). */
+  fallbackModel: string;
+  /** Raw reason for a non-refusal switch: `overloaded`, `model_not_found`, … */
+  trigger?: string;
+  /** Refusal category (`cyber`, `bio`, …). */
+  apiRefusalCategory?: string;
+  observedAt?: string;
+  /** Claude session (transcript jsonl basename) this switch happened in. The
+   *  notice is per Claude conversation, not per botmux session: `/repo`,
+   *  `/adopt` and a resume onto another native session all replace it, and a
+   *  record carried across that boundary is either a warning about a
+   *  conversation the user is no longer having or one nothing can ever clear.
+   *  Absent on state persisted by builds that predate the binding; the next
+   *  worker's mandatory seed re-establishes it. */
+  claudeSessionId?: string;
+}
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
@@ -1312,7 +1598,7 @@ export type WorkerToDaemon =
   | { type: 'turn_input_received'; turnId: string }
   /** The worker received an ordinary turn but could not place it into its CLI
    * input queue. This is safe to retry within the same worker generation. */
-  | { type: 'turn_input_rejected'; turnId: string; reason: string }
+  | { type: 'turn_input_rejected'; turnId: string; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */
@@ -1338,6 +1624,25 @@ export type WorkerToDaemon =
       type: 'active_runtime';
       model: string | null;
       reasoningEffort: string | null;
+    }
+  /** OBSERVED FACTS about Claude Code's automatic model switching — never a
+   * decision. `claudeSessionId` (always present) says WHICH Claude conversation
+   * they are about; `fallback` is a `scope:"session"` switch record this worker
+   * had not reported yet, or `null` when the newest such record is positive
+   * evidence that no notice applies (a non-Fable original, or one a fork
+   * neutralised); `servingModel` is the model serving the MAIN thread, sent
+   * whenever it changed since the worker's last report — it also drives the
+   * card's usage line, because Claude never emits `active_runtime`. The daemon
+   * holds the state and merges: a message from a different Claude session drops
+   * what it held first, a new record replaces, `fallback: null` clears, and a
+   * serving model different from the held `fallbackModel` clears. An ABSENT
+   * field means "nothing new observed" — a worker restart or a too-short
+   * transcript window must never read as "cleared". */
+  | {
+      type: 'model_fallback';
+      claudeSessionId: string;
+      fallback?: ModelFallbackState | null;
+      servingModel?: string;
     }
   | { type: 'native_session_title_generated'; title: string }
   | {
@@ -1426,12 +1731,12 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
    * has already published a fresh token. */
-  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   | {
       type: 'codex_app_dispatch_transition';
       sessionId: string;
@@ -1478,6 +1783,15 @@ export type WorkerToDaemon =
         generation: string;
         seq: number;
         dispatchId: string;
+        /** Real completion instant / native execution span for the terminal the
+         *  daemon synthesizes from this settlement. The daemon persists that
+         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+         *  these the durable path would durably win with a timing-less row and
+         *  permanently mask the worker's real numbers. Same optional-means-
+         *  unknown contract as `turn_terminal`. */
+        completedAtMs?: number;
+        durationMs?: number;
       };
       /** The model already delivered through botmux send; settle without fallback output. */
       suppressDelivery?: boolean;
@@ -1523,6 +1837,18 @@ export type WorkerToDaemon =
        *  emits `completed` with no final_output after fs-lag and must NOT be
        *  read as silence (that would mask a real, still-arriving answer). */
       outputDisposition?: 'nothing_to_send';
+      /** Wall-clock epoch ms at which the CLI turn actually reached its native
+       *  terminal. Absent when the emitter cannot vouch for a real instant, in
+       *  which case the recorder falls back to its own write time (which is NOT
+       *  the completion time — that fallback is exactly why this field exists). */
+      completedAtMs?: number;
+      /** True native execution time: from the moment this turn's input was
+       *  literally written to the CLI, to `completedAtMs`. Deliberately excludes
+       *  daemon/worker queueing before the write, so it measures the CLI, not the
+       *  backlog. Omitted (never guessed, never zero-filled) whenever the start
+       *  instant is unknown — an absent duration is honest, a fabricated one is
+       *  not. Always a non-negative integer when present. */
+      durationMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

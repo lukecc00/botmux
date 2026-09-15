@@ -54,6 +54,10 @@ export interface FsPolicy {
    *  merge (fail-closed). Empty/absent otherwise. The worker LOGS these so a
    *  silently-suppressed grant is diagnosable (codex: "至少要记录被抑制项"). */
   suppressedAuthorityPaths?: string[];
+  /** Caller allow paths suppressed because they fall inside a daemon-owned
+   *  host-only root. Unlike ordinary mandatory denies, these roots permit no
+   *  deeper carve-out: a sandbox must never read or mutate their contents. */
+  suppressedHostOnlyPaths?: string[];
 }
 
 export interface FsPolicyUserPaths {
@@ -114,6 +118,9 @@ export interface FsPolicyContext {
   serviceCredentialReadOnlyPaths?: readonly string[];
   /** Host-owned boundaries that user policy may not override. */
   mandatoryDenyPaths?: readonly string[];
+  /** Host-only authority roots. Every allow path at or below one of these is
+   *  suppressed before longest-prefix merging, then the root is denied. */
+  hostOnlyDenyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
   mandatoryReadOnlyPaths?: readonly string[];
   net?: boolean;
@@ -433,7 +440,11 @@ function linuxBaseline(h: string): FsRule[] {
  * fail-closed, never fail-open (codex P1). Carries `.kind` so callers/tests can
  * branch without string-matching the message. */
 export class FsPolicyConfigError extends Error {
-  readonly kind: 'external-bots-config' | 'working-dir-is-authority' | 'bots-config-in-carveout';
+  readonly kind:
+    | 'external-bots-config'
+    | 'working-dir-is-authority'
+    | 'working-dir-is-host-only'
+    | 'bots-config-in-carveout';
   constructor(kind: FsPolicyConfigError['kind'], message: string) {
     super(message);
     this.name = 'FsPolicyConfigError';
@@ -617,9 +628,30 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
+  const hostOnlyRoots = (ctx.hostOnlyDenyPaths ?? [])
+    .map(normalizeFsPath)
+    .filter((p): p is string => p !== null);
+  const suppressedHostOnlyPaths: string[] = [];
+  const insideHostOnlyRoot = (p: string): boolean => hostOnlyRoots.some(root => coversPath(root, p));
   const push = (paths: readonly string[] | undefined, access: FsAccess, source: FsRuleSource) => {
-    for (const p of paths ?? []) candidates.push({ path: p, access, source });
+    for (const p of paths ?? []) {
+      const normalized = normalizeFsPath(p);
+      if (access !== 'deny' && normalized && insideHostOnlyRoot(normalized)) {
+        suppressedHostOnlyPaths.push(normalized);
+        continue;
+      }
+      candidates.push({ path: p, access, source });
+    }
   };
+
+  const hostOnlyWorkingDir = normalizeFsPath(ctx.workingDir);
+  if (hostOnlyWorkingDir && insideHostOnlyRoot(hostOnlyWorkingDir)) {
+    throw new FsPolicyConfigError(
+      'working-dir-is-host-only',
+      `sandbox refuses workingDir ${hostOnlyWorkingDir}: it is inside daemon-owned host-only root `
+      + `${hostOnlyRoots.join(', ')}`,
+    );
+  }
 
   // No-Lark-transport credential profile: a core-only (apiOnly) bot or HTTP
   // virtual session must never be handed any Feishu credential, even under a
@@ -692,7 +724,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Hoisted into a named const (vs the upstream inline `candidates.push(...)`)
   // because roleLibAccess() below inspects baseline's DENY entries.
   const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
-  candidates.push(...baseline);
+  for (const rule of baseline) push([rule.path], rule.access, rule.source);
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
@@ -803,6 +835,31 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
+  // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
+  // `cli-identity/<sessionId>.<tool>.env` on every invocation, so a sandboxed
+  // session needs to READ exactly those files plus the wrapper scripts.
+  //
+  // Granted per file/dir, never the `cli-identity/` parent: that directory holds
+  // every concurrent session's files, each with a live user token belonging to a
+  // different person. A parent grant would let one session read another's — the
+  // exact cross-person leak this feature exists to prevent — and it would fail
+  // OPEN for sessions created after spawn.
+  //
+  // Read-only by construction: the daemon writes these, the CLI must never be
+  // able to. Writable would let an agent publish its own identity and act as
+  // anyone whose token it could name.
+  if (ctx.sessionId && larkTransport) {
+    push([
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
+      // The turn the CLI is currently executing. The wrapper compares it against
+      // the turn stamped on the identity and refuses on a mismatch, so without
+      // this grant a sandboxed session reads nothing and every governed command
+      // fails — the deny is safe, but it is not the behavior we want.
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.turn`,
+    ], 'readOnly', 'internal');
+  }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
   if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
@@ -910,7 +967,20 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
   push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
+  push(hostOnlyRoots, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
+
+  // Seatbelt re-emits these paths after every ordinary rule so they can carve
+  // a narrow read-only exception out of a broader deny. Never carry a path
+  // inside a host-only root into that final pass, or it would undo the
+  // daemon-owned boundary that `push()` enforced above.
+  const finalReadOnlyPaths = [
+    ...serviceCredentialReadOnlyPaths,
+    ...(ctx.mandatoryReadOnlyPaths ?? []),
+  ].filter((path) => {
+    const normalized = normalizeFsPath(path);
+    return !normalized || !insideHostOnlyRoot(normalized);
+  });
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
   // fix). We DENY THE WHOLE authority ROOT(s) — not exact credential files, which
@@ -986,12 +1056,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    finalReadOnlyPaths: [
-      ...serviceCredentialReadOnlyPaths,
-      ...(ctx.mandatoryReadOnlyPaths ?? []),
-    ],
+    finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
+      : undefined,
+    suppressedHostOnlyPaths: suppressedHostOnlyPaths.length
+      ? [...new Set(suppressedHostOnlyPaths)].sort()
       : undefined,
   };
 }

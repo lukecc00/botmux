@@ -95,9 +95,8 @@ export class FeishuLoginManager {
   private async run(): Promise<void> {
     try {
       const result = await this.prepareSession({
-        // 用户主动点的是“扫码刷新登录态”。必须跳过可能仍能访问 ask.feishu.cn、
-        // 但已经被开放平台 console 判定登出的旧 cookie；否则会直接复用缓存并报告
-        // success，随后资料读取仍返回 4101，形成无二维码的重试循环。
+        // 这是用户明确点击的「扫码刷新登录态」。若继续复用粗检通过但
+        // console 已拒绝的旧 cookie，会「假成功 → 自动重试 → 再失败」死循环。
         forceQrLogin: true,
         maxWaitMs: this.maxWaitMs,
         onQrCode: ({ qrPayload }) => {

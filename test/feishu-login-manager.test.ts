@@ -33,6 +33,8 @@ describe('FeishuLoginManager', () => {
     expect(started.status).toBe('starting');
     await flush();
 
+    // 显式「刷新登录」不能复用已被 console 注销、但 ask.feishu.cn
+    // 粗检仍会放行的旧 cookie。
     expect(prepareSession).toHaveBeenCalledWith(expect.objectContaining({ forceQrLogin: true }));
 
     const scanning = mgr.get()!;

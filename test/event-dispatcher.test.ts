@@ -145,7 +145,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -808,6 +808,7 @@ function setupBotState(opts?: {
   /** 整群 talk 授权（owner 在群里裸 `/grant` 写入的 chat_id 列表）。 */
   allowedChatGroups?: string[];
   allowedUsers?: string[];
+  ownerOpenId?: string;
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
@@ -843,6 +844,7 @@ function setupBotState(opts?: {
       // 生产里 config.allowedUsers 是原始配置（启动后 resolvedAllowedUsers 才是解析结果）。
       // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
       allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
+      ownerOpenId: opts?.ownerOpenId,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       allowedChatGroups: opts?.allowedChatGroups,
@@ -2650,8 +2652,39 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('路由侧与 daemon 侧的 @ 剥离同源：本 bot 的 @ 占住指令参数位时，两边都判「不是指令头」', () => {
+    // 路由这边曾经只剥前导 @，于是 `重构登录 /t /model @机器人` 在这里解析成
+    //「合法头部（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——
+    // 路由已经把 scope 翻成新话题，daemon 才回一句用法错误，错误提示落进一个
+    // 凭空开出来的空话题里。两边必须得出同一个结论。
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    const message = {
+      content: JSON.stringify({ text: '重构登录 /t /model @_user_1' }),
+      mentions: [{ key: '@_user_1', name: '机器人', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+
+    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(false);
+    // 没有被翻成新话题 —— 拒绝会留在原地回复，不会先产生「开了个话题」这个副作用。
+    expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+  });
+
+  it('本 bot 的 @ 夹在正文里时，路由仍然认得出这是指令头', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    const message = {
+      content: JSON.stringify({ text: '重构登录 /t /repo botmux 看看 @_user_1' }),
+      mentions: [{ key: '@_user_1', name: '机器人', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+
+    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(true);
+    // forceTopicApplied 只在**真翻了**的时候置位（上一条没翻的用例里不出现），下游的
+    // 授权闸靠它认出「这条 thread 路是 `/t` 挣来的」。
+    expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
+  });
+
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
-    // /t 和 /topic 走同一条 parseForceTopicInvocation，别让别名成为绕过 vetting 的后门。
+    // /t 和 /topic 走同一条 parseTopicHeader，别让别名成为绕过 vetting 的后门。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效
     mockGetChatMode.mockResolvedValueOnce('group');
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
@@ -5583,6 +5616,7 @@ describe('managed Agent clone owner boundary', () => {
       'chatReplyModes',
       'chatFeedbackPolicies',
       'noCardChats',
+      'quotaFallbackBot',
       'activationPending',
       'activationDeactivating',
       'activationStarting',
@@ -5665,6 +5699,18 @@ describe('configured-but-unresolved allowlist stays fail-closed (not fail-open)'
   it('canTalk: configured owner that resolves to empty blocks ordinary talk (not open)', () => {
     setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
     expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+  });
+
+  it('revoking explicit owner from resolved allowlist revokes both talk and operate', () => {
+    setupBotState({
+      ownerOpenId: 'ou_old_owner',
+      configAllowedUsers: ['ou_old_owner', 'ou_new_owner'],
+      allowedUsers: ['ou_new_owner'],
+    });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_old_owner')).toBe(false);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_old_owner')).toBe(false);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_new_owner')).toBe(true);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_new_owner')).toBe(true);
   });
 
   it('truly empty config (no allowlist at all) remains open mode', () => {
@@ -7255,6 +7301,34 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
       'om_feedback_negative',
       JSON.stringify({ type: 'negative-followup-card' }),
     );
+  });
+
+  it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({ afterAck });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_toggle', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps an inline confirmation toast in the ACK and handles publisher rejection', async () => {
+    const afterAck = vi.fn(async () => { throw new Error('temporary publish failure'); });
+    const toast = { type: 'warning', content: 'confirm empty selection' };
+    handlers.handleCardAction.mockResolvedValue({ afterAck, toast });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_submit', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({ toast });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
@@ -8851,6 +8925,153 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
 
     await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve 看看这个', {
       mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // …但让路只看**命令之前**的 @。`/solve @张三` 里的 @ 是命令自己的参数（点名让
+  // bot 去找谁/处理谁），命令仍然是冲本 bot 来的 —— 之前一律按「点名了别人」拦掉，
+  // 用户敲的免@命令后面一带 @ 就整条失灵。
+  it('still fires when the @mention comes AFTER the command (it is an argument)', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = fire('/solve @张三 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
+  // 参数原样带上 @名字 交给 daemon 渲染模板 —— 否则命令收到的是被吃掉 @ 的半句话。
+  it('keeps the trailing mention in the args handed to the daemon', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '处理：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve @张三 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: expect.objectContaining({ cmd: '/solve', args: '@张三 看看这个' }),
+    }));
+  });
+
+  // post（富文本）形态：@ 是独立的 `at` 节点，不在 text 里 —— 位置判断不能只看
+  // extractMessageTextForRouting 拼出来的字符串，否则前导 @ 的让路语义在富文本下失效。
+  function firePost(nodes: any[], mentions?: TestMention[]) {
+    return makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions,
+    });
+  }
+
+  it('post 形态：命令前的 @ 同样让路（at 节点不在 text 里，不能只看拼出的字符串）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](firePost([
+      { tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' },
+      { tag: 'text', text: ' /solve 看看这个' },
+    ], [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }]));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('post 形态：命令后的 @ 仍然触发（它是命令的参数）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = firePost([
+      { tag: 'text', text: '/solve ' },
+      { tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' },
+      { tag: 'text', text: ' 看看这个' },
+    ], [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }]);
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
+  // @ 与命令分处不同段落：段落边界不该改变先后判定。
+  it('post 形态：@ 与命令分处不同段落时按节点先后判定', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [
+        [{ tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' }],
+        [{ tag: 'text', text: '/solve 看看' }],
+      ] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 段落只是排版：节点序必须在整篇文档内**连续累加**，不能每段从 0 重来。
+  // 这条形态（命令在首段、@ 在次段）是能区分两种实现的那条：连续累加 → cmd(0) 在
+  // at(1) 之前 ⇒ 触发（正确）；段落内重置 → 两者段内序同为 0 ⇒ 误判成「@ 在命令
+  // 之前」而让路。上面 [[at],[text]] 那条在两种写法下同为让路，钉不住这一点。
+  it('post 形态：节点序跨段落连续累加（命令在首段、@ 在次段 → 触发）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [
+        [{ tag: 'text', text: '/solve 看看这个' }],
+        [{ tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' }],
+      ] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
+  // 命令前有 @ 就仍然让路，哪怕命令后面也 @ 了人：开头那个 @ 已经把活儿指出去了。
+  it('yields when a mention leads the message even if another follows the command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve @李四 看看', {
+      mentions: [
+        { key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } },
+        { key: '@_user_2', name: '李四', id: { open_id: 'ou_lisi' } },
+      ],
     }));
     await flushEventWork();
 

@@ -8,8 +8,10 @@ import type {
   DaemonToWorker,
   LarkAttachment,
   LarkMention,
+  ModelFallbackState,
   DisplayMode,
   StreamStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -88,6 +90,8 @@ export interface DaemonSession {
   spawnedAt: number;
   cliVersion: string;
   lastMessageAt: number;
+  /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
+  lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
@@ -184,16 +188,10 @@ export interface DaemonSession {
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */
   initialStartClaimToken?: string;
-  /** Number of activation-tail arrivals that reserved FIFO order before an
-   * asynchronous prompt/sender build and have not yet durably admitted or
-   * failed. An opening ACK must not clear the route while this is non-zero. */
-  queuedActivationTailAdmissionsOutstanding?: number;
-  /** An opening ACK (or ordinary cold-start handoff) observed while an
-   * asynchronous tail admission was outstanding. The final settler replays
-   * this release so a late durable successor cannot be stranded. */
-  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
-  /** Retry timer for an ordinary cold-start handoff whose durable promotion
-   * failed after all asynchronous admissions had settled. */
+  /** Retry timer for a route release whose durable promotion failed while the
+   * route was still held. Ordering between a follower still being built and
+   * the opening's release is the session turn queue's job
+   * (core/session-turn-queue.ts), not a field here. */
   queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
@@ -280,18 +278,6 @@ export interface DaemonSession {
    * Used only when a literal raw cold start must fold followers onto the same
    * text→Enter IPC boundary. */
   pendingCodexAppFollowUpGateAccepted?: boolean[];
-  /** Exact turns that arrived while a previously attempted queued activation
-   * was re-parked. They remain separate FIFO items behind the retained opening
-   * payload and advance only after worker acceptance. In-memory only. */
-  pendingQueuedActivationFollowUps?: Array<{
-    userPrompt: string;
-    cliInput: CliTurnPayload;
-    turnId: string;
-    dispatchAttempt?: number;
-    /** Legacy volatile entries already crossed the clean-input gate when they
-     * were staged. Migration must preserve that exact sidecar decision. */
-    codexAppInputGateFrozen?: true;
-  }>;
   /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
    *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
@@ -392,6 +378,42 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Actual input-committed turn for the managed reply card's Stop control. */
+  replyCardRunningTurnId?: string;
+  /**
+   * Authenticated human principal that owns the currently executing interactive
+   * turn. Set only after a worker accepts the turn and cleared by its exact
+   * terminal. A different human's message cannot mutate this task directly;
+   * it is staged as a suggestion for this owner to approve after completion.
+   * In-memory only.
+   */
+  activeInteractiveTurn?: {
+    turnId: string;
+    caller: import('../types.js').TrustedCaller;
+    /** Stable authenticated task/session owner, when distinct from the caller
+     * that happened to start the current CLI turn. */
+    controller?: import('../types.js').TrustedCaller;
+  };
+  /** Host-owned classification/approval driver currently attached to disk state. */
+  crossPrincipalInterruptionDriving?: boolean;
+  /** Runtime wake-up for the bounded wait until the current owner turn ends. */
+  crossPrincipalWaitTimer?: NodeJS.Timeout;
+  /** Transitional runtime queue retained until the durable classifier replaces
+   * every old call site. Never persisted; do not add new producers. */
+  pendingCrossPrincipalSuggestions?: Array<{
+    turnId: string;
+    ownerTurnId: string;
+    owner: TrustedCaller;
+    text: string;
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    proposer: TrustedCaller;
+    proposerName?: string;
+    replyRootId?: string;
+    inThread?: boolean;
+    approved?: boolean;
+  }>;
+  crossPrincipalSuggestionConfirming?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
@@ -405,6 +427,14 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Claude model fallback still in effect, reported by the worker from the
+   *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
+   *  without a live worker keeps the notice. Unlike the other runtime facts it
+   *  is NOT owned by a worker generation and survives every respawn: it is
+   *  bound to a Claude session id instead, and only positive evidence moves it
+   *  — a reply served by a different model, a newer switch record, a message
+   *  from another Claude session, or a role switch away from claude-code. */
+  modelFallback?: ModelFallbackState;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
   /** Queued suspend: the request arrived while the session was producing
@@ -459,6 +489,10 @@ export interface DaemonSession {
    *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
    *  notify again. In-memory only. */
   rateLimitNotifiedKey?: string;
+  /** Unique claim for the current handoff attempt. Guards an asynchronous
+   * target lookup from posting after this episode cleared and a same-key later
+   * episode started. Cross-session duplicate events use a daemon-wide TTL. */
+  quotaFallbackAttemptToken?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -538,6 +572,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Session-lifetime runtime-policy lookup authority. */
+    policyCapability?: string;
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
@@ -750,16 +786,24 @@ export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>):
 }
 
 /** A session created by the HTTP control API (`waitForFinalOutput` /
- * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
- * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*`,
+ * `http_wait_*`, or `headless_*` address, NOT a real Lark chat. Any Feishu chat API call
  * targeting it (sendMessage / card / reply / roster probe) would fail — these
  * sessions are request/response only and must never touch Lark transport.
  * Tolerates a nullish chatId (returns false — a missing surface is not an
  * HTTP virtual chat), so callers converging onto this predicate can pass an
  * optional chatId without a separate `?.` guard. */
+export const HEADLESS_CHAT_PREFIX = 'headless_';
+
+export function isHeadlessSessionChatId(chatId: string | undefined | null): boolean {
+  return !!chatId && chatId.startsWith(HEADLESS_CHAT_PREFIX);
+}
+
 export function isHttpVirtualSession(chatId: string | undefined | null): boolean {
   if (!chatId) return false;
-  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  return chatId.startsWith('http_async_')
+    || chatId.startsWith('http_wait_')
+    || isHeadlessSessionChatId(chatId);
 }
 
 /** Central Lark-transport capability gate for a live session. Returns false —

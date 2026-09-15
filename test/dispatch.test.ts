@@ -21,6 +21,7 @@ import {
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
+  buildProjectDispatchSyncAction,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -103,6 +104,26 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+});
+
+describe('buildProjectDispatchSyncAction', () => {
+  const input = {
+    dispatchRoot: 'om_existing', title: '', purpose: '', owners: ['worker-a'],
+    status: 'in_progress' as const, progress: 20,
+  };
+
+  it('omits lifecycle and owners when coordinating an existing topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: true })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+    });
+  });
+
+  it('includes initial projection fields for a newly dispatched topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: false })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+      owners: ['worker-a'], status: 'in_progress', progress: 20,
+    });
   });
 });
 
@@ -992,6 +1013,26 @@ describe('acceptedDispatchBotAppIds', () => {
       notBeforeMs: sentAt,
       isWorkerAlive,
     })).toEqual(['cli_repo']);
+  });
+
+  it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_stale_trace_root',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+    };
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(session.dispatchInputReceipts).toBeUndefined();
   });
 
   it('rejects a receipt from the previous worker generation after replacement', () => {

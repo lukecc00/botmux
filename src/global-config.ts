@@ -131,6 +131,17 @@ export interface WorkflowFeatureGlobalConfig {
   enabled?: boolean;
 }
 
+export interface WorkerConfig {
+  /** Default-on switch for fresh/resumed worker memory admission. */
+  memoryAdmissionEnabled?: boolean;
+  /** Refuse a fresh/resumed worker while available memory is below this value. */
+  minAvailableMemoryBytes?: number;
+  /** Refuse a fresh/resumed worker while memory full PSI avg10 reaches this percentage. */
+  maxMemoryFullAvg10?: number;
+  /** Optional per-session hard limit. Applied only after cgroup-v2 placement is verified. */
+  sessionMemoryMaxBytes?: number;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -148,6 +159,8 @@ export interface GlobalConfig {
    *  services/voice/types.ts. Presence (with usable creds) gates the
    *  "🔊 语音总结" button. */
   voice?: VoiceConfig;
+  /** Machine-wide worker admission and containment policy. */
+  worker?: WorkerConfig;
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
@@ -296,6 +309,10 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
+  /** Suppress Codex/TraeX/CoCo's low-quota model-switch picker for managed launches.
+   *  Default ON; false leaves the CLI's own notice configuration in control.
+   *  Applied per process; never edits the user's CLI config. Aiden's gateway cannot forward it. */
+  hideCodexRateLimitModelNudge?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -437,12 +454,35 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
+  if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'
     && Number.isFinite(d.contextCompactThreshold)
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readPositiveInteger(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined;
+}
+
+function readWorker(raw: unknown): WorkerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: WorkerConfig = {};
+  const minAvailableMemoryBytes = readPositiveInteger(value.minAvailableMemoryBytes);
+  const sessionMemoryMaxBytes = readPositiveInteger(value.sessionMemoryMaxBytes);
+  if (typeof value.memoryAdmissionEnabled === 'boolean') out.memoryAdmissionEnabled = value.memoryAdmissionEnabled;
+  if (minAvailableMemoryBytes !== undefined) out.minAvailableMemoryBytes = minAvailableMemoryBytes;
+  if (sessionMemoryMaxBytes !== undefined) out.sessionMemoryMaxBytes = sessionMemoryMaxBytes;
+  if (typeof value.maxMemoryFullAvg10 === 'number'
+    && Number.isFinite(value.maxMemoryFullAvg10)
+    && value.maxMemoryFullAvg10 > 0
+    && value.maxMemoryFullAvg10 <= 100) {
+    out.maxMemoryFullAvg10 = value.maxMemoryFullAvg10;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -638,6 +678,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
   if (voice) out.voice = voice;
+  const worker = readWorker(raw.worker);
+  if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
   const whiteboard = readWhiteboard(raw.whiteboard);
@@ -833,6 +875,32 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
     : {};
   mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
   return readGlobalConfig().dashboard ?? {};
+}
+
+/** Merge worker policy without deleting future keys written by a newer client. */
+export function mergeWorkerConfig(patch: WorkerConfig): WorkerConfig {
+  const raw = readRawConfig();
+  const existing = raw.worker && typeof raw.worker === 'object' && !Array.isArray(raw.worker)
+    ? raw.worker as Record<string, unknown>
+    : {};
+  mergeGlobalConfig({ worker: { ...existing, ...patch } as WorkerConfig });
+  return readGlobalConfig().worker ?? {};
+}
+
+/** Clear the worker keys this version owns without deleting future policy keys. */
+export function clearWorkerConfig(): WorkerConfig {
+  const raw = readRawConfig();
+  if (!raw.worker || typeof raw.worker !== 'object' || Array.isArray(raw.worker)) {
+    mergeGlobalConfig({ worker: null });
+    return {};
+  }
+  const remaining = { ...raw.worker as Record<string, unknown> };
+  delete remaining.memoryAdmissionEnabled;
+  delete remaining.minAvailableMemoryBytes;
+  delete remaining.maxMemoryFullAvg10;
+  delete remaining.sessionMemoryMaxBytes;
+  mergeGlobalConfig({ worker: Object.keys(remaining).length > 0 ? remaining as WorkerConfig : null });
+  return readGlobalConfig().worker ?? {};
 }
 
 /** 写入 notifier 的完整已知配置，同时保留配置块内的未来字段。 */

@@ -1,7 +1,7 @@
 /**
  * Unit tests for src/im/lark/md-card.ts.
  *
- * Run:  bun x vitest run --project unit test/md-card.test.ts
+ * Run:  pnpm vitest run test/md-card.test.ts
  *
  * Covers the two production rendering bugs that motivated the markdown-it
  * rewrite plus baseline behaviors that must not regress.
@@ -22,10 +22,11 @@ import {
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
   createReplyCard,
-  REPLY_CARD_FOOTER_MARKER,
+  DEFAULT_BRAND_LABEL,
   extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
+  REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -931,6 +932,13 @@ describe('buildMarkdownCard', () => {
     )).toBeNull();
   });
 
+  it('renders a backend variant between the model and reasoning effort', () => {
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
+      true,
+    )).toBe('**GPT-5.6-Terra** Max · xhigh');
+  });
+
   it('strips a leading provider/ routing prefix from the model name', () => {
     // model_hub/es1_orange_o48 → es1_orange_o48 (relay namespace hidden);
     // underscores are markdown-escaped by the shared compact formatter.
@@ -1030,27 +1038,27 @@ describe('buildMarkdownCard', () => {
     expect(rendered).not.toContain('不可用');
   });
 
-  it('keeps recipient chrome without restoring the default product brand when usage is missing', () => {
+  it('keeps brand and recipient chrome when usage is entirely missing', () => {
     const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
       context: null,
       tokens: null,
     });
     const footer = JSON.parse(json).body.elements.at(-1).content;
 
-    expect(footer).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer).toContain('[botmux](');
     expect(footer).toContain('<at id=ou_abc></at>');
-    expect(footer).not.toContain('[botmux](');
     expect(footer).not.toContain('上下文');
     expect(footer).not.toContain('Token');
     expect(footer).not.toContain('不可用');
   });
 
-  it('does not append a default-brand-only footer or orphan separator', () => {
+  it('appends footer hr + grey link element', () => {
     const json = buildMarkdownCard('hello');
     const card = JSON.parse(json);
     const tags = card.body.elements.map((e: any) => e.tag);
-    expect(tags).not.toContain('hr');
-    expect(JSON.stringify(card.body.elements)).not.toContain('botmux_reply_footer');
+    expect(tags).toContain('hr');
+    const last = card.body.elements[card.body.elements.length - 1];
+    expect(last.content).toContain('[botmux](');
   });
 
   it('addresses recipient in footer when openId is provided', () => {
@@ -1081,17 +1089,18 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      `Acme ${REPLY_CARD_FOOTER_MARKER} `
+      `Acme ·${REPLY_CARD_FOOTER_MARKER} `
       + '上下文 12.3K · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
     // Footer is context-only — the cumulative token line does not appear here.
     expect(footer?.content).not.toContain('Token');
     expect(footer?.content).not.toContain('\u200B');
     expect(footer?.element).toMatchObject({
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content: footer?.content,
     });
   });
@@ -1114,9 +1123,7 @@ describe('buildReplyCardFooter', () => {
       element_id: 'botmux_reply_footer',
     });
     expect(card.body.elements.at(-1).content).toContain('Sent to: <at id=ou_owner></at>');
-    expect(card.body.elements.at(-1).content).toContain(
-      REPLY_CARD_FOOTER_MARKER,
-    );
+    expect(card.body.elements.at(-1).content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
   it('rejects caller-supplied cards without schema-2 body elements', () => {
@@ -1189,38 +1196,48 @@ describe('buildReplyCardFooter', () => {
     expect(card.body.elements.at(-1).element_id).toBe('botmux_reply_footer');
   });
 
-  it('omits the footer when default brand, usage, and recipient are all absent', () => {
-    expect(buildReplyCardFooter({})).toBeNull();
+  it('does NOT sign a default-brand-only footer (no usage, no recipient) — avoids a dangling "botmux ·"', () => {
+    const footer = buildReplyCardFooter({});
+    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
+    // Brand alone is legitimate content with no `@` → no ownership marker, so it
+    // renders "botmux" without a trailing separator dot.
+    expect(footer?.content).not.toContain(
+      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+    );
   });
 
-  it('still signs a usage-only footer (brand disabled) with the versioned marker', () => {
+  it('signs a usage-only footer with non-link text', () => {
     const footer = buildReplyCardFooter({
       brand: '', // brand off
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
-    expect(footer?.content).toContain(
-      REPLY_CARD_FOOTER_MARKER,
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
-  it('still signs a recipient-only footer (brand disabled) with the versioned marker', () => {
+  it('does not render a separator or link when brand is disabled and only recipient remains', () => {
     const footer = buildReplyCardFooter({
       brand: '',
       recipientOpenIds: ['ou_abc'],
     });
-    expect(footer?.content).toContain(
-      REPLY_CARD_FOOTER_MARKER,
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+    expect(footer?.content).not.toContain('·');
     expect(footer?.content).toContain('<at id=ou_abc></at>');
+    expect(footer?.content.replaceAll(REPLY_CARD_FOOTER_MARKER, '')).toBe(
+      "<font color='grey'>发送给：<at id=ou_abc></at></font>",
+    );
   });
 
-  it('signs an unset-brand usage footer with the versioned marker', () => {
+  it('signs a default-brand + usage footer with a plain separator', () => {
     const footer = buildReplyCardFooter({
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
+    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
     expect(footer?.content).toContain(
-      REPLY_CARD_FOOTER_MARKER,
+      `${DEFAULT_BRAND_LABEL} ·${REPLY_CARD_FOOTER_MARKER} 上下文 5K/200K (3%)`,
     );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 });
 
@@ -1236,8 +1253,8 @@ describe('hasMarkdown', () => {
 // ─── Footer brand label (per-bot configurable) ────────────────────────────
 
 describe('brandFooterSegment', () => {
-  it('undefined (unset) → no default product brand', () => {
-    expect(brandFooterSegment(undefined)).toBeNull();
+  it('undefined (unset) → default botmux brand', () => {
+    expect(brandFooterSegment(undefined)).toBe(DEFAULT_BRAND_LABEL);
   });
   it('empty / whitespace → null (brand off)', () => {
     expect(brandFooterSegment('')).toBeNull();
@@ -1254,11 +1271,8 @@ describe('brandFooterSegment', () => {
 describe('buildMarkdownCard footer brand', () => {
   const lastEl = (json: string) => { const els = JSON.parse(json).body.elements; return els[els.length - 1]; };
 
-  it('unset brand + recipient → recipient-only signed footer without product branding', () => {
-    const content = lastEl(buildMarkdownCard('hi', 'ou_x')).content;
-    expect(content).toContain('发送给');
-    expect(content).toContain(REPLY_CARD_FOOTER_MARKER);
-    expect(content).not.toContain('[botmux](');
+  it('unset brand → default botmux footer', () => {
+    expect(lastEl(buildMarkdownCard('hi', 'ou_x')).content).toContain(DEFAULT_BRAND_LABEL);
   });
 
   it('custom brand → custom footer, no botmux', () => {
@@ -1346,6 +1360,45 @@ describe('buildCardBodyElements image rows', () => {
 
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
+
+  it.each([
+    ['medium', 2], ['small', 3], ['tiny', 4],
+  ])('fits the whole image in a proportional column: %s', (mode, columnCount) => {
+    for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
+      const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
+      const row = out.find(e => e.tag === 'column_set');
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+      expect(row.columns).toHaveLength(columnCount as number);
+      for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+      for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
+      const img = row.columns[0].elements[0];
+      expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
+      expect(img).not.toHaveProperty('mode');
+      expect(img).not.toHaveProperty('size');
+      expect(img).not.toHaveProperty('custom_width');
+    }
+  });
+
+  it('keeps the default output identical, including explicit fit_horizontal', () => {
+    const legacy = buildCardBodyElements('截图\n\n![](img_v2_a)');
+    expect(buildImageCardElements('截图', [K[0]])).toEqual(legacy);
+    expect(buildImageCardElements('截图', [K[0]], undefined, undefined, 'fit_horizontal')).toEqual(legacy);
+  });
+
+  it('sizes standalone placeholders and trailing images without resizing a grid', () => {
+    const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows[0].columns[0].elements[0]).toMatchObject({ img_key: K[0], scale_type: 'fit_horizontal', alt: { content: '预览' } });
+    expect(rows[2].columns[0].elements[0]).toMatchObject({ img_key: K[3], scale_type: 'fit_horizontal' });
+    expect(rows[1]).toEqual(buildImageCardElements('![](img:0,1)', [K[1], K[2]])[0]);
+  });
+
+  it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
+    for (const markdown of ['```\n![](img_v2_a)\n```', '    ![](img_v2_a)', 'see ![](img_v2_a) here', '![](https://example.com/a.png)']) {
+      expect(buildCardBodyElements(markdown, undefined, undefined, 'small')).toEqual(buildCardBodyElements(markdown));
+    }
+  });
+
 
   it('no images → identical to buildCardBodyElements', () => {
     expect(buildImageCardElements('hello **world**', [])).toEqual(
@@ -1464,7 +1517,7 @@ describe('buildContextualReplyCard footer brand', () => {
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',
     })).body.elements;
     const last = els[els.length - 1];
-    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.text_size).toBe('notation');
     expect(last.content).toContain('Acme');
     expect(last.content).not.toContain('botmux');
   });

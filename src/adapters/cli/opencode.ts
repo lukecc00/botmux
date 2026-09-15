@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -140,6 +141,7 @@ export async function detectOpenCodeSubmit(
   content: string,
   delayFn: (ms: number) => Promise<void> = delay,
   kind: OpenCodeDbKind = 'v1',
+  retryEnter = true,
 ): Promise<{ submitted: boolean; cliSessionId?: string; recheck?: () => { submitted: boolean; cliSessionId?: string } | false }> {
   const trySendEnter = (): boolean => {
     try {
@@ -169,7 +171,7 @@ export async function detectOpenCodeSubmit(
         ? { submitted: true, cliSessionId: afterWait.cliSessionId }
         : { submitted: true };
     }
-    if (!trySendEnter()) return { submitted: false };
+    if (retryEnter && !trySendEnter()) return { submitted: false };
   }
   const finalMatch = detectNewSubmit(baseline, content, kind);
   if (finalMatch.found) {
@@ -223,6 +225,32 @@ export const OPENCODE_BUSY_FRESHNESS_MS = 120_000;
  *  1. 存在属于该 session、状态为 `status: "running"` 的 tool part；
  *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳）。
  */
+export function isOpenCodeInitialPromptComplete(
+  baseline: number,
+  cliSessionId: string,
+  kind: OpenCodeDbKind = 'v1',
+): boolean {
+  const table = kind === 'v2' ? 'session_message' : 'message';
+  const role = kind === 'v2' ? "type = 'assistant'" : "json_extract(data, '$.role') = 'assistant'";
+  const completed = kind === 'v2'
+    ? "json_extract(data, '$.time.completed')"
+    : "json_extract(data, '$.time.completed')";
+  return withDb((db) => {
+    const assistant = db.prepare(
+      `SELECT ${completed} AS completed FROM ${table} WHERE session_id = ? AND ${role} AND time_created > ? ORDER BY time_created DESC LIMIT 1`,
+    ).get(cliSessionId, baseline) as { completed?: number | null } | undefined;
+    if (assistant?.completed === undefined || assistant.completed === null) return false;
+    const runningTool = kind === 'v2'
+      ? db.prepare(
+        "SELECT 1 AS busy FROM session_message WHERE session_id = ? AND time_created > ? AND json_extract(data, '$.state.status') = 'running' LIMIT 1",
+      ).get(cliSessionId, baseline)
+      : db.prepare(
+        "SELECT 1 AS busy FROM part WHERE session_id = ? AND time_created > ? AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.state.status') = 'running' LIMIT 1",
+      ).get(cliSessionId, baseline);
+    return !(runningTool as { busy?: number } | undefined)?.busy;
+  }) ?? false;
+}
+
 export function isOpenCodeSessionBusy(
   cliSessionId: string,
   kind: OpenCodeDbKind = 'v1',
@@ -351,9 +379,36 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
+    // bakes the full first-round prompt into `--prompt <content>`, so a long
+    // routing/role/user prompt blows the tmux limit before OpenCode starts.
+    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
+    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
+    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
+    // below the measured tmux ceiling.  Over-limit prompts defer to the
+    // normal post-start input queue.
+    maxInitialPromptArgBytes: 8192,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
+    durableInitialPromptViaArgs: true,
+    captureInitialPromptArgSubmission() {
+      return snapPartBaseline();
+    },
+    async confirmInitialPromptArgSubmission(baseline, content) {
+      return detectOpenCodeSubmit({ write() {} }, baseline, content, delay, 'v1', false);
+    },
+    findInitialPromptArgSubmission(baseline, content) {
+      if (baseline === null) return { submitted: false };
+      const result = detectNewSubmit(baseline, content, 'v1');
+      return result.cliSessionId
+        ? { submitted: result.found, cliSessionId: result.cliSessionId }
+        : { submitted: result.found };
+    },
+    isInitialPromptComplete(baseline, cliSessionId) {
+      return baseline !== null && isOpenCodeInitialPromptComplete(baseline, cliSessionId);
+    },
     rawCommandInputMode: 'paste-line',
     rawCommandSettleMs: 300,
 
@@ -388,11 +443,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline();
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -400,7 +456,10 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long/deferred or multiline prompts are parsed as individual
+          // key events and can be dropped instead of submitted as one message.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -444,12 +503,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     asksViaHook: true,
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
-    modelChoices: [
-      'anthropic/claude-sonnet-4',
-      'anthropic/claude-opus-4',
-      'openai/gpt-5',
-      'google/gemini-2.5-pro',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['opencode'],
   };
 }
 

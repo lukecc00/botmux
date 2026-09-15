@@ -98,10 +98,11 @@ function tempDir(name: string): string {
 async function loadModules() {
   const registry = await import('../src/bot-registry.js');
   const sessionStore = await import('../src/services/session-store.js');
+  const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
   sessionStore.init();
-  return { daemon, registry, types };
+  return { collaborationModeStore, daemon, registry, types };
 }
 
 beforeAll(async () => {
@@ -146,6 +147,60 @@ afterAll(() => {
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_explicit_worker';
+    const chatId = 'oc_join_explicit_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: false,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker']);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('项目群开启自动纳入后，新 Bot 即使未开启入群自动开工也会加入 Worker 白名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_project_worker';
+    const chatId = 'oc_join_project_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: true,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker', appId]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('创建一个话题根并复用 chat-scope session', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_shared';
@@ -366,6 +421,45 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       undefined,
       expect.anything(),
     );
+  });
+
+  // 卡片发不出去（飞书 230025 等）时不能停在 pendingRepo：入群自动开工没有任何
+  // 用户输入可再触发，会话会永久挂在一张不存在的卡片上。降级 = 走同一个「无可选
+  // 项目」分支，用默认目录直接开工，且共享 seed 仍归本轮所有。
+  it('repo 卡发送失败时改用默认目录直接开工，而不是挂在不存在的卡片上', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_pending_repo_card_fail';
+    const chatId = 'oc_join_pending_repo_card_fail';
+    const scanDir = tempDir('scan-pending-repo-card-fail');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // 卡片没发出去就没有可删的消息，别拿 undefined 去调删除接口。
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {

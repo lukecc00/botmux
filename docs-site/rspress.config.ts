@@ -71,6 +71,7 @@ const zhSidebar = [
     items: [
       { text: 'bots.json 配置', link: '/bots-json' },
       { text: '环境变量与文件位置', link: '/env' },
+      { text: '本地 Companion API', link: '/companion-api' },
       { text: '多 CLI 适配器', link: '/adapters' },
     ],
   },
@@ -154,6 +155,7 @@ const enSidebar = [
     items: [
       { text: 'bots.json', link: '/en/bots-json' },
       { text: 'Environment & File Locations', link: '/en/env' },
+      { text: 'Local Companion API', link: '/en/companion-api' },
       { text: 'CLI Adapters', link: '/en/adapters' },
     ],
   },

@@ -15,6 +15,9 @@ function userEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
   return { uuid: uuid ?? `a${++nextUuid}`, timestampMs: ts, kind: 'assistant_final', text };
 }
+function abortEv(reason = 'interrupted', uuid?: string, ts = 0, sourceSessionId?: string): CodexBridgeEvent {
+  return { uuid: uuid ?? `x${++nextUuid}`, timestampMs: ts, kind: 'turn_aborted', text: reason, sourceSessionId };
+}
 function progressEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
   return { uuid: uuid ?? `p${++nextUuid}`, timestampMs: ts, kind: 'assistant_progress', text };
 }
@@ -64,6 +67,166 @@ function emitDecisions(
 }
 
 describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
+  it('rejects CoT from a different native provider turn', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'prompt', 100);
+    q.ingest([{ ...userEv('prompt', 'u-native', 200), sourceTurnId: 'native-1' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'wrong' }], 'c-wrong', 300), sourceTurnId: 'native-2' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'right' }], 'c-right', 301), sourceTurnId: 'native-1' }]);
+    expect(seen).toEqual(['t1']);
+  });
+
+  it('rejects late native CoT and terminals after their turn has closed and drained', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([
+      { ...userEv('first', 'u-first', 200), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+      { ...asstEv('answer-a', 'a-first', 300), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-a' }),
+    ]);
+
+    q.ingest([userEv('second', 'u-second', 400)]);
+    q.ingest([
+      {
+        ...cotEv([{ kind: 'thinking', text: 'late-a-cot' }], 'c-late-a', 500),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...asstEv('late-a-final', 'a-late-a', 501),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...abortEv('late-a-abort', 'x-late-a', 502, 'session-1'),
+        sourceTurnId: 'native-a',
+      },
+    ]);
+
+    expect(seen).toEqual([]);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 't2', started: true })]);
+    expect(q.peek()[0]).not.toHaveProperty('finalText');
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('answer-b', 'a-second', 600), sourceSessionId: 'session-1', sourceTurnId: 'native-b',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 't2', finalText: 'answer-b', sourceTurnId: 'native-b',
+    })]);
+  });
+
+  it('keeps the start-time replay guard after a closed-turn tombstone is evicted', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('old', 'old', 1);
+    q.ingest([
+      { ...userEv('old', 'u-old', 2), sourceSessionId: 'session-1', sourceTurnId: 'native-0' },
+      { ...asstEv('old answer', 'a-old', 3), sourceSessionId: 'session-1', sourceTurnId: 'native-0' },
+    ]);
+    q.drainEmittable();
+
+    for (let index = 1; index <= 4_096; index++) {
+      const timestampMs = 10 + index * 2;
+      q.mark(`closed-${index}`, `prompt-${index}`, timestampMs);
+      q.ingest([
+        {
+          ...userEv(`prompt-${index}`, `u-closed-${index}`, timestampMs),
+          sourceSessionId: 'session-1', sourceTurnId: `native-${index}`,
+        },
+        {
+          ...asstEv(`answer-${index}`, `a-closed-${index}`, timestampMs + 1),
+          sourceSessionId: 'session-1', sourceTurnId: `native-${index}`,
+        },
+      ]);
+      q.drainEmittable();
+    }
+
+    q.mark('current', 'current', 20_000);
+    q.ingest([userEv('current', 'u-current', 20_001)]);
+    q.ingest([
+      {
+        ...cotEv([{ kind: 'thinking', text: 'evicted late cot' }], 'c-old-evicted', 3),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-0',
+      },
+      {
+        ...asstEv('evicted late final', 'a-old-evicted', 3),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-0',
+      },
+      {
+        ...abortEv('evicted late abort', 'x-old-evicted', 3, 'session-1'),
+        sourceTurnId: 'native-0',
+      },
+    ]);
+    expect(q.peek()[0]?.finalText).toBeUndefined();
+    expect(q.peek()[0]?.sourceTurnId).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('current answer', 'a-current', 20_002),
+      sourceSessionId: 'session-1', sourceTurnId: 'native-current',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'current', finalText: 'current answer', sourceTurnId: 'native-current',
+    })]);
+  });
+
+  it('matches closed native turns conservatively when session identity is absent', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('closed', 'closed', 1);
+    q.ingest([
+      { ...userEv('closed', 'u-closed-session', 2), sourceSessionId: 'session-1', sourceTurnId: 'native-shared' },
+      { ...asstEv('done', 'a-closed-session', 3), sourceSessionId: 'session-1', sourceTurnId: 'native-shared' },
+    ]);
+    q.drainEmittable();
+
+    q.mark('no-session', 'no session', 4);
+    q.ingest([userEv('no session', 'u-no-session', 5)]);
+    q.ingest([{ ...asstEv('late', 'a-no-session', 6), sourceTurnId: 'native-shared' }]);
+    expect(q.peek()[0]?.finalText).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('other session answer', 'a-other-session', 7),
+      sourceSessionId: 'session-2', sourceTurnId: 'native-shared',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'no-session', finalText: 'other session answer', sourceTurnId: 'native-shared',
+    })]);
+  });
+
+  it('keeps distinct native turns instead of treating them as a steer merge', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'same', 100);
+    q.mark('t2', 'same', 101);
+    q.ingest([
+      { ...userEv('same', 'u1', 200), sourceTurnId: 'native-1' },
+      { ...userEv('same', 'u2', 201), sourceTurnId: 'native-2' },
+      { ...asstEv('answer-1', 'a1', 300), sourceTurnId: 'native-1' },
+      { ...asstEv('answer-2', 'a2', 301), sourceTurnId: 'native-2' },
+    ]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-1', sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', finalText: 'answer-2', sourceTurnId: 'native-2' }),
+    ]);
+  });
+
+  it('binds a native id onto an id-less collecting turn without advancing the queue', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([userEv('first', 'u1', 200)]);
+    q.ingest([{ uuid: 'bind1', timestampMs: 201, kind: 'turn_bind', text: '', sourceTurnId: 'native-1' }]);
+
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 't1', started: true, sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', started: false }),
+    ]);
+  });
+
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
     const q = new CodexBridgeQueue();
     const seen: { turnId: string; entries: readonly unknown[] }[] = [];
@@ -161,6 +324,418 @@ describe('CodexBridgeQueue', () => {
       turnId: 'turn-layout-build',
       finalText: '最终完成',
       progressTexts: ['已核对原生 XML 和 Holder。', '已完成首轮修复并开始构建。'],
+    });
+  });
+
+  it('refreshes a queued submit after an interrupted predecessor and attributes its real final', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('first', 'interrupt first', 100);
+    q.mark('second', 'run second', 101);
+    q.confirmPendingTurn('second', 200);
+    q.ingest([userEv('interrupt first', 'u-first-abort', 300)]);
+
+    now = 50_000;
+    q.ingest([abortEv('interrupted', 'x-first-abort', 400)]);
+    expect(q.peek().find(turn => turn.turnId === 'second')?.submitConfirmedAtMs).toBe(now);
+    expect(q.hasBlockingTurn(now + 1)).toBe(true);
+
+    q.ingest([
+      userEv('run second', 'u-after-abort', 50_001),
+      asstEv('second completed', 'a-after-abort', 50_002),
+    ]);
+    expect(q.hasBlockingTurn()).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'first', finalText: '', terminalStatus: 'ambiguous' }),
+      expect.objectContaining({ turnId: 'second', finalText: 'second completed' }),
+    ]);
+  });
+
+  it('replays a buffered successor abort after a stale head is pruned', () => {
+    let now = 19_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('stale', 'never reached transcript', 100);
+    q.confirmPendingTurn('stale', 0);
+    q.mark('interrupted-successor', 'successor starts then aborts', now);
+    q.confirmPendingTurn('interrupted-successor', now);
+
+    q.ingest([
+      userEv('successor starts then aborts', 'u-buffered-abort', 19_001),
+      abortEv('interrupted', 'x-buffered-abort', 19_002),
+    ]);
+    expect(q.peek().find(turn => turn.turnId === 'interrupted-successor')?.started).toBe(false);
+
+    now = STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['stale']);
+    expect(q.hasBlockingTurn()).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'interrupted-successor',
+        finalText: '',
+        terminalStatus: 'ambiguous',
+      }),
+    ]);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('bounds an explicitly confirmed pre-start turn with a self-healing lease', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('queued', 'park this prompt', 100);
+    expect(q.hasBlockingTurn(1_000)).toBe(false);
+
+    expect(q.confirmPendingTurn('queued', 1_000)).toBe(true);
+    expect(q.hasBlockingTurn(1_000 + STRUCTURED_SUBMIT_START_GRACE_MS - 1)).toBe(true);
+    expect(q.preStartLeaseRemainingMs(1_000 + STRUCTURED_SUBMIT_START_GRACE_MS - 1)).toBe(1);
+    expect(q.hasBlockingTurn(1_000 + STRUCTURED_SUBMIT_START_GRACE_MS + 1)).toBe(false);
+    expect(q.preStartLeaseRemainingMs(1_000 + STRUCTURED_SUBMIT_START_GRACE_MS + 1)).toBeUndefined();
+  });
+
+  it('blocks the ready race while submit verification is still in flight, then self-heals', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('verifying', 'history polling prompt', 100);
+    expect(q.beginSubmitVerification('verifying', 1_000)).toBe(true);
+    expect(q.hasBlockingTurn(1_000 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS - 1)).toBe(true);
+    expect(q.preStartLeaseRemainingMs(1_000 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS - 1)).toBe(1);
+    expect(q.hasBlockingTurn(1_000 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 1)).toBe(false);
+
+    expect(q.finishSubmitVerification('verifying')).toBe(true);
+    expect(q.hasBlockingTurn(1_001)).toBe(false);
+  });
+
+  it('refreshes a finished unconfirmed write into a bounded attribution-only lease', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('unconfirmed', 'adapter returned undefined', now);
+    expect(q.peek()[0]?.unconfirmedAttributionStartedAtMs).toBe(100);
+
+    q.beginSubmitVerification('unconfirmed', 200);
+    now = 500;
+    expect(q.finishSubmitVerification('unconfirmed')).toBe(true);
+    expect(q.peek()[0]).toMatchObject({ unconfirmedAttributionStartedAtMs: 500 });
+    expect(q.peek()[0]?.submitVerificationStartedAtMs).toBeUndefined();
+
+    // Attribution-only retention must never turn an uncertain keypress into
+    // lifecycle busy or reject a real ready signal.
+    expect(q.hasBlockingTurn(now)).toBe(false);
+    expect(q.preStartLeaseRemainingMs(now)).toBeUndefined();
+    expect(q.pruneExpiredPreStartHeads(now + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS)).toEqual([]);
+    expect(q.pruneExpiredPreStartHeads(now + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1)
+      .map(turn => turn.turnId)).toEqual(['unconfirmed']);
+  });
+
+  it('protects an unconfirmed attribution head while bounded verification is active', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('verifying', 'slow authoritative check', 0);
+    q.beginSubmitVerification('verifying', 0);
+
+    expect(q.pruneExpiredPreStartHeads(STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1)).toEqual([]);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['verifying']);
+    expect(q.pruneExpiredPreStartHeads(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 1)
+      .map(turn => turn.turnId)).toEqual(['verifying']);
+  });
+
+  it('atomically transitions in-flight verification to a confirmed start lease', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('verified', 'confirmed after polling', 100);
+    q.beginSubmitVerification('verified', 1_000);
+    expect(q.confirmPendingTurn('verified', 2_000)).toBe(true);
+    expect(q.peek()[0]?.submitVerificationStartedAtMs).toBeUndefined();
+    expect(q.peek()[0]?.submitConfirmedAtMs).toBe(2_000);
+    expect(q.hasBlockingTurn(2_000 + STRUCTURED_SUBMIT_START_GRACE_MS - 1)).toBe(true);
+  });
+
+  it('reports the longest active pre-start lease when several submits were confirmed', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('older', 'older confirmed prompt', 100);
+    q.mark('newer', 'newer confirmed prompt', 101);
+    q.confirmPendingTurn('older', 1_000);
+    q.confirmPendingTurn('newer', 2_000);
+
+    expect(q.preStartLeaseRemainingMs(1_000 + STRUCTURED_SUBMIT_START_GRACE_MS + 1))
+      .toBe(999);
+  });
+
+  it('refreshes the next confirmed type-ahead lease from local observation time, not transcript clock', () => {
+    let observedNow = 120;
+    const q = new CodexBridgeQueue(() => observedNow);
+    q.mark('t1', 'first prompt', 100);
+    q.mark('t2', 'queued second prompt', 101);
+    q.confirmPendingTurn('t1', 110);
+    q.confirmPendingTurn('t2', 111);
+    q.ingest([userEv('first prompt', 'u-first-lease', 200)]);
+
+    // t2's enqueue-time lease can expire while t1 legitimately runs.
+    observedNow = 50_000;
+    const futureTranscriptTime = 9_999_999_999;
+    q.ingest([asstEv('first done', 'a-first-lease', futureTranscriptTime)]);
+    expect(q.hasBlockingTurn(observedNow + 1)).toBe(true);
+    expect(q.peek().find(turn => turn.turnId === 't2')?.submitConfirmedAtMs).toBe(observedNow);
+
+    q.ingest([userEv('queued second prompt', 'u-second-lease', futureTranscriptTime + 2)]);
+    expect(q.hasBlockingTurn(observedNow + STRUCTURED_SUBMIT_START_GRACE_MS + 100)).toBe(true);
+    observedNow += 10;
+    q.ingest([asstEv('second done', 'a-second-lease', futureTranscriptTime + 3)]);
+    expect(q.hasBlockingTurn(observedNow + 1)).toBe(false);
+  });
+
+  it('drops only an unstarted failed-submit mark so status can converge to idle', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('failed', 'never submitted', 100);
+    expect(q.dropPendingTurn('failed')?.turnId).toBe('failed');
+    expect(q.hasBlockingTurn()).toBe(false);
+
+    q.mark('started', 'accepted prompt', 200);
+    q.ingest([userEv('accepted prompt', 'u-started', 300)]);
+    expect(q.dropPendingTurn('started')).toBeNull();
+    expect(q.hasBlockingTurn()).toBe(true);
+  });
+
+  it('lets an authoritative terminal retire one exact started attempt and refreshes its successor lease', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('active-turn', 'active delivery', 100, 1);
+    q.confirmPendingTurn('active-turn', 100, 1);
+    q.ingest([userEv('active delivery', 'u-active-delivery', 101)]);
+    q.mark('successor-turn', 'replayed delivery', 102, 2);
+    q.confirmPendingTurn('successor-turn', 102, 2);
+
+    now = 50_000;
+    expect(q.dropPendingTurn('active-turn', 1, true)).toEqual(
+      expect.objectContaining({ turnId: 'active-turn', dispatchAttempt: 1, started: true }),
+    );
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'successor-turn', dispatchAttempt: 2, submitConfirmedAtMs: now }),
+    ]);
+    expect(q.hasBlockingTurn(now + 1)).toBe(true);
+  });
+
+  it('replays a later turn buffered behind a failed head mark', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('failed', 'first submit was dropped', 100);
+    q.mark('next', 'second submit reached the cli', 200);
+
+    // The queue initially compares this event with the failed head and buffers
+    // it as unmatched. Removing that head must immediately replay it against
+    // the second mark.
+    q.ingest([userEv('second submit reached the cli', 'u-next', 300)]);
+    expect(q.peek().find(turn => turn.turnId === 'next')?.started).toBe(false);
+    expect(q.dropPendingTurn('failed')?.turnId).toBe('failed');
+    expect(q.peek().find(turn => turn.turnId === 'next')?.started).toBe(true);
+    expect(q.hasBlockingTurn()).toBe(true);
+
+    q.ingest([asstEv('second turn done', 'a-next', 400)]);
+    expect(q.hasBlockingTurn()).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'next', finalText: 'second turn done' }),
+    ]);
+  });
+
+  it('preserves a later successful event across two failed head drops', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('failed-1', 'first submit failed', 100);
+    q.mark('failed-2', 'second submit failed', 200);
+    q.mark('success-3', 'third submit reached cli', 300);
+    q.ingest([
+      userEv('third submit reached cli', 'u-third-behind-two', 400),
+      asstEv('third response', 'a-third-behind-two', 500),
+    ]);
+
+    expect(q.dropPendingTurn('failed-1')?.turnId).toBe('failed-1');
+    expect(q.peek().find(turn => turn.turnId === 'success-3')?.started).toBe(false);
+    expect(q.dropPendingTurn('failed-2')?.turnId).toBe('failed-2');
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'success-3', finalText: 'third response' }),
+    ]);
+  });
+
+  it('expires a confirmed stale head and replays a buffered successor user/final lifecycle', () => {
+    let now = 19_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('stale', 'accepted but never started', 100);
+    q.confirmPendingTurn('stale', 0);
+    q.mark('live-second', 'second prompt really started', 19_000);
+    q.confirmPendingTurn('live-second', 19_000);
+
+    // While the stale head lease is still active, the real second user event
+    // cannot fingerprint-match it and is retained in the unmatched buffer.
+    q.ingest([userEv('second prompt really started', 'u-live-second', 19_001)]);
+    expect(q.peek().find(turn => turn.turnId === 'live-second')?.started).toBe(false);
+
+    // Expiry removes only the stale confirmed head and immediately replays the
+    // buffered event against its live successor.
+    now = STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['stale']);
+    expect(q.peek().some(turn => turn.turnId === 'stale')).toBe(false);
+    expect(q.peek().find(turn => turn.turnId === 'live-second')?.started).toBe(true);
+
+    q.ingest([asstEv('second response', 'a-live-second', 20_002)]);
+    expect(q.hasBlockingTurn()).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'live-second', finalText: 'second response' }),
+    ]);
+  });
+
+  it('expires a silent unconfirmed write and drains a buffered real successor lifecycle', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+
+    // Hermes/Pi/MTR writeInput returns undefined. The worker therefore ends
+    // verification without positive submit evidence; if Enter was silently
+    // dropped, this attribution-only head must not live forever.
+    q.mark('silent-write', 'keypress disappeared', now);
+    q.beginSubmitVerification('silent-write', now);
+    q.finishSubmitVerification('silent-write', now);
+
+    now = 19_000;
+    q.mark('real-successor', 'second prompt reached transcript', now);
+    q.ingest([
+      userEv('second prompt reached transcript', 'u-real-after-silent', 19_001),
+      asstEv('second prompt done', 'a-real-after-silent', 19_002),
+    ]);
+    expect(q.peek().find(turn => turn.turnId === 'real-successor')?.started).toBe(false);
+    expect(q.hasBlockingTurn()).toBe(false);
+
+    now = STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['silent-write']);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'real-successor', finalText: 'second prompt done' }),
+    ]);
+  });
+
+  it('expires consecutive confirmed stale heads until a buffered live turn can start', () => {
+    let now = 19_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('stale-1', 'first stale confirmed prompt', 100);
+    q.confirmPendingTurn('stale-1', 0);
+    q.mark('stale-2', 'second stale confirmed prompt', 200);
+    q.confirmPendingTurn('stale-2', 500);
+    q.mark('live-3', 'third prompt reached transcript', 19_000);
+    q.confirmPendingTurn('live-3', 19_000);
+    q.ingest([userEv('third prompt reached transcript', 'u-live-third', 19_001)]);
+
+    now = STRUCTURED_SUBMIT_START_GRACE_MS + 501;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['stale-1', 'stale-2']);
+    expect(q.peek().find(turn => turn.turnId === 'live-3')?.started).toBe(true);
+
+    q.ingest([asstEv('third response', 'a-live-third', 20_502)]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'live-3', finalText: 'third response' }),
+    ]);
+  });
+
+  it('never prunes a started turn or queued confirmations behind its active lifecycle', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('running', 'long running first prompt', 100);
+    q.confirmPendingTurn('running', 100);
+    q.ingest([userEv('long running first prompt', 'u-running-prune', 200)]);
+    q.mark('queued', 'valid queued second prompt', 300);
+    q.confirmPendingTurn('queued', 300);
+
+    now = 100_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['running', 'queued']);
+    expect(q.hasBlockingTurn()).toBe(true);
+
+    q.ingest([asstEv('first finished', 'a-running-prune', 100_001)]);
+    expect(q.peek().find(turn => turn.turnId === 'queued')?.submitConfirmedAtMs).toBe(now);
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+  });
+
+  it('refreshes a queued unconfirmed attribution lease when its started predecessor finishes', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('running', 'long running first prompt', now);
+    q.ingest([userEv('long running first prompt', 'u-running-before-bare', 101)]);
+    q.mark('queued-bare', 'unconfirmed typeahead', 200);
+    q.beginSubmitVerification('queued-bare', 200);
+    q.finishSubmitVerification('queued-bare', 201);
+
+    now = 100_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    q.ingest([asstEv('first finished', 'a-running-before-bare', now)]);
+    expect(q.peek().find(turn => turn.turnId === 'queued-bare')?.unconfirmedAttributionStartedAtMs)
+      .toBe(now);
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['queued-bare']);
+  });
+
+  it('keeps status queries pure when pruning would replay a complete buffered successor', () => {
+    let now = 19_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('stale', 'stale head before complete successor', 100);
+    q.confirmPendingTurn('stale', 0);
+    q.mark('complete-successor', 'successor user and final buffered', 19_000);
+    q.confirmPendingTurn('complete-successor', 19_000);
+    q.ingest([
+      userEv('successor user and final buffered', 'u-complete-successor', 19_001),
+      asstEv('successor complete', 'a-complete-successor', 19_002),
+    ]);
+
+    now = STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    // Projection/timer queries may observe lease expiry but must not mutate the
+    // queue and silently create an undrained completion.
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.preStartLeaseRemainingMs()).toBe(STRUCTURED_SUBMIT_START_GRACE_MS - 1_001);
+    expect(q.peek().find(turn => turn.turnId === 'complete-successor')?.started).toBe(false);
+
+    // The explicit worker mutation boundary prunes, replays and can drain in
+    // the same call stack.
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['stale']);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'complete-successor', finalText: 'successor complete' }),
+    ]);
+  });
+
+  it('accepts a matching late user event at the lease boundary before pruning its head', () => {
+    let now = STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('late-but-real', 'late transcript start', 100);
+    q.confirmPendingTurn('late-but-real', 0);
+
+    q.ingest([userEv('late transcript start', 'u-late-real', now)]);
+    expect(q.peek().find(turn => turn.turnId === 'late-but-real')?.started).toBe(true);
+    expect(q.hasBlockingTurn()).toBe(true);
+
+    now++;
+    q.ingest([asstEv('late turn done', 'a-late-real', now)]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'late-but-real', finalText: 'late turn done' }),
+    ]);
+  });
+
+  it('uses transcript start rather than a later worker mark for native terminal fallback', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('clock-skewed', 'prompt', 10_000);
+    q.ingest([userEv('prompt', 'u-clock-skewed', 8_000)]);
+
+    expect(q.peek()[0]).toMatchObject({
+      markTimeMs: 10_000,
+      transcriptStartTimeMs: 8_000,
+    });
+    q.ingest([{
+      ...asstEv('done', 'a-clock-skewed', 8_001), sourceTurnId: 'native-clock-skewed',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'clock-skewed', finalText: 'done', sourceTurnId: 'native-clock-skewed',
+    })]);
+  });
+
+  it('accepts a matching late user event for an expired attribution-only head before pruning', () => {
+    let now = STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('late-unconfirmed', 'late bare transcript start', 0);
+
+    // Worker ingest runs before the explicit prune boundary. A real matching
+    // event therefore owns the mark even when the attribution clock elapsed.
+    q.ingest([userEv('late bare transcript start', 'u-late-unconfirmed', now)]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'late-unconfirmed',
+      started: true,
+      unconfirmedAttributionStartedAtMs: undefined,
     });
   });
 
@@ -501,6 +1076,24 @@ describe('CodexBridgeQueue', () => {
     expect(ready).toHaveLength(1);
     expect(ready[0].turnId).toBe('t1');
     expect(ready[0].finalText).toBe('Hi，收到。');
+  });
+
+  it('records the original transcript start time during buffered late-attach replay', () => {
+    const q = new CodexBridgeQueue();
+    q.ingest([userEv('buffered prompt', 'u-buffered-clock', 8_000)]);
+    q.mark('buffered-clock', 'buffered prompt', 10_000);
+
+    expect(q.peek()[0]).toMatchObject({
+      markTimeMs: 10_000,
+      transcriptStartTimeMs: 8_000,
+    });
+    q.ingest([{
+      ...asstEv('buffered done', 'a-buffered-clock', 8_001),
+      sourceTurnId: 'native-buffered-clock',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'buffered-clock', finalText: 'buffered done', sourceTurnId: 'native-buffered-clock',
+    })]);
   });
 
   it('does not replay buffered events older than the 5s skew window', () => {

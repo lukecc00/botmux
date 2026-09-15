@@ -37,6 +37,8 @@
  *              BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL drives the injection.
  *   nowake   — reproduces the pre-fix teardown (destroy + unlink, no wake-up
  *              byte) and MUST hang, proving the harness has teeth
+ *   drain    — kill() then return, no process.exit(). bun test waits for the
+ *              event loop to empty; process.exit() would hide a leftover handle
  */
 import fs from 'node:fs';
 import { TmuxPipeBackend, __testOnly_liveFifoReaderCount as readerRegistrySize } from '../../src/adapters/backend/tmux-pipe-backend.js';
@@ -61,7 +63,9 @@ if (mode === 'spawnfail') {
   // leaky one. Assert on the observable leak instead: after a failed spawn no
   // reader may remain registered, and the fifo must be gone from disk.
   const leakedReaders = readerRegistrySize();
-  const fifoLeft = fs.existsSync((failing as unknown as { fifoPath: string }).fifoPath);
+  const failedFifoPath = (failing as unknown as { fifoPath: string }).fifoPath;
+  const fifoLeft = fs.existsSync(failedFifoPath);
+  process.stdout.write(`FIFO_PATH=${failedFifoPath}\n`);
   process.stdout.write(`LEAKED_READERS=${leakedReaders} FIFO_LEFT=${fifoLeft}\n`);
   // Yield first. libuv only parks the blocking fifo read on a threadpool
   // thread after one event-loop turn, and spawn() throws synchronously — exit
@@ -87,7 +91,9 @@ if (mode === 'wakefail') {
   } catch {
     threw = true;
   }
-  const fifoLeft = fs.existsSync((doomed as unknown as { fifoPath: string }).fifoPath);
+  const doomedFifoPath = (doomed as unknown as { fifoPath: string }).fifoPath;
+  const fifoLeft = fs.existsSync(doomedFifoPath);
+  process.stdout.write(`FIFO_PATH=${doomedFifoPath}\n`);
   process.stdout.write(`SPAWN_THREW=${threw} LEAKED_READERS=${readerRegistrySize()} FIFO_LEFT=${fifoLeft}\n`);
   // Same reason as the spawnfail case: give libuv a turn to park a read, so a
   // fail-open regression actually gets the chance to wedge this process.
@@ -112,6 +118,12 @@ if (typeof fifoFd !== 'number' || !readStream) {
   process.exit(2);
 }
 const fifoPath = (backend as unknown as { fifoPath: string }).fifoPath;
+// Announce the EXACT fifo this run owns, before any teardown. The parent needs
+// it to assert cleanup against one known path instead of diffing the shared
+// tmpdir — that directory belongs to the whole machine (every live daemon
+// worker creates `botmux-pipe-*.fifo` there), so a directory diff is a race
+// against unrelated processes, not a property of this code.
+process.stdout.write(`FIFO_PATH=${fifoPath}\n`);
 
 // Give libuv a moment to park a threadpool read on the fifo. Without a read in
 // flight there is nothing to wedge and both variants would exit cleanly.
@@ -184,7 +196,9 @@ setTimeout(() => {
   process.stdout.write(
     `LEAKED_READERS=${readerRegistrySize()} FIFO_LEFT=${fs.existsSync(fifoPath)}\n`,
   );
-  process.exit(0);
+  // bun test does not force-exit: a leftover fifo handle keeps the process
+  // alive after every assertion has passed. process.exit() would hide that.
+  if (mode !== 'drain') process.exit(0);
 }, 250);
 
 }

@@ -183,6 +183,39 @@ describe('schedule-store', () => {
       const same = createTask({ ...TASK_PARAMS, id: 'fixed-id1', silent: true });
       expect(same.id).toBe('fixed-id1');
     });
+
+    it('keeps the legacy single-chat canonical hash and persisted shape byte-for-byte compatible', async () => {
+      const { canonicalScheduleInput, createTask } = await freshImport();
+      const { computeInputHash } = await import('../src/utils/canonical-input-hash.js');
+
+      expect(computeInputHash(canonicalScheduleInput(TASK_PARAMS))).toBe(
+        'sha256:76ce65e79bd591dfe41be58c70326f8c4c7640eab87b3dfe0271dbe976c5089d',
+      );
+      const task = createTask({ ...TASK_PARAMS, chatIds: [TASK_PARAMS.chatId] });
+      expect(task).toMatchObject({ chatId: TASK_PARAMS.chatId });
+      expect(task.chatIds).toBeUndefined();
+      const persisted = JSON.parse(readFileSync(storeFp(), 'utf-8'))[task.id];
+      expect('chatIds' in persisted).toBe(false);
+    });
+
+    it('normalizes, deduplicates and persists deterministic multi-chat targets', async () => {
+      const store = await freshImport();
+      const task = store.createTask({
+        ...TASK_PARAMS,
+        chatId: 'oc_stale_legacy_primary',
+        chatIds: [' oc_primary ', 'oc_second', 'oc_primary', 'oc_third'],
+      });
+
+      expect(task.chatId).toBe('oc_primary');
+      expect(task.chatIds).toEqual(['oc_primary', 'oc_second', 'oc_third']);
+      expect(store.effectiveScheduleChatIds(task)).toEqual(['oc_primary', 'oc_second', 'oc_third']);
+
+      const reloaded = await freshImport();
+      expect(reloaded.getTask(task.id)).toMatchObject({
+        chatId: 'oc_primary',
+        chatIds: ['oc_primary', 'oc_second', 'oc_third'],
+      });
+    });
   });
 
   describe('getTask', () => {
@@ -267,6 +300,27 @@ describe('schedule-store', () => {
 
       updateTask(task.id, { deliver: 'origin' });
       expect(getTask(task.id)!.deliver).toBe('origin');
+    });
+
+    it('atomically changes multi-chat targets and removes chatIds when collapsed to one', async () => {
+      const { createTask, updateTask, getTask } = await freshImport();
+      const task = createTask({
+        ...TASK_PARAMS,
+        chatIds: ['oc_one', 'oc_two', 'oc_one'],
+      });
+      expect(task).toMatchObject({ chatId: 'oc_one', chatIds: ['oc_one', 'oc_two'] });
+
+      updateTask(task.id, { chatIds: ['oc_three', 'oc_three', 'oc_four'] });
+      expect(getTask(task.id)).toMatchObject({
+        chatId: 'oc_three',
+        chatIds: ['oc_three', 'oc_four'],
+      });
+
+      updateTask(task.id, { chatIds: ['oc_four'] });
+      expect(getTask(task.id)).toMatchObject({ chatId: 'oc_four' });
+      expect(getTask(task.id)?.chatIds).toBeUndefined();
+      const persisted = JSON.parse(readFileSync(storeFp(), 'utf-8'))[task.id];
+      expect('chatIds' in persisted).toBe(false);
     });
 
     it('normalizes a legacy new-topic create to origin across reloads', async () => {
@@ -373,6 +427,41 @@ describe('schedule-store', () => {
       expect(reloaded!.lastRunAt).toBe('2026-01-01T00:00:00.000Z');
     });
 
+    // 每次 reload 都按 normalizeTask 的字段白名单重建任务对象，白名单漏一个字段就
+    // 会在重启后静默丢失（ownerOpenId 踩过一次）。这条往返用例是那两行的红灯：
+    // 只测 createTask 的返回值不会发现丢字段，因为丢弃发生在读盘那一侧。
+    it('should persist the per-task model / reasoningEffort across reloads', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask({
+        ...TASK_PARAMS,
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      });
+      expect(task.model).toBe('gpt-5.6-sol');
+
+      const store2 = await freshImport();
+      const reloaded = store2.getTask(task.id);
+      expect(reloaded).toBeDefined();
+      expect(reloaded!.model).toBe('gpt-5.6-sol');
+      expect(reloaded!.reasoningEffort).toBe('ultra');
+    });
+
+    // 手改过的 JSON 里的垃圾值不该被带到执行时 —— 那里只会变成一次 CLI 报错。
+    it('should drop a hand-edited junk model / effort on reload', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask(TASK_PARAMS);
+      const fp = storeFp();
+      const raw = JSON.parse(readFileSync(fp, 'utf-8'));
+      raw[task.id].model = '   ';
+      raw[task.id].reasoningEffort = 'turbo';
+      writeFileSync(fp, JSON.stringify(raw));
+
+      const store2 = await freshImport();
+      const reloaded = store2.getTask(task.id);
+      expect(reloaded!.model).toBeUndefined();
+      expect(reloaded!.reasoningEffort).toBeUndefined();
+    });
+
     it('should persist removals across reloads', async () => {
       const store1 = await freshImport();
       const task = store1.createTask(TASK_PARAMS);
@@ -418,6 +507,29 @@ describe('schedule-store', () => {
       const normalized = JSON.parse(readFileSync(fp, 'utf-8'));
       expect(normalized['legacy-scope'].scope).toBe('chat');
       expect(normalized['legacy-scope'].parsed.kind).toBe('cron');
+    });
+
+    it('ignores one malformed chatIds value without dropping other stored tasks', async () => {
+      const fp = storeFp();
+      mkdirSync(dirname(fp), { recursive: true });
+      const row = (id: string, chatId: string, chatIds?: unknown) => ({
+        ...TASK_PARAMS,
+        id,
+        chatId,
+        chatIds,
+        enabled: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+      });
+      writeFileSync(fp, JSON.stringify({
+        malformed: row('malformed', 'oc_legacy_fallback', ['oc_good', 42]),
+        healthy: row('healthy', 'oc_healthy', ['oc_healthy', 'oc_second']),
+      }), 'utf-8');
+
+      const store = await freshImport();
+      expect(store.listTasks()).toHaveLength(2);
+      expect(store.getTask('malformed')).toMatchObject({ chatId: 'oc_legacy_fallback' });
+      expect(store.getTask('malformed')?.chatIds).toBeUndefined();
+      expect(store.getTask('healthy')?.chatIds).toEqual(['oc_healthy', 'oc_second']);
     });
 
     it('rolls back memory and disk when persistence fails before rename', async () => {

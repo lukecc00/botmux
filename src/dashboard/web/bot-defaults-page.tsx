@@ -47,6 +47,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -67,7 +68,35 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { lookupCliSelection } from '../../setup/cli-selection.js';
+import {
+  STREAMING_CARD_BUTTON_IDS,
+  type StreamingCardButtonId,
+} from '../../im/lark/streaming-card-buttons.js';
+
+/** The reasoning-effort selector, its option list and the save payload must all
+ *  agree on which CLIs are configurable — they were three separate inline
+ *  predicates and drifted (claude-code reached the selector but the save path
+ *  still blanked it out). Single source now.
+ *
+ *  The dropdown hands us a *selection key*, which for gateway entries is not a
+ *  CliId: `aiden-x-claude`, `cjadk-x-claude` and `ttadk-x-claude` all resolve to
+ *  `claude-code` (and the `-codex` family likewise). Matching on the raw key
+ *  would hide the selector for every wrapped bot and blank its stored effort on
+ *  save, even though the wrapper only replaces the binary — `stripWrapperUnsafeArgs`
+ *  removes `--settings`, botmux's `-c` overrides and `--dangerously-bypass-hook-trust`,
+ *  never `--effort`. So resolve the key first. */
+function reasoningCatalogKey(cliKey: string): string | undefined {
+  const cliId = lookupCliSelection(cliKey)?.cliId ?? cliKey;
+  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code') return cliId;
+  if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
+  return undefined;
+}
+
+function cliSupportsReasoningEffort(cliKey: string): boolean {
+  return reasoningCatalogKey(cliKey) !== undefined;
+}
 import {
   REPLY_HEADER_COLORS,
   REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
@@ -93,7 +122,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string | number | Record<string, unknown>>;
+type CardPrefPatch = Record<string, boolean | string | number | Record<string, unknown> | StreamingCardButtonId[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -102,6 +131,14 @@ type JsonResponse = {
 };
 
 type RuntimeMode = 'official' | 'legacy' | 'custom';
+type NativePolicyMode = 'passthrough' | 'custom';
+type NativeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+type NativePolicyErrors = { model: string | null; effort: string | null };
+
+function nativePolicyModeFrom(policy: { mode?: unknown } | undefined): NativePolicyMode {
+  return policy?.mode === 'custom' ? 'custom' : 'passthrough';
+}
+
 type RuntimeDraft = {
   mode: RuntimeMode;
   id: string;
@@ -455,7 +492,7 @@ type DropdownFieldOption<T extends string> = {
   disabled?: boolean;
 };
 
-function DropdownField<T extends string>(props: {
+export function DropdownField<T extends string>(props: {
   dataInput: string;
   value: T;
   options: DropdownFieldOption<T>[];
@@ -507,6 +544,7 @@ export function ModelPickerField(props: {
   ariaLabel: string;
   defaultLabel: string;
   customLabel: string;
+  includeDefault?: boolean;
   detectedCount?: number;
   detectedLabel?: string;
   /** 下拉菜单样式类：defaults 页传 bd-field-menu，onboarding 传 onboarding-menu。 */
@@ -518,13 +556,14 @@ export function ModelPickerField(props: {
   const current = props.value;
   const dropdownOptions = useMemo(() => {
     const opts: { value: string; label: ReactNode }[] = [];
+    if (props.includeDefault) opts.push({ value: '', label: props.defaultLabel });
     if (current && !props.options.includes(current)) {
       opts.push({ value: current, label: current });
     }
     for (const item of props.options) opts.push({ value: item, label: item });
     opts.push({ value: MODEL_PICKER_CUSTOM, label: props.customLabel });
     return opts;
-  }, [current, props.options, props.customLabel]);
+  }, [current, props.options, props.customLabel, props.includeDefault, props.defaultLabel]);
 
   return (
     <span className="bd-model-picker">
@@ -733,12 +772,15 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
+    replyCardMode: body.replyCardMode,
+    hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     thinkingCard: body.thinkingCard,
+    thinkingCardToolResult: body.thinkingCardToolResult,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
@@ -826,7 +868,9 @@ export function BotDefaultsPage() {
       return;
     }
     if (!selectedAppId || !filtered.some(bot => bot.larkAppId === selectedAppId)) {
-      setSelectedAppId(filtered[0].larkAppId);
+      const firstBot = filtered[0];
+      setSelectedAppId(firstBot.larkAppId);
+      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
     }
   }, [filtered, loadError, loading, selectedAppId]);
 
@@ -865,6 +909,7 @@ export function BotDefaultsPage() {
       <BotDefaultsCard
         key={`${selectedBot.larkAppId}:${profileRoleVersion}`}
         bot={selectedBot}
+        bots={bots}
         cliState={cliState}
         patchBot={patchBot}
         activeTab={activeTab}
@@ -944,7 +989,10 @@ export function BotDefaultsPage() {
                 key={bot.larkAppId}
                 bot={bot}
                 selected={bot.larkAppId === selectedAppId}
-                onSelect={() => setSelectedAppId(bot.larkAppId)}
+                onSelect={() => {
+                  setSelectedAppId(bot.larkAppId);
+                  if (bot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
+                }}
               />
             ))}
           </div>
@@ -956,6 +1004,7 @@ export function BotDefaultsPage() {
 }
 
 function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect(): void }) {
+  const tr = useT();
   const { bot } = props;
   const name = bot.botName ?? bot.larkAppId;
   const cli = displayCliId(bot, cliIdOf(bot.larkAppId));
@@ -978,13 +1027,17 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
         <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
-      {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+        ? <span className="bd-roster-flag bd-roster-flag-blocked">{tr('botDefaults.startupBlockedBadge')}</span>
+        : bot.online === false ? <span className="bd-roster-flag">{tr('botDefaults.offlineBadge')}</span>
+        : bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
     </div>
   );
 }
 
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
+  bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
   activeTab: BotDefaultsTab;
@@ -1032,7 +1085,10 @@ function BotDefaultsCard(props: {
               patchBot={patchBot}
               meta={(
                 <>
-                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+                    ? <small className="bd-meta-blocked">● {tr('botDefaults.metaStartupBlocked')}</small>
+                    : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
+                    : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
                   {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
                 </>
@@ -1043,6 +1099,12 @@ function BotDefaultsCard(props: {
         </header>
         <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
       </div>
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle' ? (
+        <div className="bd-startup-blocked" role="alert" data-startup-blocked>
+          <strong>{tr('botDefaults.startupBlockedTitle')}</strong>
+          <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
+        </div>
+      ) : null}
       <div className="bd-body bd-tab-panels">
         <div
           id="bd-panel-common"
@@ -1100,6 +1162,7 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1145,6 +1208,7 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1255,6 +1319,145 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
           </div>
         </details>
       ) : null}
+    </section>
+  );
+}
+
+type QuotaFallbackKind = 'usage' | 'rate';
+
+function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow[]; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackBot ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [targetAppId, setTargetAppId] = useState(initial?.targetAppId ?? '');
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [message, setMessage] = useState(initial?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackBot ?? null;
+    setEnabled(next?.enabled === true);
+    setTargetAppId(next?.targetAppId ?? '');
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setMessage(next?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  }, [props.bot.quotaFallbackBot, tr]);
+
+  const targetOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackTargetPlaceholder') },
+    ...props.bots
+      .filter(candidate => candidate.larkAppId !== props.bot.larkAppId && !candidate.error)
+      .map(candidate => ({
+        value: candidate.larkAppId,
+        label: `${candidate.botName ?? candidate.larkAppId} · ${candidate.larkAppId}`,
+      })),
+  ], [props.bot.larkAppId, props.bots, tr]);
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    const cleanMessage = message.trim();
+    if (enabled && !targetAppId) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackTargetRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    if (enabled && (!cleanMessage || Array.from(cleanMessage).length > 1000 || /<\s*at\b/i.test(cleanMessage))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackMessageInvalid')}` });
+      return;
+    }
+
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback`,
+        { enabled, targetAppId, kinds, message: cleanMessage },
+      );
+      if (res.ok && res.body.ok) {
+        const config = res.body.quotaFallbackBot ?? null;
+        props.patchBot(props.bot.larkAppId, {
+          quotaFallbackBot: config,
+          ...(res.body.restartRequired ? { startupBlocked: undefined } : {}),
+        });
+        setStatus({
+          text: `✓ ${res.body.restartRequired ? tr('botDefaults.quotaFallbackSavedRestart') : tr('botDefaults.cardPrefSaved')}`,
+          ok: true,
+        });
+      } else if (res.body?.error === 'quota_fallback_cycle') {
+        const cycle = Array.isArray(res.body?.cycle) ? res.body.cycle.join(' → ') : '';
+        const text = tr('botDefaults.quotaFallbackCycle', { cycle });
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error', duration: 8_000 });
+      } else if (res.body?.error === 'quota_fallback_target_not_local') {
+        const text = tr('botDefaults.quotaFallbackTargetNotLocal');
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error' });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback" data-quota-fallback>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackHelp')}>{tr('botDefaults.quotaFallbackTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback"
+        title={tr('botDefaults.quotaFallbackEnabled')}
+        help={tr('botDefaults.quotaFallbackEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.quotaFallbackTargetHelp')}>{tr('botDefaults.quotaFallbackTarget')}</FieldTitle>
+          <DropdownField<string>
+            dataInput="quotaFallbackTarget"
+            ariaLabel={tr('botDefaults.quotaFallbackTarget')}
+            value={targetAppId}
+            disabled={busy || !enabled}
+            options={targetOptions}
+            searchable
+            onChange={setTargetAppId}
+          />
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.quotaFallbackMessageHelp')}>{tr('botDefaults.quotaFallbackMessage')}</FieldTitle></span>
+          <textarea rows={3} maxLength={1000} data-input="quotaFallbackMessage" value={message} disabled={busy || !enabled} onChange={event => setMessage(event.currentTarget.value)} />
+        </label>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackCycleNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
     </section>
   );
 }
@@ -2056,7 +2259,15 @@ export function BotAgentSection(props: {
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
+  const [modelBackendVariant, setModelBackendVariant] = useState<'' | 'standard' | 'max'>(bot.modelBackendVariant ?? '');
+  const [modelBackendVariantTouched, setModelBackendVariantTouched] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
+  const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
+  const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
+  const [nativeEffort, setNativeEffort] = useState<'' | NativeEffort>(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
+  const [nativePolicyTouched, setNativePolicyTouched] = useState(false);
+  const [nativePolicyErrors, setNativePolicyErrors] = useState<NativePolicyErrors>({ model: null, effort: null });
   // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
   // the runner default (10 min). `touched` gates whether a save sends the field
   // at all: an untouched field is omitted so the daemon preserves the exact
@@ -2086,7 +2297,15 @@ export function BotAgentSection(props: {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
+    setModelBackendVariant(bot.modelBackendVariant ?? '');
+    setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
+    setNativeModel(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
+    setNativeEffortMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
+    setNativeEffort(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
+    setNativePolicyTouched(false);
+    setNativePolicyErrors({ model: null, effort: null });
     setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
     setTurnTimeoutTouched(false);
     setTurnTimeoutError(null);
@@ -2102,7 +2321,9 @@ export function BotAgentSection(props: {
     bot.cliId,
     bot.larkAppId,
     bot.model,
+    bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
     bot.dshRuntime,
     runtimeConfigKey,
@@ -2164,6 +2385,10 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
+    if (nextKey !== 'traex') {
+      setModelBackendVariant('');
+      setModelBackendVariantTouched(true);
+    }
   }
 
   function updateRuntimeMode(mode: RuntimeMode): void {
@@ -2183,6 +2408,7 @@ export function BotAgentSection(props: {
   async function saveAgent(): Promise<void> {
     setAgentStatus(null);
     setRuntimeStatus(null);
+    setNativePolicyErrors({ model: null, effort: null });
     let cliRuntime: CliRuntimeConfig | null | undefined;
     if (runtimeTouched) cliRuntime = null;
     if (runtimeTouched && cliKey === 'codex' && runtimeDraft.mode === 'custom') {
@@ -2227,12 +2453,35 @@ export function BotAgentSection(props: {
       setTurnTimeoutError(null);
       turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
     }
+    const trimmedNativeModel = nativeModel.trim();
+    if (cliKey === 'traex') {
+      const nextNativePolicyErrors: NativePolicyErrors = {
+        model: nativeModelMode === 'custom' && !trimmedNativeModel ? tr('botDefaults.nativeSubagentModelRequired') : null,
+        effort: nativeEffortMode === 'custom' && !nativeEffort ? tr('botDefaults.nativeSubagentReasoningEffortRequired') : null,
+      };
+      if (nextNativePolicyErrors.model || nextNativePolicyErrors.effort) {
+        setNativePolicyErrors(nextNativePolicyErrors);
+        setAgentStatus({ text: `✗ ${tr('botDefaults.nativeSubagentIncomplete')}` });
+        return;
+      }
+    }
     setAgentBusy(true);
     try {
+      const nativeSubagentRuntime = nativeModelMode === 'passthrough' && nativeEffortMode === 'passthrough'
+        ? null
+        : {
+            ...(nativeModelMode === 'custom'
+              ? { model: { mode: 'custom' as const, value: trimmedNativeModel } }
+              : {}),
+            ...(nativeEffortMode === 'custom'
+              ? { reasoningEffort: { mode: 'custom' as const, value: nativeEffort } }
+              : {}),
+          };
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        ...(cliKey === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2242,6 +2491,7 @@ export function BotAgentSection(props: {
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
+        ...(cliKey === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
@@ -2283,7 +2533,9 @@ export function BotAgentSection(props: {
             : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
+          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
@@ -2295,9 +2547,17 @@ export function BotAgentSection(props: {
           typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
         ));
         setTurnTimeoutTouched(false);
+        setModelBackendVariant(res.body.modelBackendVariant ?? '');
+        setModelBackendVariantTouched(false);
         setTurnTimeoutError(null);
         setDshRuntimeTouched(false);
         setRuntimeTouched(false);
+        setNativePolicyTouched(false);
+        const savedNativePolicy = res.body.nativeSubagentRuntime;
+        setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
+        setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
+        setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
+        setNativeEffort(savedNativePolicy?.reasoningEffort?.mode === 'custom' ? savedNativePolicy.reasoningEffort.value : '');
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
           if (probe && typeof probe.version === 'string') {
@@ -2365,13 +2625,22 @@ export function BotAgentSection(props: {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
       const summary = parseAgentSwitchSummary(res.body);
       if (res.ok && res.body.ok) {
+        const savedNativePolicy = res.body.nativeSubagentRuntime;
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime ?? null,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
+          nativeSubagentRuntime: savedNativePolicy ?? undefined,
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
+        setReasoningEffort(res.body.reasoningEffort ?? '');
+        setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
+        setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
+        setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
+        setNativeEffort(savedNativePolicy?.reasoningEffort?.mode === 'custom' ? savedNativePolicy.reasoningEffort.value : '');
+        setNativePolicyTouched(false);
         const note = [
           summary.residual > 0 ? tr('botDefaults.agentClosedResidual', { count: summary.residual }) : '',
           residualIdText(summary, tr),
@@ -2417,18 +2686,57 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
+  const isTraex = cliKey === 'traex';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex';
+  const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
+    () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
     [cliKey, isCodexSelection, model],
+  );
+  const nativeReasoningEffortOptions = useMemo(
+    () => nativeModelMode === 'custom'
+      ? reasoningEffortsForCliModel('traex', nativeModel)
+      : CODEX_REASONING_EFFORTS,
+    [nativeModel, nativeModelMode],
   );
 
   useEffect(() => {
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
   }, [reasoningEffort, reasoningEffortOptions]);
+  useEffect(() => {
+    if (nativeModelMode !== 'custom') {
+      if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));
+      return;
+    }
+    if (nativePolicyErrors.model && nativeModel.trim()) {
+      setNativePolicyErrors(current => ({ ...current, model: null }));
+    }
+  }, [nativeModel, nativeModelMode, nativePolicyErrors.model]);
+  useEffect(() => {
+    if (nativeEffortMode !== 'custom') {
+      if (nativePolicyErrors.effort) setNativePolicyErrors(current => ({ ...current, effort: null }));
+      return;
+    }
+    if (nativePolicyErrors.effort && nativeEffort) {
+      setNativePolicyErrors(current => ({ ...current, effort: null }));
+    }
+  }, [nativeEffort, nativeEffortMode, nativePolicyErrors.effort]);
+  useEffect(() => {
+    if (
+      cliKey === 'traex'
+      && nativePolicyTouched
+      && nativeEffortMode === 'custom'
+      && nativeEffort
+      && !nativeReasoningEffortOptions.includes(nativeEffort)
+    ) {
+      setNativeEffortMode('passthrough');
+      setNativeEffort('');
+      setNativePolicyTouched(true);
+      setNativePolicyErrors(current => ({ ...current, effort: null }));
+    }
+  }, [cliKey, nativeEffort, nativeEffortMode, nativePolicyTouched, nativeReasoningEffortOptions]);
   // Old dashboard payloads can omit agentSelectionKey while still carrying a
   // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
   // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
@@ -2623,6 +2931,28 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      {isTraex && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.agentModelBackendVariantHelp')}>{tr('botDefaults.agentModelBackendVariant')}</FieldTitle>
+            <DropdownField
+              dataInput="agentModelBackendVariant"
+              ariaLabel={tr('botDefaults.agentModelBackendVariant')}
+              value={modelBackendVariant}
+              disabled={agentBusy}
+              options={[
+                { value: '', label: tr('botDefaults.agentModelBackendVariantDefault') },
+                { value: 'standard', label: tr('botDefaults.agentModelBackendVariantStandard') },
+                { value: 'max', label: tr('botDefaults.agentModelBackendVariantMax') },
+              ]}
+              onChange={next => {
+                setModelBackendVariant(next as '' | 'standard' | 'max');
+                setModelBackendVariantTouched(true);
+              }}
+            />
+          </div>
+        </div>
+      )}
       {isDsh && (
         <div className="bd-row">
           <div className="bd-field">
@@ -2758,6 +3088,96 @@ export function BotAgentSection(props: {
               ]}
               onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
             />
+          </div>
+        </div>
+      )}
+      {cliKey === 'traex' && (
+        <div className="bd-codex-runtime" data-native-subagent-runtime="">
+          <div className="bd-runtime-heading">
+            <FieldTitle help={tr('botDefaults.nativeSubagentHelp')}>{tr('botDefaults.nativeSubagentTitle')}</FieldTitle>
+          </div>
+          <div className="bd-row">
+            <div className="bd-field">
+              <span>{tr('botDefaults.nativeSubagentModel')}</span>
+              <DropdownField
+                dataInput="nativeSubagentModelMode"
+                ariaLabel={tr('botDefaults.nativeSubagentModel')}
+                value={nativeModelMode}
+                disabled={agentBusy}
+                options={[
+                  { value: 'passthrough', label: tr('botDefaults.nativeSubagentPassthrough') },
+                  { value: 'custom', label: tr('botDefaults.nativeSubagentCustom') },
+                ]}
+                onChange={next => { setNativeModelMode(next as NativePolicyMode); setNativePolicyTouched(true); }}
+              />
+            </div>
+            {nativeModelMode === 'custom' ? (
+              <label>
+                <span>{tr('botDefaults.nativeSubagentCustomModel')}</span>
+                <ModelPickerField
+                  value={nativeModel}
+                  onChange={next => {
+                    setNativeModel(next);
+                    setNativePolicyTouched(true);
+                    if (nativePolicyErrors.model && next.trim()) {
+                      setNativePolicyErrors(current => ({ ...current, model: null }));
+                    }
+                  }}
+                  options={modelCandidates}
+                  disabled={agentBusy}
+                  busy={detectingModels}
+                  dataInput="nativeSubagentModel"
+                  ariaLabel={tr('botDefaults.nativeSubagentCustomModel')}
+                  defaultLabel={tr('botDefaults.modelPickerDefault')}
+                  customLabel={tr('botDefaults.modelPickerCustom')}
+                  menuClassName="bd-field-menu"
+                />
+                {nativePolicyErrors.model ? (
+                  <small className="hint-warn" data-native-subagent-error="">{nativePolicyErrors.model}</small>
+                ) : null}
+              </label>
+            ) : null}
+          </div>
+          <div className="bd-row">
+            <div className="bd-field">
+              <span>{tr('botDefaults.nativeSubagentReasoningEffort')}</span>
+              <DropdownField
+                dataInput="nativeSubagentReasoningEffortMode"
+                ariaLabel={tr('botDefaults.nativeSubagentReasoningEffort')}
+                value={nativeEffortMode}
+                disabled={agentBusy}
+                options={[
+                  { value: 'passthrough', label: tr('botDefaults.nativeSubagentPassthrough') },
+                  { value: 'custom', label: tr('botDefaults.nativeSubagentCustom') },
+                ]}
+                onChange={next => { setNativeEffortMode(next as NativePolicyMode); setNativePolicyTouched(true); }}
+              />
+            </div>
+            {nativeEffortMode === 'custom' ? (
+              <div className="bd-field">
+                <span>{tr('botDefaults.nativeSubagentCustomReasoningEffort')}</span>
+                <DropdownField
+                  dataInput="nativeSubagentReasoningEffort"
+                  ariaLabel={tr('botDefaults.nativeSubagentCustomReasoningEffort')}
+                  value={nativeEffort}
+                  disabled={agentBusy}
+                  options={nativeReasoningEffortOptions.map(value => ({
+                    value,
+                    label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
+                  }))}
+                  onChange={next => {
+                    setNativeEffort(next as NativeEffort);
+                    setNativePolicyTouched(true);
+                    if (nativePolicyErrors.effort && next) {
+                      setNativePolicyErrors(current => ({ ...current, effort: null }));
+                    }
+                  }}
+                />
+                {nativePolicyErrors.effort ? (
+                  <small className="hint-warn" data-native-subagent-error="">{nativePolicyErrors.effort}</small>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       )}
@@ -3068,6 +3488,154 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
         <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
       </div>
     </div>
+  );
+}
+
+/**
+ * Trigger-user CLI auth.
+ *
+ * Sits in the security tab beside sandbox / Codex credentials / grants — this is
+ * the same class of setting: who a session acts as.
+ *
+ * The shape mirrors SandboxSection: a main toggle, with the detail controls
+ * appearing only once it is on. Tools are checkboxes rather than separate toggles
+ * because they are one feature's scope, not two independent capabilities.
+ *
+ * The two advisories are shown, not hidden. Without the file sandbox the agent
+ * can read other people's token files directly, and a self-credentialed MCP
+ * server bypasses the wrapper entirely — an operator who is not told either of
+ * those would believe the boundary is complete.
+ */
+function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const policy = bot.triggerUserAuth ?? null;
+  const enabled = policy?.enabled === true;
+  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
+  const fallback = policy?.fallback ?? 'bot-identity';
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [info, setInfo] = useState<{
+    authorizedCount?: number;
+    tokenStoreAdvisory?: string;
+    mcpAdvisory?: string;
+  } | null>(null);
+
+  // Only fetch the advisories when the feature is on: they describe THIS
+  // policy's limits, and showing them for a bot that never enabled it would be
+  // noise about a boundary nobody asked for.
+  useEffect(() => {
+    if (!enabled) { setInfo(null); return; }
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth-status`, undefined);
+        if (alive && res.ok && res.body.ok) setInfo(res.body as any);
+      } catch { /* advisory only — never block the panel on it */ }
+    })();
+    return () => { alive = false; };
+  }, [bot.larkAppId, enabled]);
+
+  async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
+    const previous = policy;
+    setStatus(null);
+    setBusy(true);
+    patchBot(bot.larkAppId, { triggerUserAuth: next });
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+        triggerUserAuth: next,
+      });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.triggerUserAuthSaved')}`, ok: true });
+      } else {
+        patchBot(bot.larkAppId, { triggerUserAuth: previous });
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      patchBot(bot.larkAppId, { triggerUserAuth: previous });
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
+    void save({ enabled: true, tools: next, fallback });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-trigger-user-auth"
+        title={tr('botDefaults.triggerUserAuthToggle')}
+        help={tr('botDefaults.triggerUserAuthHelp')}
+        onChange={checked => void save(
+          checked ? { enabled: true, tools, fallback } : null,
+        )}
+      />
+      {enabled ? (
+        <>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthTools')}</span>
+            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+              <label key={tool} className="bd-inline-check">
+                <input
+                  type="checkbox"
+                  data-action={`trigger-user-auth-tool-${tool}`}
+                  checked={tools.includes(tool)}
+                  disabled={busy}
+                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                />
+                <span>{tool}</span>
+              </label>
+            ))}
+          </div>
+          <div className="bd-row">
+            <label>
+              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
+              <select
+                data-input="triggerUserAuthFallback"
+                value={fallback}
+                disabled={busy}
+                onChange={event => void save({
+                  enabled: true,
+                  tools,
+                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
+                })}
+              >
+                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
+                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
+              </select>
+            </label>
+          </div>
+          {tools.includes('bytedcli') ? (
+            <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
+          ) : null}
+          {typeof info?.authorizedCount === 'number' ? (
+            <p className="bd-section-note" data-trigger-user-auth-authorized="">
+              {tr('botDefaults.triggerUserAuthAuthorized', { count: String(info.authorizedCount) })}
+            </p>
+          ) : null}
+          {info?.tokenStoreAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-token-advisory="">
+              ⚠️ {info.tokenStoreAdvisory}
+            </p>
+          ) : null}
+          {info?.mcpAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-mcp-advisory="">
+              ⚠️ {info.mcpAdvisory}
+            </p>
+          ) : null}
+        </>
+      ) : null}
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-trigger-user-auth-status': '' }} />
+      </div>
+    </section>
   );
 }
 
@@ -3721,23 +4289,29 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const { bot, putCardPref } = props;
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
+  const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
+  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
+    setReplyMode(bot.replyCardMode ?? 'legacy');
+    setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
-  }, [bot.disableStreamingCard, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -3763,12 +4337,54 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
     { value: 'off', label: tr('botDefaults.usageDisplayOff') },
   ];
+  const buttonOptions: Array<{ id: StreamingCardButtonId; title: string; description: string }> =
+    STREAMING_CARD_BUTTON_IDS.map(id => ({
+      id,
+      title: tr(`botDefaults.streamingButton.${id}`),
+      description: tr(`botDefaults.streamingButton.${id}Description`),
+    }));
+  const pinToggle = <StreamingCardPinToggle
+    scope="bot-defaults"
+    checked={pinStreamingCard}
+    disabled={busy !== null}
+    dataAction="toggle-pin-streaming-card"
+    title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
+    description={tr('botDefaults.pinStreamingCardDescription')}
+    help={replyMode === 'legacy' ? tr('botDefaults.pinStreamingCardHelp') : undefined}
+    onChange={checked => {
+      const previous = pinStreamingCard;
+      setPinStreamingCard(checked);
+      void savePatch({ pinStreamingCard: checked }, 'pin-streaming', () => setPinStreamingCard(previous));
+    }}
+  />;
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
       <div className="bd-card-settings">
         <section className="bd-card-setting-group" data-card-feedback-group>
           <h4 className="bd-card-setting-heading">{tr('botDefaults.cardFeedbackGroup')}</h4>
+          <div className="bd-row bd-card-display">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.replyCardModeHelp')}>{tr('botDefaults.replyCardMode')}</FieldTitle>
+              <DropdownField
+                dataInput="replyCardMode"
+                ariaLabel={tr('botDefaults.replyCardMode')}
+                value={replyMode}
+                disabled={busy !== null}
+                options={[
+                  { value: 'legacy', label: tr('botDefaults.replyCardLegacy') },
+                  { value: 'unified', label: tr('botDefaults.replyCardUnified') },
+                ]}
+                onChange={next => {
+                  const previous = replyMode;
+                  setReplyMode(next);
+                  void savePatch({ replyCardMode: next }, 'reply-mode', () => setReplyMode(previous));
+                }}
+              />
+            </div>
+            <p className="bd-card-setting-copy">{tr(replyMode === 'unified' ? 'botDefaults.replyCardUnifiedDescription'
+              : 'botDefaults.replyCardLegacyDescription')}</p>
+          </div>
           <ToggleRow
             className="bd-card-primary-toggle"
             checked={!disableStreaming}
@@ -3805,33 +4421,66 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             checked={thinkingCard}
             disabled={busy !== null}
             dataAction="toggle-thinking-card"
-            title={tr('botDefaults.thinkingCard')}
-            description={tr('botDefaults.thinkingCardDescription')}
-            help={tr('botDefaults.thinkingCardHelp')}
+            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
               const previous = thinkingCard;
               setThinkingCard(checked);
               void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
             }}
           />
-          <StreamingCardPinToggle
-            scope="bot-defaults"
-            checked={pinStreamingCard}
-            disabled={busy !== null}
-            dataAction="toggle-pin-streaming-card"
-            title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
-            description={tr('botDefaults.pinStreamingCardDescription')}
-            help={tr('botDefaults.pinStreamingCardHelp')}
-            onChange={checked => {
-              const previous = pinStreamingCard;
-              setPinStreamingCard(checked);
-              void savePatch(
-                { pinStreamingCard: checked },
-                'pin-streaming',
-                () => setPinStreamingCard(previous),
+          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
+            <ToggleRow
+              checked={thinkingCardToolResult}
+              disabled={busy !== null}
+              dataAction="toggle-thinking-card-tool-result"
+              title={tr('botDefaults.thinkingCardToolResult')}
+              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
+              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
+              onChange={checked => {
+                const previous = thinkingCardToolResult;
+                setThinkingCardToolResult(checked);
+                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
+              }}
+            />
+          </div>
+          {replyMode === 'legacy' && pinToggle}
+        </section>
+
+        <section className="bd-card-setting-group" data-card-buttons-group>
+          <h4 className="bd-card-setting-heading">{tr(replyMode === 'legacy' ? 'botDefaults.streamingButtons' : 'botDefaults.replyCardControls')}</h4>
+          {replyMode !== 'legacy' && <p className="bd-card-setting-copy">{tr('botDefaults.replyCardControlsHelp')}</p>}
+          <div className="bd-card-button-grid" data-card-button-grid>
+            {buttonOptions.map(option => {
+              const visible = !hiddenButtons.includes(option.id);
+              return (
+                <ToggleRow
+                  key={option.id}
+                  className="bd-card-button-toggle"
+                  checked={visible}
+                  disabled={busy !== null}
+                  dataAction={`toggle-streaming-button-${option.id}`}
+                  title={option.title}
+                  help={option.description}
+                  onChange={checked => {
+                    const previous = hiddenButtons;
+                    const hidden = new Set(hiddenButtons);
+                    if (checked) hidden.delete(option.id);
+                    else hidden.add(option.id);
+                    const next = STREAMING_CARD_BUTTON_IDS.filter(id => hidden.has(id));
+                    setHiddenButtons(next);
+                    void savePatch(
+                      { hiddenStreamingCardButtons: next },
+                      `streaming-button-${option.id}`,
+                      () => setHiddenButtons(previous),
+                    );
+                  }}
+                />
               );
-            }}
-          />
+            })}
+          </div>
+          {replyMode !== 'legacy' && pinToggle}
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
@@ -5278,8 +5927,8 @@ function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem)
 /** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的
  *  授权 UI（PR review：授权行必须与实际 tagMode 一致）。
  *  - feed-group（默认）：个人侧边栏分组，需一次 OAuth → 显示状态徽标 + 一键授权
- *  - chat-tag：应用租户身份打企业群标签，无需用户授权（部分租户权限目录无该
- *    scope）→ 不显示授权按钮
+ *  - chat-tag：应用租户身份打企业群标签，无需用户授权（但飞书尚未开放该能力，
+ *    im:tag scope 在权限目录里搜不到）→ 不显示授权按钮
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
@@ -7667,7 +8316,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     : quota > MAX_GRANT_QUOTA
       ? tr('botDefaults.quotaHelpLegacy', {
         cardCount: MAX_GRANT_QUOTA,
-        oncallCount: quota,
+        configuredCount: quota,
         defaultCount: DEFAULT_GRANT_QUOTA,
       })
       : tr('botDefaults.quotaHelpCustom', {
@@ -7685,7 +8334,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       ? tr('botDefaults.grantDefaultsCurrentLegacy', {
         duration: currentDurationLabel,
         cardCount: MAX_GRANT_QUOTA,
-        oncallCount: quota,
+        configuredCount: quota,
       })
       : tr('botDefaults.grantDefaultsCurrentCustom', {
         duration: currentDurationLabel,

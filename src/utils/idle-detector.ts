@@ -12,6 +12,36 @@ const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
 const SPINNER_GUARD_MS = 3_000;
 
+/** Strip ANSI escape sequences from a screen/PTY text before running
+ *  line-anchored adapter patterns. Shared by the IdleDetector PTY stream path
+ *  and the worker's viewport busy probes: both must see IDENTICAL text, since
+ *  patterns (e.g. claude-code's footer regex) anchor on `^` and tmux
+ *  `capture-pane -e` emits SGR color codes at line starts that break the
+ *  anchor unless stripped first. Cursor-forward sequences (`ESC[nC`) are
+ *  expanded to spaces because they represent real horizontal gaps.
+ *
+ *  Covers what tmux capture-pane actually emits (verified against tmux 3.5a
+ *  grid output): CSI with `:` subparameters (e.g. `ESC[4:3m`), OSC hyperlinks
+ *  terminated by ST (`ESC \`) as well as BEL, charset designation (`ESC( B`),
+ *  and bare SO/SI charset-shift bytes (0x0e/0x0f). Leaving any of these at a
+ *  line start keeps a `^`-anchored pattern from binding. */
+export function stripAnsiScreenText(str: string): string {
+  return str
+    // Cursor-forward: ESC[nC moves the cursor right n columns, which renders
+    // as real horizontal whitespace on screen — preserve it as spaces.
+    .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
+    // CSI: ESC[ params(0x30–0x3F, includes ':' ';' '?') intermediates final.
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    // OSC: ESC] ... terminated by BEL (0x07) or ST (ESC \).
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    // Charset designation: ESC ( B / ESC ) 0 etc.
+    .replace(/\x1b[()][0-9A-B]/g, '')
+    // Remaining two-byte escape sequences.
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    // Bare SO/SI (G0/G1 charset shift) control bytes.
+    .replace(/[\x0e\x0f]/g, '');
+}
+
 export class IdleDetector {
   private outputTail = '';
   private lastSpinnerAt = 0;
@@ -26,6 +56,11 @@ export class IdleDetector {
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
+  private startupPendingPattern: RegExp | undefined;
+  private startupReadyPattern: RegExp | undefined;
+  private startupTail = '';
+  private startupPending = false;
+  private startupComplete = false;
   /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
    *  chunks carrying explicit static-busy evidence (scanned across chunks
    *  via the rolling tail); suppresses screen-derived idle until a chunk
@@ -43,6 +78,8 @@ export class IdleDetector {
     this.staticBusyPattern = cli.staticBusyPattern;
     this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
+    this.startupPendingPattern = cli.startupPendingPattern;
+    this.startupReadyPattern = cli.startupReadyPattern;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -86,6 +123,31 @@ export class IdleDetector {
     }
 
     const stripped = this.stripAnsi(data);
+    if (!this.startupComplete && this.startupPendingPattern) {
+      // Preserve raw chunks until decoding: an ANSI style sequence can be
+      // split between reads right before `loading`. Per-chunk stripping would
+      // leave escape fragments inside the word and miss the startup hold.
+      const rawStartup = this.startupTail + data;
+      const startup = this.stripAnsi(rawStartup);
+      const pendingAt = lastMatchIndex(this.startupPendingPattern, startup);
+      const readyAt = this.startupReadyPattern
+        ? lastMatchIndex(this.startupReadyPattern, startup)
+        : -1;
+      // Initialization is monotonic for this CLI process. A restored pane may
+      // seed its entire history in one chunk, including a quoted loading
+      // banner after the actual loaded banner. Treat that exactly like two
+      // feeds: once fully initialized, later text cannot re-arm startup.
+      if (readyAt >= 0) {
+        this.startupComplete = true;
+        this.startupPending = false;
+        this.startupTail = '';
+      } else {
+        if (pendingAt >= 0) this.startupPending = true;
+        // Keep split banner evidence without retaining startup output
+        // indefinitely. Unlike outputTail this survives a per-turn reset.
+        this.startupTail = rawStartup.slice(-8_192);
+      }
+    }
     // Shift the clear position left when the tail window drops characters
     // from the head, so it stays relative to the current window.
     const combined = this.outputTail + stripped;
@@ -175,7 +237,7 @@ export class IdleDetector {
         this.quiescenceTimer = null;
         // A static-busy latch outranks a completion marker: the queue screen
         // can carry both, and the latch only clears on a composer redraw.
-        if (!this.isIdle && !this.staticBusyLatch) this.markIdle('screen');
+        if (!this.isIdle && !this.staticBusyLatch && !this.isStartupPending()) this.markIdle('screen');
       }, 500);
       return;
     }
@@ -223,7 +285,17 @@ export class IdleDetector {
    *  for the next turn — same lifecycle as the internal markIdle path. */
   fireIdle(): void {
     if (this.isIdle) return;
+    // Actual transcript completion proves the session initialized, even if
+    // its loaded banner was omitted or the operator customized the footer.
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
     this.markIdle('external');
+  }
+
+  /** Shared by the worker's screen-ready and hard-timeout write paths. */
+  isStartupPending(): boolean {
+    return this.startupPending && !this.startupComplete;
   }
 
   dispose(): void {
@@ -238,6 +310,7 @@ export class IdleDetector {
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
+    if (this.isStartupPending()) return;
     // Explicit static-busy evidence (capacity queue): the screen is not
     // quiescing into a prompt — it is parked on a queue notice. Do not mark
     // idle and do not re-arm: the latch clears on the composer redraw, whose
@@ -272,9 +345,7 @@ export class IdleDetector {
   }
 
   private stripAnsi(str: string): string {
-    return str
-      .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+    return stripAnsiScreenText(str);
   }
 }
 
