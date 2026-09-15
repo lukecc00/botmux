@@ -134,6 +134,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       httpLlm: j?.topicGroupMemory?.httpLlm,
       tencentdb: j?.topicGroupMemory?.tencentdb,
     },
+    groupAgentContext: j?.groupAgentContext === true,
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),

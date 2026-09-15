@@ -162,6 +162,27 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(envelope).not.toContain('至少 botmux send 回应一次');
   });
 
+
+  it('hook 模式把群公告/Pin Agent Context 放进 sidecar，不污染 PTY 输入', () => {
+    const groupContext = '<group_agent_context source="lark" trust="untrusted"><announcement status="ok">PPE</announcement></group_agent_context>';
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ groupAgentContextBlock: groupContext }));
+
+    expect(result.content).toContain('<user_message>');
+    expect(result.content).not.toContain('<group_agent_context');
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+    expect(envelope).toContain(groupContext);
+    expect(envelope).toContain('<botmux_reminder>');
+  });
+
+  it('群公告/Pin Agent Context 过大时回退 inline，避免 hook sidecar 超限丢上下文', () => {
+    const groupContext = `<group_agent_context>${'x'.repeat(9_000)}</group_agent_context>`;
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ groupAgentContextBlock: groupContext }));
+
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(result.content).toContain('<group_agent_context>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
   it('off：完全 inline（reminder 在 PTY 文本里，无 sidecar）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },

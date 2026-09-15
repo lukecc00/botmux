@@ -28,6 +28,12 @@ function setListPinsImpl(appId: string, impl: (req: any) => Promise<any>) {
   getBot(appId).client = { im: { v1: { pin: { list: impl } } } } as any;
 }
 
+
+function setClientImpl(appId: string, client: any) {
+  registerBot({ larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code' });
+  getBot(appId).client = client;
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 describe('pinMessage provenance and unpinMessage boolean contracts', () => {
@@ -223,6 +229,30 @@ describe('listChatPins pagination contract', () => {
         page_token: 'next-token',
       },
     });
+  });
+
+
+  it('uses the generic GET helper when a deadline option is supplied', async () => {
+    const request = vi.fn(async () => ({
+      code: 0,
+      data: { items: [{ message_id: 'om_deadline' }], has_more: false },
+    }));
+    const generatedList = vi.fn(async () => { throw new Error('should not use generated list with deadline'); });
+    setClientImpl('list_deadline', {
+      request,
+      im: { v1: { pin: { list: generatedList } } },
+    });
+
+    await expect(listChatPins('list_deadline', 'oc_chat', { timeoutMs: 1234 })).resolves.toEqual([
+      { messageId: 'om_deadline', chatId: undefined, operatorId: undefined, operatorIdType: undefined, createTime: undefined },
+    ]);
+    expect(generatedList).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      url: '/open-apis/im/v1/pins',
+      params: { chat_id: 'oc_chat', page_size: 50 },
+      timeout: 1234,
+    }));
   });
 
   it('preserves every remote record and raw string provenance fields verbatim', async () => {

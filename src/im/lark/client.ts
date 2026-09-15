@@ -997,20 +997,28 @@ const LARK_PIN_LIST_MAX_PAGE = 50;
  * tokens, and repeated tokens all throw so callers never silently accept a
  * truncated provenance chain.
  */
-export async function listChatPins(larkAppId: string, chatId: string): Promise<LarkPinRecord[]> {
+export async function listChatPins(
+  larkAppId: string,
+  chatId: string,
+  options?: LarkRequestOptions,
+): Promise<LarkPinRecord[]> {
   const c = getBotClient(larkAppId);
   const out: LarkPinRecord[] = [];
   const seenPageTokens = new Set<string>();
   let pageToken: string | undefined;
 
   for (;;) {
-    const res: any = await c.im.v1.pin.list({
-      params: {
-        chat_id: chatId,
-        page_size: LARK_PIN_LIST_MAX_PAGE,
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
-    });
+    const params = {
+      chat_id: chatId,
+      page_size: LARK_PIN_LIST_MAX_PAGE,
+      ...(pageToken ? { page_token: pageToken } : {}),
+    };
+    // Preserve the generated-SDK path for existing callers/tests. Deadline-aware
+    // reads use the generic GET helper because generated IRequestOptions does not
+    // expose axios timeout/signal fields.
+    const res: any = options
+      ? await larkGet(c, '/open-apis/im/v1/pins', params, options)
+      : await c.im.v1.pin.list({ params });
 
     if (typeof res?.code !== 'number') {
       throw new Error('Failed to list chat pins: missing code');
@@ -1036,6 +1044,136 @@ export async function listChatPins(larkAppId: string, chatId: string): Promise<L
   }
 
   return out;
+}
+
+export interface LarkChatAnnouncement {
+  text: string;
+  updatedAt?: string;
+  revision?: string;
+  source: 'docx' | 'legacy';
+}
+
+function announcementLink(url: unknown): string {
+  return typeof url === 'string' && url.trim() ? url.trim() : '';
+}
+
+function renderAnnouncementTextElement(element: any): string {
+  if (!element || typeof element !== 'object') return '';
+  if (typeof element.text_run?.content === 'string') {
+    const content = element.text_run.content;
+    const url = announcementLink(element.text_run.text_element_style?.link?.url);
+    return url && !content.includes(url) ? `${content} (${url})` : content;
+  }
+  if (typeof element.mention_user?.user_id === 'string') return `@${element.mention_user.user_id}`;
+  if (typeof element.mention_doc?.title === 'string') {
+    const url = announcementLink(element.mention_doc.url);
+    return url ? `${element.mention_doc.title} (${url})` : element.mention_doc.title;
+  }
+  if (typeof element.reminder?.text === 'string') return element.reminder.text;
+  if (typeof element.equation?.content === 'string') return element.equation.content;
+  if (typeof element.file?.name === 'string') return `[文件: ${element.file.name}]`;
+  if (typeof element.inline_file?.name === 'string') return `[文件: ${element.inline_file.name}]`;
+  if (typeof element.link_preview?.url === 'string') {
+    const title = typeof element.link_preview.title === 'string' ? element.link_preview.title : '';
+    return title ? `${title} (${element.link_preview.url})` : element.link_preview.url;
+  }
+  return '';
+}
+
+function renderAnnouncementBlock(block: any): string {
+  if (!block || typeof block !== 'object') return '';
+  for (const key of ['page', 'text', 'heading1', 'heading2', 'heading3', 'heading4', 'heading5', 'heading6', 'heading7', 'heading8', 'heading9', 'bullet', 'ordered', 'code', 'quote', 'todo', 'callout']) {
+    const elements = block[key]?.elements;
+    if (Array.isArray(elements)) {
+      const line = elements.map(renderAnnouncementTextElement).join('').trim();
+      if (line) return line;
+    }
+  }
+  if (typeof block.divider === 'object') return '---';
+  if (typeof block.file?.name === 'string') return `[文件: ${block.file.name}]`;
+  if (typeof block.image?.token === 'string') return '[图片]';
+  if (typeof block.project?.url === 'string') {
+    return typeof block.project.title === 'string' && block.project.title
+      ? `${block.project.title} (${block.project.url})`
+      : block.project.url;
+  }
+  return '';
+}
+
+function extractLegacyAnnouncementText(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim()) return '';
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return raw.trim(); }
+  const out: string[] = [];
+  const visit = (value: unknown, key?: string): void => {
+    if (typeof value === 'string') {
+      if (['text', 'content', 'title', 'url', 'href', 'link'].includes(key ?? '') && value.trim()) out.push(value.trim());
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(item => visit(item));
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) visit(child, childKey);
+  };
+  visit(parsed);
+  return [...new Set(out)].join('\n');
+}
+
+/** Read a chat announcement, preferring Docx blocks and falling back to the
+ * legacy IM announcement format. Both regular groups and topic groups use the
+ * same chat_id-scoped announcement. */
+export async function getChatAnnouncement(
+  larkAppId: string,
+  chatId: string,
+  options?: LarkRequestOptions,
+): Promise<LarkChatAnnouncement> {
+  const c = getBotClient(larkAppId);
+  const encoded = encodeURIComponent(chatId);
+  let docxError: unknown;
+  try {
+    const info = await larkGet(c, `/open-apis/docx/v1/chats/${encoded}/announcement`, {}, options);
+    if (info?.code === 0 && info.data?.announcement_type === 'docx') {
+      const blocks: any[] = [];
+      const seen = new Set<string>();
+      let pageToken: string | undefined;
+      do {
+        const res = await larkGet(c, `/open-apis/docx/v1/chats/${encoded}/announcement/blocks`, {
+          page_size: 500,
+          ...(pageToken ? { page_token: pageToken } : {}),
+          ...(typeof info.data.revision_id === 'number' ? { revision_id: info.data.revision_id } : {}),
+        }, options);
+        if (res?.code !== 0) throw new Error(`Failed to get chat announcement blocks: ${res?.msg ?? 'unknown error'} (code: ${res?.code ?? 'missing'})`);
+        blocks.push(...(res.data?.items ?? []));
+        if (res.data?.has_more !== true) break;
+        const next = res.data?.page_token;
+        if (typeof next !== 'string' || !next || seen.has(next)) throw new Error('Failed to get chat announcement blocks: malformed pagination token');
+        seen.add(next);
+        pageToken = next;
+      } while (pageToken);
+      return {
+        text: blocks.map(renderAnnouncementBlock).filter(Boolean).join('\n'),
+        updatedAt: String(info.data.update_time_v2 ?? info.data.update_time ?? '') || undefined,
+        revision: typeof info.data.revision_id === 'number' ? String(info.data.revision_id) : undefined,
+        source: 'docx',
+      };
+    }
+  } catch (error) {
+    docxError = error;
+  }
+
+  const legacy = await larkGet(c, `/open-apis/im/v1/chats/${encoded}/announcement`, {}, options);
+  if (legacy?.code !== 0) {
+    const detail = `Failed to get chat announcement: ${legacy?.msg ?? 'unknown error'} (code: ${legacy?.code ?? 'missing'})`;
+    throw docxError ? new Error(`${detail}; Docx probe: ${formatLarkError(docxError) ?? String(docxError)}`) : new Error(detail);
+  }
+  return {
+    text: extractLegacyAnnouncementText(legacy.data?.content),
+    updatedAt: typeof legacy.data?.update_time === 'string' ? legacy.data.update_time : undefined,
+    revision: typeof legacy.data?.revision === 'string' ? legacy.data.revision : undefined,
+    source: 'legacy',
+  };
 }
 
 /**

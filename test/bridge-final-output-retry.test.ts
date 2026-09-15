@@ -127,6 +127,7 @@ import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
 import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
+import { setTopicGroupMemoryUpdateSchedulerForTests } from '../src/services/topic-group-memory-update.js';
 import {
   clearMessageListenerRunPreviewStore,
   createMessageListenerRunPreview,
@@ -237,6 +238,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
+    setTopicGroupMemoryUpdateSchedulerForTests(undefined);
     vi.clearAllMocks();
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
@@ -257,6 +259,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
+    setTopicGroupMemoryUpdateSchedulerForTests(undefined);
     vi.useRealTimers();
   });
 
@@ -1002,6 +1005,63 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
     expect(sessionReply).not.toHaveBeenCalled();
   });
+
+  it('writes topic-group memory once for an observed explicit final send', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const scheduleMemory = vi.fn();
+    setTopicGroupMemoryUpdateSchedulerForTests(scheduleMemory);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'turn-explicit-final',
+      messageId: 'om_explicit_final',
+      responseKind: 'final',
+      previewText: 'final answer sent through botmux send',
+    } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+
+    expect(scheduleMemory).toHaveBeenCalledTimes(1);
+    expect(scheduleMemory).toHaveBeenCalledWith(ds, {
+      turnId: 'turn-explicit-final',
+      content: 'final answer sent through botmux send',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each(['progress', 'auxiliary', undefined] as const)(
+    'does not write topic-group memory for observed %s sends',
+    async responseKind => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const scheduleMemory = vi.fn();
+      setTopicGroupMemoryUpdateSchedulerForTests(scheduleMemory);
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+
+      const ds = makeDs();
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: 'turn-explicit-non-final',
+        ...(responseKind ? { responseKind } : {}),
+        previewText: 'not a final answer',
+      } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+
+      expect(scheduleMemory).not.toHaveBeenCalled();
+      expect(sessionReply).not.toHaveBeenCalled();
+    },
+  );
 
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');

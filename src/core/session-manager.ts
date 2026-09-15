@@ -84,6 +84,7 @@ import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-sche
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { loadTopicGroupMemoryBlockForSession } from '../services/topic-group-memory-runtime.js';
+import { loadGroupAgentContextBlockForSession } from '../services/group-agent-context.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
@@ -1036,6 +1037,7 @@ function buildCodexAppTurnInput(opts: {
   text: string;
   roleBlock?: string;
   topicGroupMemoryBlock?: string;
+  groupAgentContextBlock?: string;
   whiteboardBlock?: string;
   senderBlock?: string;
   substitutePolicyBlock?: string;
@@ -1053,6 +1055,7 @@ function buildCodexAppTurnInput(opts: {
   const additionalContext: Record<string, CodexAppAdditionalContextEntry> = {};
   addCodexAppContext(additionalContext, 'botmux_role', opts.roleBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_topic_group_memory', opts.topicGroupMemoryBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_group_agent_context', opts.groupAgentContextBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_whiteboard', opts.whiteboardBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_sender', opts.senderBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_substitute_policy', opts.substitutePolicyBlock ?? '', 'application');
@@ -1102,7 +1105,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; topicGroupMemoryBlock?: string; groupAgentContextBlock?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
@@ -1164,6 +1167,7 @@ export function buildNewTopicPrompt(
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const topicGroupMemoryBlock = opts?.topicGroupMemoryBlock ?? '';
+  const groupAgentContextBlock = opts?.groupAgentContextBlock ?? '';
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1202,6 +1206,7 @@ export function buildNewTopicPrompt(
   if (roleBlock) parts.push(roleBlock);
   if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
   if (topicGroupMemoryBlock) parts.push(topicGroupMemoryBlock);
+  if (groupAgentContextBlock) parts.push(groupAgentContextBlock);
   if (whiteboardBlock) parts.push(whiteboardBlock);
   if (chatContextPolicyBlock) parts.push(chatContextPolicyBlock);
   if (chatContextBlock) parts.push(chatContextBlock);
@@ -1253,6 +1258,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     topicGroupMemoryBlock?: string;
+    groupAgentContextBlock?: string;
     substituteTrigger?: SubstituteTrigger;
     codexAppText?: string;
     codexAppApplicationContext?: string;
@@ -1276,6 +1282,7 @@ export function buildNewTopicCliInput(
   }
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const topicGroupMemoryBlock = opts?.topicGroupMemoryBlock ?? '';
+  const groupAgentContextBlock = opts?.groupAgentContextBlock ?? '';
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1296,6 +1303,7 @@ export function buildNewTopicCliInput(
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       topicGroupMemoryBlock,
+      groupAgentContextBlock,
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -1318,7 +1326,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'topicGroupMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'topicGroupMemory' | 'groupAgentContext' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1338,6 +1346,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   topicGroupMemoryBlock?: string;
+  groupAgentContextBlock?: string;
   substituteTrigger?: SubstituteTrigger;
   codexAppText?: string;
   codexAppApplicationContext?: string;
@@ -1362,6 +1371,7 @@ function buildFollowUpBlocks(
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const topicGroupMemoryBlock = opts?.topicGroupMemoryBlock ?? '';
+  const groupAgentContextBlock = opts?.groupAgentContextBlock ?? '';
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1380,6 +1390,7 @@ function buildFollowUpBlocks(
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (topicGroupMemoryBlock) blocks.push({ key: 'topicGroupMemory', text: topicGroupMemoryBlock });
+  if (groupAgentContextBlock) blocks.push({ key: 'groupAgentContext', text: groupAgentContextBlock });
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -1545,11 +1556,11 @@ export function buildFollowUpCliInput(
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     const ptyText = blocks
-      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard' && b.key !== 'groupAgentContext')
       .map((b) => b.text)
       .join('\n\n');
     const hookEnvelope = blocks
-      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard' || b.key === 'groupAgentContext')
       .map((b) => b.text)
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
@@ -1564,6 +1575,7 @@ export function buildFollowUpCliInput(
   }
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const topicGroupMemoryBlock = opts.topicGroupMemoryBlock ?? '';
+  const groupAgentContextBlock = opts.groupAgentContextBlock ?? '';
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
@@ -1581,6 +1593,7 @@ export function buildFollowUpCliInput(
       text: opts.codexAppText ?? content,
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       topicGroupMemoryBlock,
+      groupAgentContextBlock,
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -1707,6 +1720,7 @@ export function buildReforkPrompt(
     locale?: Locale;
     sender?: ResolvedSender;
     topicGroupMemoryBlock?: string;
+    groupAgentContextBlock?: string;
   },
 ): string {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -1730,6 +1744,7 @@ export function buildReforkPrompt(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     topicGroupMemoryBlock: opts?.topicGroupMemoryBlock,
+    groupAgentContextBlock: opts?.groupAgentContextBlock,
     sessionBackendType: ds.session.backendType,
   });
 }
@@ -1748,6 +1763,7 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     topicGroupMemoryBlock?: string;
+    groupAgentContextBlock?: string;
     substituteTrigger?: SubstituteTrigger;
     codexAppText?: string;
     codexAppApplicationContext?: string;
@@ -1778,6 +1794,7 @@ export function buildReforkCliInput(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     topicGroupMemoryBlock: opts?.topicGroupMemoryBlock,
+    groupAgentContextBlock: opts?.groupAgentContextBlock,
     sessionBackendType: ds.session.backendType,
     turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
@@ -3766,6 +3783,8 @@ async function forkOrShowRepoCard(
       whiteboardId: ds.session.whiteboardId,
       topicGroupMemoryBlock: ds.pendingTopicGroupMemoryBlock
         ?? await loadTopicGroupMemoryBlockForSession(ds, userContent),
+      groupAgentContextBlock: ds.pendingGroupAgentContextBlock
+        ?? await loadGroupAgentContextBlockForSession(ds),
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
@@ -3847,6 +3866,7 @@ async function forkOrShowRepoCard(
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingTopicGroupMemoryBlock = undefined;
+    ds.pendingGroupAgentContextBlock = undefined;
     ds.pendingChatContext = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;

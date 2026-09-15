@@ -1383,7 +1383,18 @@ export type WorkerToDaemon =
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even
    * though transcript fallback output is suppressed to avoid duplicates. */
-  | { type: 'explicit_reply_observed'; turnId: string; messageId?: string }
+  | {
+      type: 'explicit_reply_observed';
+      turnId: string;
+      messageId?: string;
+      /** `botmux send --response-kind`. Legacy/absent markers behave as
+       * progress for durable side effects; only explicit final sends can write
+       * topic-group memory. */
+      responseKind?: 'progress' | 'final' | 'auxiliary';
+      /** Bounded copy of the explicit send body for daemon-side memory writeback
+       * when transcript fallback is suppressed. */
+      previewText?: string;
+    }
   | {
       type: 'progress_output';
       /** Worker-side identity and transcript UUID fence stale/cross-session IPC. */

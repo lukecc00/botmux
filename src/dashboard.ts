@@ -6649,6 +6649,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Group announcement + Pin Agent Context status. The daemon owns the live
+    // cache/status for its bot, while the dashboard only proxies the selected
+    // app id. POST clears the cache so the next real group turn re-reads Lark.
+    let mBotGroupContext: RegExpMatchArray | null;
+    if ((mBotGroupContext = url.pathname.match(/^\/api\/bots\/([^/]+)\/group-agent-context\/(status|refresh)$/))) {
+      const appId = decodeURIComponent(mBotGroupContext[1]);
+      const operation = mBotGroupContext[2];
+      if ((req.method === 'GET' && operation === 'status') || (req.method === 'POST' && operation === 'refresh')) {
+        const upstream = await proxyToDaemon(appId, `/api/group-agent-context/${operation}`, { method: req.method });
+        res.writeHead(upstream.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
     // POST /api/bots/:appId/topic-group-memory/hub-link — authenticated
     // one-click access. POST deliberately keeps the Hub user_key outside the
     // dashboard's public read-only GET surface.

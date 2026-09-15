@@ -13341,6 +13341,12 @@ function setupWorkerHandlers(
             replyMessageId: msg.messageId,
           });
         }
+        if (msg.responseKind === 'final' && typeof msg.previewText === 'string' && msg.previewText.trim()) {
+          scheduleTopicGroupMemoryUpdate(ds, {
+            turnId: msg.turnId,
+            content: msg.previewText,
+          });
+        }
         break;
       }
 

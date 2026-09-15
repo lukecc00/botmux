@@ -167,6 +167,7 @@ export type BotDefaultsRow = {
       panelUrl?: string;
     };
   };
+  groupAgentContext?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
@@ -199,6 +200,36 @@ export type TopicGroupMemoryStats = {
   resources: number;
   recentContributions: number;
   error?: string;
+};
+
+export type TopicGroupMemoryRuntimeStatus = {
+  persisted?: boolean;
+  effectiveProvider?: 'disabled' | 'tencentdb' | 'local' | 'local-fallback' | 'not-checked' | string;
+  runtimeDir?: string;
+  runtimeManifestPresent?: boolean;
+  memoryCoreHealthy?: boolean | null;
+  memoryCoreError?: string;
+  probedChatId?: string;
+  hubConfigured?: boolean;
+  hubReachable?: boolean | null;
+  hubError?: string;
+  latestTencentDbCaptureAt?: string | null;
+  latestTencentDbCaptureTurnId?: string | null;
+  latestLocalUpdateAt?: string | null;
+  latestLocalRevision?: number | null;
+};
+
+export type GroupAgentContextRuntimeStatus = {
+  larkAppId: string;
+  chatId: string;
+  enabled: boolean;
+  lastFetchAt?: string;
+  lastSuccessAt?: string;
+  announcementStatus?: 'ok' | 'empty' | 'partial' | 'unavailable';
+  pinStatus?: 'ok' | 'empty' | 'partial' | 'unavailable';
+  pinCount: number;
+  fromCache?: boolean;
+  lastError?: string;
 };
 
 export type TopicGroupMemoryTextEntry = {

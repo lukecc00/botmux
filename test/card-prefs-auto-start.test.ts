@@ -94,6 +94,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
+    expect(prefs.groupAgentContext).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
     expect(prefs.autoStartOnGroupJoinSeed).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
@@ -158,6 +159,34 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
   });
 
+  it('topic-group TencentDB L2/L3 toggles persist and survive a module reload', async () => {
+    writeConfig({
+      topicGroupMemory: {
+        enabled: true,
+        tencentdb: { includePersona: true, includeScenes: true },
+      },
+    });
+    let modules = await freshModules();
+    modules.registry.loadBotConfigs().forEach(c => modules.registry.registerBot(c));
+
+    const saved = await modules.store.updateBotCardPrefs('app_default', {
+      topicGroupMemory: {
+        tencentdb: { includePersona: false, includeScenes: false },
+      },
+    });
+    expect(saved.ok && saved.prefs.topicGroupMemory.tencentdb.includePersona).toBe(false);
+    expect(saved.ok && saved.prefs.topicGroupMemory.tencentdb.includeScenes).toBe(false);
+    expect(readConfig().topicGroupMemory.tencentdb).toMatchObject({
+      includePersona: false,
+      includeScenes: false,
+    });
+
+    modules = await freshModules();
+    modules.registry.loadBotConfigs().forEach(c => modules.registry.registerBot(c));
+    expect(modules.store.getBotCardPrefs('app_default').topicGroupMemory.tencentdb)
+      .toMatchObject({ includePersona: false, includeScenes: false });
+  });
+
   it('autoStartOnGroupJoinSeed round-trips; blank clears back to the built-in i18n fallback', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
@@ -175,6 +204,29 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(clear.ok && clear.prefs.autoStartOnGroupJoinSeed).toBe('');
     expect(readConfig().autoStartOnGroupJoinSeed).toBeUndefined();
     expect(registry.getBot('app_default').config.autoStartOnGroupJoinSeed).toBeUndefined();
+  });
+
+
+  it('groupAgentContext is default-off, persists, clears on off, and survives reload', async () => {
+    writeConfig();
+    let modules = await freshModules();
+    modules.registry.loadBotConfigs().forEach(c => modules.registry.registerBot(c));
+
+    expect(modules.store.getBotCardPrefs('app_default').groupAgentContext).toBe(false);
+
+    const on = await modules.store.updateBotCardPrefs('app_default', { groupAgentContext: true });
+    expect(on.ok && on.prefs.groupAgentContext).toBe(true);
+    expect(readConfig().groupAgentContext).toBe(true);
+    expect(modules.registry.getBot('app_default').config.groupAgentContext).toBe(true);
+
+    modules = await freshModules();
+    modules.registry.loadBotConfigs().forEach(c => modules.registry.registerBot(c));
+    expect(modules.store.getBotCardPrefs('app_default').groupAgentContext).toBe(true);
+
+    const off = await modules.store.updateBotCardPrefs('app_default', { groupAgentContext: false });
+    expect(off.ok && off.prefs.groupAgentContext).toBe(false);
+    expect(readConfig().groupAgentContext).toBeUndefined();
+    expect(modules.registry.getBot('app_default').config.groupAgentContext).toBeUndefined();
   });
 
   it('codexAppCleanInput is default-off and round-trips without a restart', async () => {

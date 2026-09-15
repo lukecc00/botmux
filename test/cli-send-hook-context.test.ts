@@ -592,6 +592,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain("responseKindOccurrences > 1");
     expect(cmdSend).toContain("flagPresentButValueMissing(rest, '--response-kind')");
     expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
+    expect(cmdSend).toContain('responseKind: effectiveResponseKind');
     expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
     expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');

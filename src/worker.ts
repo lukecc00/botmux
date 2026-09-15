@@ -4587,7 +4587,7 @@ function explicitReplyMarkerForTurnWindow(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper);
-  return inWindow.at(-1);
+  return inWindow.filter(marker => marker.responseKind === 'final').at(-1) ?? inWindow.at(-1);
 }
 
 function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | undefined): void {
@@ -4596,6 +4596,10 @@ function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | 
     type: 'explicit_reply_observed',
     turnId,
     ...(marker.messageId ? { messageId: marker.messageId } : {}),
+    ...(marker.responseKind === 'progress' || marker.responseKind === 'final' || marker.responseKind === 'auxiliary'
+      ? { responseKind: marker.responseKind }
+      : {}),
+    ...(marker.previewText ? { previewText: marker.previewText } : {}),
   });
 }
 
@@ -5831,6 +5835,12 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
+    const explicitReplyMarker = explicitReplyMarkerForTurnWindow(
+      { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal },
+      nextBoundaryMs,
+      markers,
+      adoptMode,
+    );
     if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
@@ -5838,7 +5848,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     }
 
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
-    if (!path) continue;
+    if (!path) {
+      notifyExplicitReplyObserved(turn.turnId, explicitReplyMarker);
+      continue;
+    }
     let drained = cache.get(path);
     if (!drained) {
       drained = drainTranscript(path, 0);
@@ -5853,7 +5866,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // Adopt keeps the full join: transcript drain is that mode's only channel,
     // so interim narration is the user's only window into the turn.
     const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
-    if (assistantText.length === 0) continue;
+    if (assistantText.length === 0) {
+      notifyExplicitReplyObserved(turn.turnId, explicitReplyMarker);
+      continue;
+    }
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
@@ -5872,10 +5888,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
+      notifyExplicitReplyObserved(turn.turnId, explicitReplyMarker);
       continue;
     }
 
@@ -7526,11 +7539,26 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    const suppressFallback = shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode);
+    const explicitReplyMarker = explicitReplyMarkerForTurnWindow(
+      gateInput,
+      nextBoundaryMs,
+      markers,
+      adoptMode,
+    );
+    if (!content || suppressFallback) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
-    if (!content) continue;
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (!content) {
+      // The common successful `botmux send --response-kind final` shape has an
+      // empty structured transcript final (`last_agent_message: ''`). The send
+      // marker is therefore the only authoritative final-answer payload. Notify
+      // the daemon before the empty-content bail-out so observers and shared
+      // memory see the reply even though there is no fallback body to post.
+      notifyExplicitReplyObserved(turn.turnId, explicitReplyMarker);
+      continue;
+    }
+    if (suppressFallback) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -7542,10 +7570,7 @@ function emitReadyCodexTurns(): void {
       if (!adoptMode && isBridgeNothingToSendFinal(turn.finalText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
+      notifyExplicitReplyObserved(turn.turnId, explicitReplyMarker);
       continue;
     }
     // NON-ADOPT only: strip a trailing sentinel line so the literal token never
@@ -9609,7 +9634,7 @@ async function handleTrustedCodexAppMarker(
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }
-    if (deliverableContent && startedAtMs !== undefined) {
+    if (startedAtMs !== undefined) {
       const suppressMarkers = readSendMarkers();
       // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
       // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
@@ -9620,13 +9645,21 @@ async function handleTrustedCodexAppMarker(
       // be invisible and a longer-than-send narration would leak (same class as
       // the transcript-path bug this fixes).
       const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
-      suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
+      const explicitReplyMarker = explicitReplyMarkerForTurnWindow(
         gateInput,
         completedAtMs + 5_001,
         suppressMarkers,
         false,
       );
-      if (suppressDelivery) {
+      if (deliverableContent) {
+        suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
+          gateInput,
+          completedAtMs + 5_001,
+          suppressMarkers,
+          false,
+        );
+      }
+      if (suppressDelivery || (!deliverableContent && explicitReplyMarker)) {
         log(`${cliName()} final_output suppressed (model already called botmux send)`);
         // Symmetric with the legacy/master appTurnId final branch: tell
         // observers (e.g. the message-listener run-preview lifecycle) that this
@@ -9635,10 +9668,7 @@ async function handleTrustedCodexAppMarker(
         // suppressDelivery:true, which the daemon short-circuits WITHOUT calling
         // deliverFinalOutput — the only site that otherwise marks run-preview
         // replied — so without this the preview shows "running" forever (F3).
-        notifyExplicitReplyObserved(
-          turnId,
-          explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, suppressMarkers, false),
-        );
+        notifyExplicitReplyObserved(turnId, explicitReplyMarker);
       }
     }
 

@@ -1774,6 +1774,7 @@ async function triggerSessionTurnAdmitted(
     newDs.pendingCodexAppApplicationContext = undefined;
     newDs.pendingCodexAppMessageContext = undefined;
     newDs.pendingTopicGroupMemoryBlock = undefined;
+    newDs.pendingGroupAgentContextBlock = undefined;
   };
 
   // Idempotency claim (fresh async virtual only — validator guarantees this is

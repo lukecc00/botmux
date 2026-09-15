@@ -81,6 +81,19 @@ export interface TopicGroupMemoryUpdateDeps {
   disableLlm?: boolean;
 }
 
+type TopicGroupMemoryUpdateScheduler = (
+  ds: DaemonSession,
+  output: TopicGroupMemoryFinalInput,
+) => void;
+
+let topicGroupMemoryUpdateScheduler: TopicGroupMemoryUpdateScheduler | undefined;
+
+export function setTopicGroupMemoryUpdateSchedulerForTests(
+  scheduler: TopicGroupMemoryUpdateScheduler | undefined,
+): void {
+  topicGroupMemoryUpdateScheduler = scheduler;
+}
+
 function uniqueSafe(values: string[], maxItems = 10): string[] {
   const out: string[] = [];
   const keys = new Set<string>();
@@ -464,6 +477,10 @@ export async function maybeUpdateTopicGroupMemoryFromFinal(
 }
 
 export function scheduleTopicGroupMemoryUpdate(ds: DaemonSession, output: TopicGroupMemoryFinalInput): void {
+  if (topicGroupMemoryUpdateScheduler) {
+    topicGroupMemoryUpdateScheduler(ds, output);
+    return;
+  }
   const snapshot: TopicGroupMemoryFinalInput = {
     ...output,
     userPrompt: output.userPrompt

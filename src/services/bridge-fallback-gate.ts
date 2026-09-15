@@ -197,6 +197,10 @@ export interface BridgeSendMarker {
   messageId?: string;
   turnId?: string;
   dispatchAttempt?: number;
+  /** Role declared by `botmux send --response-kind`. Only explicit final sends
+   *  are eligible for durable memory writeback; progress/auxiliary sends remain
+   *  delivery markers only. Absent means legacy/progress. */
+  responseKind?: 'progress' | 'final' | 'auxiliary';
   contentLength?: number;
   /** Stable digest of the normalized visible body. Lets the fallback
    * distinguish a manually mirrored progress card from a final-answer send. */
@@ -225,7 +229,7 @@ export interface BridgeGateInput {
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
-const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
+export const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
 
 function bridgeContentHash(normalized: string): string {
   return createHash('sha256').update(normalized).digest('hex').slice(0, 32);
@@ -294,12 +298,18 @@ function markerSetCoversFinal(
   const progressHashes = new Set(normalizedProgress.map(bridgeContentHash));
   const progressLengths = new Set(normalizedProgress.map(text => text.length));
   const finalMarkers = markers.filter(marker => {
+    if (marker.responseKind === 'final') return true;
     if (marker.contentHash) return !progressHashes.has(marker.contentHash);
     // Rolling-upgrade compatibility: exact commentary-length matches from old
     // structured markers are progress; unknown legacy markers stay conservative.
     return marker.contentLength === undefined || !progressLengths.has(marker.contentLength);
   });
   if (finalMarkers.length === 0) return false;
+
+  // A send explicitly classified as final is the durable answer for this turn.
+  // Do not let a longer transcript narration/fallback body re-open the gate and
+  // create a second visible reply or a second memory write.
+  if (finalMarkers.some(marker => marker.responseKind === 'final')) return true;
 
   // Back-compat: old marker files only have sentAtMs/messageId. Keep the old
   // conservative behavior for those entries instead of risking duplicates.

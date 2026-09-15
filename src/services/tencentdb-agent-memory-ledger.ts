@@ -5,9 +5,14 @@ import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 
+export interface TencentDbCaptureLedgerEntry {
+  turnId: string;
+  capturedAt: string;
+}
+
 interface CaptureLedger {
   schemaVersion: 1;
-  captured: Array<{ turnId: string; capturedAt: string }>;
+  captured: TencentDbCaptureLedgerEntry[];
 }
 
 export interface TencentDbCaptureLedgerOptions {
@@ -16,7 +21,7 @@ export interface TencentDbCaptureLedgerOptions {
   now?: () => string;
 }
 
-function ledgerPath(scopeKey: string, options: TencentDbCaptureLedgerOptions): string {
+export function tencentDbCaptureLedgerPath(scopeKey: string, options: TencentDbCaptureLedgerOptions = {}): string {
   const digest = createHash('sha256').update(scopeKey).digest('hex');
   return join(
     resolve(options.dataDir ?? resolveBotmuxDataDir()),
@@ -43,6 +48,31 @@ async function readLedger(path: string): Promise<CaptureLedger> {
   }
 }
 
+export async function readTencentDbCaptureLedger(
+  scopeKey: string,
+  options: TencentDbCaptureLedgerOptions = {},
+): Promise<{ path: string; captured: TencentDbCaptureLedgerEntry[] }> {
+  const path = tencentDbCaptureLedgerPath(scopeKey, options);
+  const ledger = await readLedger(path);
+  return { path, captured: ledger.captured };
+}
+
+export async function latestTencentDbCaptureForScopes(
+  scopeKeys: readonly string[],
+  options: TencentDbCaptureLedgerOptions = {},
+): Promise<({ scopeKey: string; path: string } & TencentDbCaptureLedgerEntry) | null> {
+  let latest: ({ scopeKey: string; path: string } & TencentDbCaptureLedgerEntry) | null = null;
+  for (const scopeKey of scopeKeys) {
+    const ledger = await readTencentDbCaptureLedger(scopeKey, options);
+    for (const entry of ledger.captured) {
+      if (!latest || (Date.parse(entry.capturedAt) || 0) > (Date.parse(latest.capturedAt) || 0)) {
+        latest = { scopeKey, path: ledger.path, ...entry };
+      }
+    }
+  }
+  return latest;
+}
+
 /**
  * Serialize the provider request and record a turn only after MemoryCore has
  * acknowledged it. This prevents ordinary replay duplicates while preserving
@@ -57,7 +87,7 @@ export async function captureTencentDbTurnOnce<T>(
   options: TencentDbCaptureLedgerOptions = {},
 ): Promise<{ captured: boolean; result?: T }> {
   if (!turnId.trim()) throw new Error('tencentdb_capture_turn_id_required');
-  const path = ledgerPath(scopeKey, options);
+  const path = tencentDbCaptureLedgerPath(scopeKey, options);
   await fsp.mkdir(dirname(path), { recursive: true, mode: 0o700 });
   return withFileLock(path, async () => {
     const ledger = await readLedger(path);

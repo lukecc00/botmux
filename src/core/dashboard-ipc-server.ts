@@ -49,6 +49,11 @@ import {
 } from '../services/topic-group-memory-http-distiller.js';
 import { resolveTopicGroupMemoryConfig } from '../services/topic-group-memory-config.js';
 import { buildMemoryHubLoginUrl, MemoryHubAccessError } from '../services/memory-hub-access.js';
+import { probeTopicGroupMemoryRuntimeStatus } from '../services/topic-group-memory-status.js';
+import {
+  clearGroupAgentContextCache,
+  getGroupAgentContextRuntimeStatus,
+} from '../services/group-agent-context.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -4201,6 +4206,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
     topicGroupMemory: cardPrefs.topicGroupMemory,
+    groupAgentContext: cardPrefs.groupAgentContext,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
@@ -4229,6 +4235,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   });
 });
 
+ipcRoute('GET', '/api/group-agent-context/status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  jsonRes(res, 200, { ok: true, ...getGroupAgentContextRuntimeStatus(cachedLarkAppId) });
+});
+
+ipcRoute('POST', '/api/group-agent-context/refresh', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  clearGroupAgentContextCache(cachedLarkAppId);
+  jsonRes(res, 200, { ok: true, ...getGroupAgentContextRuntimeStatus(cachedLarkAppId) });
+});
+
 // Topic-group shared-memory maintenance is deliberately daemon-local: this
 // process can only inspect the current bot's larkAppId partition. The outer
 // dashboard proxies these routes to the selected bot daemon.
@@ -4238,10 +4255,14 @@ ipcRoute('GET', '/api/topic-group-memory', async (_req, res) => {
   const memories = await topicGroupMemoryStore.listTopicGroupMemories(cachedLarkAppId, {
     limits: { maxSummaryChars: memoryConfig.maxSummaryChars },
   });
+  const runtime = await probeTopicGroupMemoryRuntimeStatus(cachedLarkAppId, memoryConfig, memories, {
+    dataDir: config.session.dataDir,
+  });
   jsonRes(res, 200, {
     ok: true,
     larkAppId: cachedLarkAppId,
     config: memoryConfig,
+    runtime,
     count: memories.length,
     memories,
   });
@@ -4368,6 +4389,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
     topicGroupMemory?: unknown;
+    groupAgentContext?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -4382,6 +4404,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
     topicGroupMemory?: import('../bot-registry.js').TopicGroupMemoryConfig;
+    groupAgentContext?: boolean;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -4396,6 +4419,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.groupAgentContext === 'boolean') patch.groupAgentContext = body.groupAgentContext;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {

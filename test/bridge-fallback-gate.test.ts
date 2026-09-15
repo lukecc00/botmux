@@ -4,6 +4,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
+  BRIDGE_SEND_PREVIEW_MAX_CHARS,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
   bridgePostText,
@@ -320,8 +321,22 @@ describe('buildBridgeSendMarkerContent', () => {
     const content = ` ${'x'.repeat(5_000)} `;
     const marker = buildBridgeSendMarkerContent(content)!;
     expect(marker.contentLength).toBe(5_000);
-    expect(marker.previewText).toHaveLength(4_000);
+    expect(marker.previewText).toHaveLength(BRIDGE_SEND_PREVIEW_MAX_CHARS);
     expect(marker.previewText?.endsWith('…')).toBe(true);
+  });
+
+  it('treats an explicitly classified final send as authoritative even when transcript narration is longer', () => {
+    const marker = {
+      sentAtMs: 200,
+      responseKind: 'final' as const,
+      ...buildBridgeSendMarkerContent('concise final answer'),
+    };
+    expect(shouldSuppressBridgeEmit(
+      { markTimeMs: 100, isLocal: false, finalText: 'x'.repeat(2_000) },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
   });
 
   it('preserves paragraph / list / code-block structure for Markdown rendering', () => {

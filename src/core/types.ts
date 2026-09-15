@@ -223,6 +223,8 @@ export interface DaemonSession {
    * Staging it here preserves the synchronous reserved-fork contract without
    * dropping the local MemoryCore prompt lane. In-memory only. */
   pendingTopicGroupMemoryBlock?: string;
+  /** Group announcement + Pin context captured for a delayed opening turn. */
+  pendingGroupAgentContextBlock?: string;
   /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
   pendingChatContext?: ChatContext;
   /** One-shot CLI slash command to send literally after the worker reports

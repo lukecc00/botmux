@@ -289,6 +289,7 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { loadTopicGroupMemoryBlockForSession } from './services/topic-group-memory-runtime.js';
+import { loadGroupAgentContextBlockForSession } from './services/group-agent-context.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -5301,6 +5302,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingTopicGroupMemoryBlock = undefined;
+  ds.pendingGroupAgentContextBlock = undefined;
   ds.pendingChatContext = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
@@ -16848,6 +16850,7 @@ function buildReservedInitialInput(
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       topicGroupMemoryBlock: ds.pendingTopicGroupMemoryBlock,
+      groupAgentContextBlock: ds.pendingGroupAgentContextBlock,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
       // master: thread the joined-chat context into the opening prompt (group-join
@@ -16867,6 +16870,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingTopicGroupMemoryBlock = undefined;
+  ds.pendingGroupAgentContextBlock = undefined;
   ds.pendingAttachments = undefined;
   ds.pendingMentions = undefined;
   ds.pendingSubstituteTrigger = undefined;
@@ -18546,6 +18550,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    ds.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(ds);
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
@@ -18598,6 +18603,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    ds.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(ds);
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
@@ -19068,6 +19074,7 @@ async function handleBotAdded(
       }
       ensureSessionWhiteboard(ds);
       ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, promptBody);
+      ds.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(ds);
       const availableBots = await getAvailableBots(larkAppId, chatId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
@@ -19118,6 +19125,7 @@ async function handleBotAdded(
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
       ds.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(ds, promptBody);
+      ds.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(ds);
       const availableBots = await getAvailableBots(larkAppId, chatId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
@@ -20086,8 +20094,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
-        sessionBackendType: ds.session.backendType,
-        turnId: parsed.messageId,
+          sessionBackendType: ds.session.backendType,
+          turnId: parsed.messageId,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -20359,6 +20367,7 @@ async function handleThreadReplyAdmitted(
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       ensureSessionWhiteboard(newDs);
       newDs.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs, parsed.content);
+      newDs.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
@@ -20399,6 +20408,7 @@ async function handleThreadReplyAdmitted(
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
       newDs.pendingTopicGroupMemoryBlock = await loadTopicGroupMemoryBlockForSession(newDs, parsed.content);
+      newDs.pendingGroupAgentContextBlock = await loadGroupAgentContextBlockForSession(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
@@ -20458,6 +20468,7 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const topicGroupMemoryBlock = isBridge ? '' : await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    const groupAgentContextBlock = isBridge ? '' : await loadGroupAgentContextBlockForSession(ds);
     const turnSender = await getThreadSender();
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
@@ -20484,6 +20495,7 @@ async function handleThreadReplyAdmitted(
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
             topicGroupMemoryBlock,
+            groupAgentContextBlock,
             substituteTrigger,
             codexAppText: parsed.content,
             codexAppApplicationContext,
@@ -20501,12 +20513,13 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           topicGroupMemoryBlock,
+          groupAgentContextBlock,
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
-        sessionBackendType: ds.session.backendType,
-        turnId: parsed.messageId,
+          sessionBackendType: ds.session.backendType,
+          turnId: parsed.messageId,
         });
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
@@ -20591,6 +20604,7 @@ async function handleThreadReplyAdmitted(
     const topicGroupMemoryBlock = ds.adoptedFrom
       ? ''
       : await loadTopicGroupMemoryBlockForSession(ds, parsed.content);
+    const groupAgentContextBlock = ds.adoptedFrom ? '' : await loadGroupAgentContextBlockForSession(ds);
     const stageCurrentBehindQueuedActivation = async (): Promise<void> => {
       const tailReservation = reserveAsyncQueuedActivationTailAdmission(ds);
       try {
@@ -20605,12 +20619,13 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           topicGroupMemoryBlock,
+          groupAgentContextBlock,
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
-        sessionBackendType: ds.session.backendType,
-        turnId: parsed.messageId,
+          sessionBackendType: ds.session.backendType,
+          turnId: parsed.messageId,
         });
         // R4-B1: freeze the admission-time steer authorization onto the queued
         // opening payload so the worker-null re-fork path carries it exactly like
@@ -20755,6 +20770,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           topicGroupMemoryBlock,
+          groupAgentContextBlock,
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
           codexAppApplicationContext,
@@ -20770,6 +20786,7 @@ async function handleThreadReplyAdmitted(
         selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender: queuedHasDurableTail ? undefined : reforkSender,
         topicGroupMemoryBlock,
+        groupAgentContextBlock,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
         codexAppText: reforkCodexApp.text,
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,

@@ -95,6 +95,8 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, silentIdleCardFlag, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { loadTopicGroupMemoryBlockForSession } from '../../services/topic-group-memory-runtime.js';
+import { loadGroupAgentContextBlockForSession } from '../../services/group-agent-context.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
@@ -589,6 +591,10 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              topicGroupMemoryBlock: ds.pendingTopicGroupMemoryBlock
+                ?? await loadTopicGroupMemoryBlockForSession(ds, pendingPrompt),
+              groupAgentContextBlock: ds.pendingGroupAgentContextBlock
+                ?? await loadGroupAgentContextBlockForSession(ds),
             },
           )
         : undefined;
@@ -640,6 +646,8 @@ export async function commitRepoSelection(
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
+      ds.pendingTopicGroupMemoryBlock = undefined;
+      ds.pendingGroupAgentContextBlock = undefined;
       ds.pendingChatContext = undefined;
       ds.pendingAttachments = undefined;
       ds.pendingMentions = undefined;

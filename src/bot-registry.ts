@@ -1562,6 +1562,12 @@ export interface BotConfig {
   /** Per-bot shared memory for independent sessions in the same real topic group. */
   topicGroupMemory?: TopicGroupMemoryConfig;
   /**
+   * Group-scoped user-maintained Agent Context. When enabled, every real Lark
+   * group turn reads the chat announcement and pinned messages before prompt
+   * assembly. Default off; topic-group threads share the same chat_id context.
+   */
+  groupAgentContext?: boolean;
+  /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
    */
@@ -3448,6 +3454,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       topicGroupMemory: normalizeTopicGroupMemoryConfig(entry.topicGroupMemory),
+      groupAgentContext: entry.groupAgentContext === true || undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,

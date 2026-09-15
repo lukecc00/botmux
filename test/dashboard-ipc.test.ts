@@ -50,6 +50,7 @@ import {
   REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
   REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
 } from '../src/im/lark/reply-card-style.js';
+import { __testOnly as groupAgentContextTestOnly } from '../src/services/group-agent-context.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -836,6 +837,88 @@ describe('POST /api/session-origin/attest', () => {
       fixture.cleanup();
     }
   }, 5_000);
+});
+
+
+describe('PUT /api/bot-card-prefs — group Agent Context', () => {
+  it('persists the group announcement/Pin context switch and exposes runtime status controls', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-group-agent-context-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-group-agent-context-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      groupAgentContextTestOnly.contextCache.set(`${appId}::oc_ctx`, {
+        expiresAt: Date.now() + 60_000,
+        context: {
+          chatId: 'oc_ctx',
+          fetchedAt: '2026-09-15T00:00:00.000Z',
+          fromCache: false,
+          announcement: { status: 'ok', text: '公告' },
+          pins: { status: 'ok', items: [] },
+        },
+      });
+      groupAgentContextTestOnly.statusByScope.set(`${appId}::oc_ctx`, {
+        larkAppId: appId,
+        chatId: 'oc_ctx',
+        enabled: true,
+        lastFetchAt: '2026-09-15T00:00:00.000Z',
+        announcementStatus: 'ok',
+        pinStatus: 'ok',
+        pinCount: 0,
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ groupAgentContext: false });
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ groupAgentContext: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, groupAgentContext: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].groupAgentContext).toBe(true);
+      expect(getBot(appId).config.groupAgentContext).toBe(true);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ groupAgentContext: true });
+
+      const status = await (await fetch(`${base}/api/group-agent-context/status`)).json();
+      expect(status).toMatchObject({ ok: true, enabled: true });
+      expect(status.chats[0]).toMatchObject({ chatId: 'oc_ctx', announcementStatus: 'ok', pinStatus: 'ok' });
+
+      const refresh = await (await fetch(`${base}/api/group-agent-context/refresh`, { method: 'POST' })).json();
+      expect(refresh).toMatchObject({ ok: true, enabled: true });
+      expect(groupAgentContextTestOnly.contextCache.has(`${appId}::oc_ctx`)).toBe(false);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ groupAgentContext: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, groupAgentContext: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].groupAgentContext).toBeUndefined();
+      expect(getBot(appId).config.groupAgentContext).toBeUndefined();
+    } finally {
+      groupAgentContextTestOnly.contextCache.clear();
+      groupAgentContextTestOnly.statusByScope.clear();
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {

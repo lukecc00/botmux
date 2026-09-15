@@ -99,6 +99,8 @@ export interface BotCardPrefs {
   summaryMemoryPath: string;
   /** Shared MemoryCore-backed memory for independent sessions in one topic group. */
   topicGroupMemory: ResolvedTopicGroupMemoryConfig;
+  /** Read group announcement + Pin messages as untrusted per-turn Agent Context. */
+  groupAgentContext: boolean;
 }
 
 export type BotCardPrefsPatch = Omit<Partial<BotCardPrefs>, 'topicGroupMemory'> & {
@@ -134,6 +136,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       summaryMemory: c.summaryMemory === true,
       summaryMemoryPath: typeof c.summaryMemoryPath === 'string' && c.summaryMemoryPath.trim() ? c.summaryMemoryPath.trim() : 'summary.md',
       topicGroupMemory,
+      groupAgentContext: c.groupAgentContext === true,
     };
   } catch {
     return {
@@ -158,6 +161,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       summaryMemory: false,
       summaryMemoryPath: 'summary.md',
       topicGroupMemory: resolveTopicGroupMemoryConfig(undefined),
+      groupAgentContext: false,
     };
   }
 }
@@ -310,6 +314,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'summaryMemory', patch.summaryMemory);
     applyStr(entry, 'summaryMemoryPath', patch.summaryMemoryPath);
     applyTopicGroupMemory(entry, patch.topicGroupMemory);
+    apply(entry, 'groupAgentContext', patch.groupAgentContext);
     const topicGroupMemory = resolveTopicGroupMemoryConfig(entry.topicGroupMemory);
     return {
       write: true,
@@ -339,6 +344,7 @@ async function updateBotCardPrefsInternal(
         summaryMemory: entry.summaryMemory === true,
         summaryMemoryPath: typeof entry.summaryMemoryPath === 'string' && entry.summaryMemoryPath.trim() ? entry.summaryMemoryPath.trim() : 'summary.md',
         topicGroupMemory,
+        groupAgentContext: entry.groupAgentContext === true,
       },
     };
   });
@@ -418,6 +424,9 @@ async function updateBotCardPrefsInternal(
   if (patch.topicGroupMemory !== undefined) {
     bot.config.topicGroupMemory = r.result.topicGroupMemory;
   }
+  if (patch.groupAgentContext !== undefined) {
+    bot.config.groupAgentContext = patch.groupAgentContext || undefined;
+  }
   const nextPinStreamingCard = bot.config.pinStreamingCard === true;
   if (patch.pinStreamingCard !== undefined && previousPinStreamingCard !== nextPinStreamingCard) {
     notifyPinStreamingCardChanged(larkAppId, nextPinStreamingCard);
@@ -437,6 +446,7 @@ async function updateBotCardPrefsInternal(
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
     `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +
     `topicGroupMemory=${r.result.topicGroupMemory.enabled}/${r.result.topicGroupMemory.provider}/${r.result.topicGroupMemory.injectMode}/${r.result.topicGroupMemory.updateMode} ` +
+    `groupAgentContext=${r.result.groupAgentContext} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length} ` +
     `autoStartOnGroupJoinSeed.len=${r.result.autoStartOnGroupJoinSeed.length}`,
   );

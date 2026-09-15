@@ -2,7 +2,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { captureTencentDbTurnOnce } from '../src/services/tencentdb-agent-memory-ledger.js';
+import {
+  captureTencentDbTurnOnce,
+  latestTencentDbCaptureForScopes,
+  readTencentDbCaptureLedger,
+} from '../src/services/tencentdb-agent-memory-ledger.js';
 
 const dirs: string[] = [];
 async function dataDir(): Promise<string> {
@@ -42,5 +46,22 @@ describe('TencentDB capture success ledger', () => {
     )));
     expect(results.filter(result => result.captured)).toHaveLength(1);
     expect(capture).toHaveBeenCalledOnce();
+  });
+
+  it('reports the latest capture across topic-group scopes for diagnostics', async () => {
+    const dir = await dataDir();
+    await captureTencentDbTurnOnce('app:chat-a', 'turn-a', async () => 'a', {
+      dataDir: dir,
+      now: () => '2026-09-01T00:00:00.000Z',
+    });
+    await captureTencentDbTurnOnce('app:chat-b', 'turn-b', async () => 'b', {
+      dataDir: dir,
+      now: () => '2026-09-02T00:00:00.000Z',
+    });
+
+    expect(await readTencentDbCaptureLedger('app:chat-a', { dataDir: dir }))
+      .toMatchObject({ captured: [{ turnId: 'turn-a', capturedAt: '2026-09-01T00:00:00.000Z' }] });
+    expect(await latestTencentDbCaptureForScopes(['app:chat-a', 'app:chat-b'], { dataDir: dir }))
+      .toMatchObject({ scopeKey: 'app:chat-b', turnId: 'turn-b', capturedAt: '2026-09-02T00:00:00.000Z' });
   });
 });

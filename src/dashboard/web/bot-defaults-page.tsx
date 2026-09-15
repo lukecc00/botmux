@@ -25,10 +25,12 @@ import {
   type BotSubstituteMode,
   type BotSubstituteTarget,
   type CliOptionsState,
+  type GroupAgentContextRuntimeStatus,
   type SubstituteTargetResolution,
   type TopicGroupMemoryDocument,
   type TopicGroupMemoryEditableContent,
   type TopicGroupMemoryResource,
+  type TopicGroupMemoryRuntimeStatus,
   type TopicGroupMemoryStats,
 } from './bot-defaults.js';
 import {
@@ -746,6 +748,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
     topicGroupMemory: body.topicGroupMemory,
+    groupAgentContext: body.groupAgentContext,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
     docSubscribeDefaultMode: body.docSubscribeDefaultMode,
@@ -1075,6 +1078,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile bd-tile-wide"><GroupAgentContextSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile bd-tile-wide"><TopicGroupMemorySection bot={bot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
@@ -4210,6 +4214,121 @@ function normalizeSummaryMemoryPath(raw: string): string {
   return value || 'summary.md';
 }
 
+function formatGroupAgentContextTimestamp(value: string | undefined): string {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : value;
+}
+
+function GroupAgentContextSection(props: {
+  bot: BotDefaultsRow;
+  patchBot: PatchBot;
+  putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
+}) {
+  const tr = useT();
+  const [enabled, setEnabled] = useState(props.bot.groupAgentContext === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [runtime, setRuntime] = useState<GroupAgentContextRuntimeStatus[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => setEnabled(props.bot.groupAgentContext === true), [props.bot.groupAgentContext]);
+
+  const loadStatus = useCallback(async (): Promise<void> => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/bots/${encodeURIComponent(props.bot.larkAppId)}/group-agent-context/status`);
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body?.error ?? String(response.status));
+      setRuntime(Array.isArray(body.chats) ? body.chats as GroupAgentContextRuntimeStatus[] : []);
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setLoading(false);
+    }
+  }, [props.bot.larkAppId]);
+
+  useEffect(() => { void loadStatus(); }, [loadStatus]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = enabled;
+    setEnabled(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const response = await props.putCardPref({ groupAgentContext: next });
+      if (!response.ok || !response.body?.ok) throw new Error(responseErrorText(response));
+      const saved = response.body.groupAgentContext === true;
+      setEnabled(saved);
+      props.patchBot(props.bot.larkAppId, { groupAgentContext: saved });
+      setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      await loadStatus();
+    } catch (error: any) {
+      setEnabled(previous);
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refresh(): Promise<void> {
+    setLoading(true);
+    setStatus(null);
+    try {
+      const response = await fetch(`/api/bots/${encodeURIComponent(props.bot.larkAppId)}/group-agent-context/refresh`, { method: 'POST' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body?.error ?? String(response.status));
+      setRuntime(Array.isArray(body.chats) ? body.chats as GroupAgentContextRuntimeStatus[] : []);
+      setStatus({ text: `✓ ${tr('botDefaults.groupAgentContextCacheCleared')}`, ok: true });
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-group-agent-context>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionGroupAgentContext')}</h3>
+      <p className="bd-section-help">{tr('botDefaults.groupAgentContextHelp')}</p>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-group-agent-context"
+        title={tr('botDefaults.groupAgentContextEnabled')}
+        help={tr('botDefaults.groupAgentContextEnabledHelp')}
+        description={tr('botDefaults.groupAgentContextDescription')}
+        onChange={next => void save(next)}
+      />
+      <div className="tgm-memory-status-strip" data-group-agent-context-summary>
+        <span>{enabled ? tr('botDefaults.groupAgentContextStateEnabled') : tr('botDefaults.groupAgentContextStateDisabled')}</span>
+        <span>{tr('botDefaults.groupAgentContextScope')}</span>
+        <span>{tr('botDefaults.groupAgentContextCache')}</span>
+      </div>
+      {runtime.length === 0 ? (
+        <p className="empty">{tr('botDefaults.groupAgentContextNoReads')}</p>
+      ) : (
+        <div className="tgm-memory-diagnostic-list" data-group-agent-context-runtime>
+          {runtime.map(item => (
+            <div className="bd-context-status-row" key={item.chatId}>
+              <code>{item.chatId}</code>
+              <span>{tr('botDefaults.groupAgentContextAnnouncementStatus', { status: item.announcementStatus ?? 'unknown' })}</span>
+              <span>{tr('botDefaults.groupAgentContextPinStatus', { status: item.pinStatus ?? 'unknown', count: item.pinCount })}</span>
+              <span>{tr('botDefaults.groupAgentContextLastFetch', { time: formatGroupAgentContextTimestamp(item.lastFetchAt) })}</span>
+              {item.fromCache ? <span>{tr('botDefaults.groupAgentContextFromCache')}</span> : null}
+              {item.lastError ? <span className="hint-warn-inline">{tr('botDefaults.groupAgentContextError', { error: item.lastError })}</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="actions">
+        <button type="button" disabled={loading} onClick={() => void refresh()}>{tr('botDefaults.groupAgentContextRefresh')}</button>
+        <StatusSpan status={status} attr={{ 'data-group-agent-context-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
 function summaryMemoryPath(bot: Pick<BotDefaultsRow, 'summaryMemoryPath'>): string {
   return normalizeSummaryMemoryPath(typeof bot.summaryMemoryPath === 'string' ? bot.summaryMemoryPath : '');
 }
@@ -5706,6 +5825,12 @@ function topicGroupMemoryChatName(memory: Pick<TopicGroupMemoryStats, 'chatId' |
   return memory.chatName?.trim() || chatDisplayTitle({ chatId: memory.chatId })?.trim() || fallback;
 }
 
+function formatTopicGroupMemoryTimestamp(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : value;
+}
+
 function topicGroupMemoryEditableContent(memory: TopicGroupMemoryDocument): TopicGroupMemoryEditableContent {
   return {
     summary: memory.summary,
@@ -6029,6 +6154,7 @@ function TopicGroupMemorySection(props: {
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
   const [memories, setMemories] = useState<TopicGroupMemoryStats[]>([]);
+  const [runtime, setRuntime] = useState<TopicGroupMemoryRuntimeStatus | null>(null);
   const [memoryBusy, setMemoryBusy] = useState(false);
   const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
   const [selectedMemory, setSelectedMemory] = useState<TopicGroupMemorySelection | null>(null);
@@ -6075,6 +6201,9 @@ function TopicGroupMemorySection(props: {
       }
       const nextMemories = res.body.memories as TopicGroupMemoryStats[];
       setMemories(nextMemories);
+      setRuntime(res.body.runtime && typeof res.body.runtime === 'object'
+        ? res.body.runtime as TopicGroupMemoryRuntimeStatus
+        : null);
       setMemoryPage(currentPage => Math.min(
         currentPage,
         Math.max(1, Math.ceil(nextMemories.length / TOPIC_GROUP_MEMORY_PAGE_SIZE)),
@@ -6088,6 +6217,7 @@ function TopicGroupMemorySection(props: {
 
   useEffect(() => {
     setMemories([]);
+    setRuntime(null);
     setSelectedMemory(null);
     setMemoryPage(1);
     void loadMemories();
@@ -6335,6 +6465,22 @@ function TopicGroupMemorySection(props: {
   const visibleMemories = memories.slice(memoryPageStart, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
   const memoryPageFrom = memories.length === 0 ? 0 : memoryPageStart + 1;
   const memoryPageTo = Math.min(memories.length, memoryPageStart + TOPIC_GROUP_MEMORY_PAGE_SIZE);
+  const latestTencentDbCaptureAt = formatTopicGroupMemoryTimestamp(runtime?.latestTencentDbCaptureAt);
+  const latestLocalUpdateAt = formatTopicGroupMemoryTimestamp(runtime?.latestLocalUpdateAt);
+  const memoryCoreStatus = runtime?.memoryCoreHealthy === true
+    ? tr('botDefaults.topicGroupMemoryCoreHealthy')
+    : runtime?.memoryCoreHealthy === false
+      ? tr('botDefaults.topicGroupMemoryCoreUnhealthy')
+      : memories.length === 0 && enabled && provider !== 'local'
+        ? tr('botDefaults.topicGroupMemoryCoreNoScope')
+        : tr('botDefaults.topicGroupMemoryCoreNotChecked');
+  const hubStatus = runtime?.hubConfigured === false
+    ? tr('botDefaults.topicGroupMemoryHubNotConfigured')
+    : runtime?.hubReachable === true
+      ? tr('botDefaults.topicGroupMemoryHubReachable')
+      : runtime?.hubReachable === false
+        ? tr('botDefaults.topicGroupMemoryHubUnreachable')
+        : tr('botDefaults.topicGroupMemoryHubNotChecked');
 
   return (
     <section className="bd-section tgm-memory-section" data-topic-group-memory>
@@ -6476,7 +6622,11 @@ function TopicGroupMemorySection(props: {
           dataAction="toggle-topic-group-memory-tencent-persona"
           title={tr('botDefaults.topicGroupMemoryTencentPersona')}
           help={tr('botDefaults.topicGroupMemoryTencentPersonaHelp')}
-          onChange={setTencentIncludePersona}
+          onChange={next => {
+            const previous = tencentIncludePersona;
+            setTencentIncludePersona(next);
+            void save({ tencentdb: { includePersona: next } }).then(ok => { if (!ok) setTencentIncludePersona(previous); });
+          }}
         />
         <ToggleRow
           checked={tencentIncludeScenes}
@@ -6484,7 +6634,11 @@ function TopicGroupMemorySection(props: {
           dataAction="toggle-topic-group-memory-tencent-scenes"
           title={tr('botDefaults.topicGroupMemoryTencentScenes')}
           help={tr('botDefaults.topicGroupMemoryTencentScenesHelp')}
-          onChange={setTencentIncludeScenes}
+          onChange={next => {
+            const previous = tencentIncludeScenes;
+            setTencentIncludeScenes(next);
+            void save({ tencentdb: { includeScenes: next } }).then(ok => { if (!ok) setTencentIncludeScenes(previous); });
+          }}
         />
         <div className="actions">
           <button type="button" className="primary" disabled={busy} onClick={() => void saveTencentDb()}>{tr('botDefaults.save')}</button>
@@ -6542,8 +6696,20 @@ function TopicGroupMemorySection(props: {
         <h4 className="bd-subsection-title">{tr('botDefaults.topicGroupMemoryManagement')}</h4>
         <div className="tgm-memory-status-strip" data-topic-group-memory-summary>
           <span>{enabled ? tr('botDefaults.topicGroupMemoryStateEnabled') : tr('botDefaults.topicGroupMemoryStateDisabled')}</span>
+          <span>{tr('botDefaults.topicGroupMemoryEffectiveProvider', { provider: runtime?.effectiveProvider ?? 'unknown' })}</span>
+          <span>{memoryCoreStatus}</span>
+          <span>{hubStatus}</span>
+          <span>{tr('botDefaults.topicGroupMemoryTencentLatestCapture', { time: latestTencentDbCaptureAt ?? tr('botDefaults.topicGroupMemoryNever') })}</span>
+          <span>{tr('botDefaults.topicGroupMemoryLocalLatestUpdate', { time: latestLocalUpdateAt ?? tr('botDefaults.topicGroupMemoryNever') })}</span>
           <span>{tr('botDefaults.topicGroupMemoryCountSummary', { count: memories.length })}</span>
           <span>{tr('botDefaults.topicGroupMemorySizeSummary', { size: formatMemoryBytes(memories.reduce((sum, item) => sum + item.sizeBytes, 0)) })}</span>
+        </div>
+        <div className="tgm-memory-diagnostic-list" data-topic-group-memory-runtime>
+          <span>{tr('botDefaults.topicGroupMemoryPersistedConfig')}</span>
+          <span>{tr('botDefaults.topicGroupMemoryRuntimeManifest', { state: runtime?.runtimeManifestPresent ? tr('botDefaults.topicGroupMemoryPresent') : tr('botDefaults.topicGroupMemoryMissing') })}</span>
+          {runtime?.runtimeDir ? <code>{runtime.runtimeDir}</code> : null}
+          {runtime?.memoryCoreError ? <span className="hint-warn-inline">{tr('botDefaults.topicGroupMemoryCoreError', { error: runtime.memoryCoreError })}</span> : null}
+          {runtime?.hubError ? <span className="hint-warn-inline">{tr('botDefaults.topicGroupMemoryHubError', { error: runtime.hubError })}</span> : null}
         </div>
         <div className="actions">
           <button type="button" disabled={memoryBusy} onClick={() => void loadMemories()}>

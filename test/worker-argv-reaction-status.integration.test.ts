@@ -102,6 +102,21 @@ function piTranscriptRecord(role: 'user' | 'assistant', text: string, stopReason
   }) + '\n';
 }
 
+function bridgeSendMarkerRecord(
+  sentAtMs: number,
+  content: string,
+  responseKind: 'progress' | 'final' | 'auxiliary' = 'final',
+): string {
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  return JSON.stringify({
+    sentAtMs,
+    messageId: `om_${responseKind}_send`,
+    responseKind,
+    contentLength: normalized.length,
+    previewText: content,
+  }) + '\n';
+}
+
 function ompTranscriptRecord(
   id: string,
   parentId: string | null,
@@ -123,6 +138,153 @@ function ompTranscriptRecord(
 }
 
 describe('worker argv reaction status', () => {
+  it('emits explicit_reply_observed for an explicit final send when the transcript final is empty', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-empty-final-send-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345680';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    const markerDir = join(dataDir, 'turn-sends');
+    mkdirSync(markerDir, { recursive: true });
+    const markerPath = join(markerDir, 'sid-worker-empty-final-send.jsonl');
+    writeFileSync(markerPath, '');
+
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('Working...\\n');
+setTimeout(() => process.stdout.write('Ready\\n'), 2_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-empty-final-send',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-empty-final-send',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'empty final prompt',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_empty_final_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'empty final prompt'));
+    appendFileSync(markerPath, bridgeSendMarkerRecord(Date.now(), 'explicit final answer'));
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', '', 'stop'));
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_empty_final_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    expect(messages.filter(message => message.type === 'final_output' && message.turnId === 'om_empty_final_turn'), logs.join('')).toHaveLength(0);
+    expect(messages.filter(message => message.type === 'explicit_reply_observed' && message.turnId === 'om_empty_final_turn'))
+      .toEqual([{ type: 'explicit_reply_observed', turnId: 'om_empty_final_turn', messageId: 'om_final_send', responseKind: 'final', previewText: 'explicit final answer' }]);
+  }, 20_000);
+
+  it('does not duplicate explicit_reply_observed when transcript content is also suppressed by the same final send', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-final-send-dedupe-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345681';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    const markerDir = join(dataDir, 'turn-sends');
+    mkdirSync(markerDir, { recursive: true });
+    const markerPath = join(markerDir, 'sid-worker-final-send-dedupe.jsonl');
+    writeFileSync(markerPath, '');
+
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('Working...\\n');
+setTimeout(() => process.stdout.write('Ready\\n'), 2_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-final-send-dedupe',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-final-send-dedupe',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'dedupe final prompt',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_dedupe_final_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'dedupe final prompt'));
+    appendFileSync(markerPath, bridgeSendMarkerRecord(Date.now(), 'explicit final answer'));
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'a longer transcript narration', 'stop'));
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_dedupe_final_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    expect(messages.filter(message => message.type === 'final_output' && message.turnId === 'om_dedupe_final_turn'), logs.join('')).toHaveLength(0);
+    expect(messages.filter(message => message.type === 'explicit_reply_observed' && message.turnId === 'om_dedupe_final_turn')).toHaveLength(1);
+  }, 20_000);
+
   it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
     tempDirs.add(root);
