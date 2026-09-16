@@ -4966,6 +4966,46 @@ describe('POST /api/sessions/:sessionId/progress-card', () => {
     }
   });
 
+  it('suppresses progress cards when the bot switch is disabled', async () => {
+    const appId = 'progress-card-disabled-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: '/tmp',
+      workingDirs: ['/tmp'],
+    } as any);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 'progress-session-off', rootMessageId: 'om_root', cliId: 'codex' },
+      larkAppId: appId,
+      chatId: 'oc_chat',
+      chatType: 'group',
+      workingDir: '/tmp',
+    } as any);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/progress-session-off/progress-card';
+      const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          ...trustedHostHeaders('POST', path, handle.port),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ content: '关闭后不应发过程阶段卡。' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        suppressed: true,
+        reason: 'stage_conclusion_cards_disabled',
+      });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
   it('rejects an unsigned request that does not hold the live turn capability', async () => {
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 'progress-session' },

@@ -161,7 +161,9 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain("savePatch({ stageConclusionCards: checked }, 'stage-conclusions'");
     expect(i18n.match(/'botDefaults\.stageConclusionCards'/g)).toHaveLength(2);
     expect(i18n).toContain('不暴露隐藏思维链');
+    expect(i18n).toContain('不再额外发送这些过程阶段卡');
     expect(i18n).toContain('Off by default and configurable per bot');
+    expect(i18n).toContain('auxiliary process cards are suppressed');
   });
 
   it('places the Feishu description editor inside the profile header main column', () => {

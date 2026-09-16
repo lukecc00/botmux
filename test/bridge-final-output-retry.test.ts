@@ -136,6 +136,7 @@ import {
 } from '../src/services/vc-meeting-delivery-store.js';
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
+import { listProgressDeliveries } from '../src/services/progress-delivery-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
 import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
 import { setTopicGroupMemoryUpdateSchedulerForTests } from '../src/services/topic-group-memory-update.js';
@@ -2900,7 +2901,7 @@ describe('Worker turn_terminal routing', () => {
     vi.useRealTimers();
   });
 
-  it('keeps structured progress visible without footer controls when the bot switch is off', async () => {
+  it('suppresses structured progress when the bot switch is off without affecting the final answer', async () => {
     vi.useFakeTimers();
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
@@ -2919,21 +2920,28 @@ describe('Worker turn_terminal routing', () => {
 
     (ds.worker as any).emit('message', {
       type: 'progress_output', sessionId: ds.session.sessionId,
-      content: '阶段结论仍然可见', uuid: 'progress-switch-off', turnId: 'turn-progress-off',
+      content: '关闭后不应出现的阶段卡', uuid: 'progress-switch-off', turnId: 'turn-progress-off',
     } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '最终答复仍然正常送达', lastUuid: 'final-switch-off', turnId: 'turn-progress-off',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
     await vi.advanceTimersByTimeAsync(0);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    const card = String(sessionReply.mock.calls[0][1]);
-    expect(card).toContain('阶段结论仍然可见');
-    expect(card).not.toContain('web终端');
-    expect(card).not.toContain('reply_stop');
-    expect(card).not.toContain('reply_manage');
+    expect(String(sessionReply.mock.calls[0][1])).toContain('最终答复仍然正常送达');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('关闭后不应出现的阶段卡');
     vi.useRealTimers();
   });
 
   it('keeps tool-separated commentary in FIFO and retries past the foreground budget', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const deliveredBodies: string[] = [];
     let calls = 0;
@@ -2991,6 +2999,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('waits for earlier commentary before forwarding the final answer', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const deliveryOrder: string[] = [];
     let progressAttempts = 0;
@@ -3030,6 +3044,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('forwards the final answer after a bounded wait when commentary remains stuck', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const deliveryOrder: string[] = [];
     const sessionReply = vi.fn(async (_rootId: string, body: string) => {
@@ -3069,6 +3089,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('drops permanently rejected commentary and still forwards the final answer', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const deliveryOrder: string[] = [];
     const sessionReply = vi.fn(async (_rootId: string, body: string) => {
@@ -3105,6 +3131,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('keeps retrying Lark rate limits even when the SDK wraps them in HTTP 400', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     let attempts = 0;
     const sessionReply = vi.fn(async () => {
@@ -3130,8 +3162,50 @@ describe('Worker turn_terminal routing', () => {
     vi.useRealTimers();
   });
 
+  it('stops retrying accepted progress when the bot switch is turned off before retry', async () => {
+    vi.useFakeTimers();
+    const bot = {
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    let attempts = 0;
+    const sessionReply = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary Lark outage');
+      return 'om_progress_after_retry';
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'progress_output', sessionId: ds.session.sessionId,
+      content: '开关关闭前已入队的过程卡', uuid: 'progress-disabled-before-retry', turnId: 'turn-disable-retry',
+    } satisfies Extract<WorkerToDaemon, { type: 'progress_output' }>);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempts).toBe(1);
+    expect(listProgressDeliveries('/tmp/test-sessions', ds.session.sessionId)).toHaveLength(1);
+
+    delete bot.config.stageConclusionCards;
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listProgressDeliveries('/tmp/test-sessions', ds.session.sessionId)).toHaveLength(0);
+    vi.useRealTimers();
+  });
+
   it('does not make one turn final wait for commentary that arrived afterward', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const deliveryOrder: string[] = [];
     let releaseLaterProgress!: () => void;
@@ -3172,6 +3246,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('does not retry commentary or release its waiting final after close begins', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     let calls = 0;
     const sessionReply = vi.fn(async () => {
@@ -3205,6 +3285,12 @@ describe('Worker turn_terminal routing', () => {
 
   it('keeps an accepted progress outbox retry alive across worker replacement', async () => {
     vi.useFakeTimers();
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', stageConclusionCards: true,
+      },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const ds = makeDs();
     const oldWorker = ds.worker as any;
     let attempts = 0;

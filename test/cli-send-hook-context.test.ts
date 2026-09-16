@@ -722,6 +722,9 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain("const path = `/api/sessions/${encodeURIComponent(sid)}/progress-card`");
     expect(cmdSend).toContain('cardJson?: unknown');
     expect(cmdSend).toContain('providerUuid?: unknown');
+    expect(cmdSend).toContain('suppressed?: unknown');
+    expect(cmdSend).toContain('nativeProgressSuppressed = true');
+    expect(cmdSend).toContain("reason: 'stage_conclusion_cards_disabled'");
     expect(cmdSend).toContain('ordinaryBridgeOutputUuid = payload.providerUuid');
     expect(cmdSend).toContain("} else if (nativeProgressCardJson) {");
     expect(cmdSend).toContain("messageId = await dispatchPrimary(nativeProgressCardJson, 'interactive')");

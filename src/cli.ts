@@ -10465,12 +10465,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
 
-    // A normal no-mention progress update must use the same canonical card as
-    // transcript-native commentary: Web Terminal / stop / manage controls and
-    // no recipient footer. Ask the owning daemon to render it from the live
-    // session, preserving all callback identities and the authoritative turn
-    // UUID. This is best-effort; specialized sends retain their existing path.
+    // A normal no-mention progress update follows the bot's stage-conclusion
+    // card preference. When enabled, ask the owning daemon to render the live
+    // Web Terminal / stop / manage callback card. When disabled, the daemon
+    // explicitly suppresses this auxiliary message so the historical low-noise
+    // flow remains intact. Specialized sends retain their existing path.
     let nativeProgressCardJson: string | undefined;
+    let nativeProgressSuppressed = false;
     const nativeProgressEligible = effectiveResponseKind === 'progress'
       && noMention
       && !customCardRequested
@@ -10521,7 +10522,9 @@ async function cmdSend(rest: string[]): Promise<void> {
             const payload = await response.json() as {
               cardJson?: unknown;
               providerUuid?: unknown;
+              suppressed?: unknown;
             };
+            if (payload.suppressed === true) nativeProgressSuppressed = true;
             if (typeof payload.cardJson === 'string') nativeProgressCardJson = payload.cardJson;
             if (typeof payload.providerUuid === 'string' && payload.providerUuid) {
               ordinaryBridgeOutputUuid = payload.providerUuid;
@@ -10529,6 +10532,20 @@ async function cmdSend(rest: string[]): Promise<void> {
           }
         }
       } catch { /* fall back to the ordinary card and best-effort local UUID */ }
+    }
+
+    if (nativeProgressSuppressed) {
+      console.error('阶段进度已按本 bot 的「阶段结论控制卡」设置抑制；完成时仍需发送最终答复。');
+      console.log(JSON.stringify({
+        success: true,
+        accepted: true,
+        delivered: false,
+        suppressed: true,
+        reason: 'stage_conclusion_cards_disabled',
+        sessionId: sid,
+        turnId: currentTurnId,
+      }));
+      return;
     }
 
     // Upload images only after the final rendered payload has passed the

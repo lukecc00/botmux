@@ -150,7 +150,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, buildNativeProgressCard, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, buildNativeProgressCard, stageConclusionCardsEnabled, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -1885,8 +1885,8 @@ function sessionCliIpcAuth(
 }
 
 /** Return the daemon's canonical low-attention progress card without sending
- * it. `botmux send --no-mention` uses this so explicit milestone sends follow
- * the bot's stage-conclusion control-card preference. */
+ * it. When the per-bot preference is off, tell `botmux send --no-mention` to
+ * suppress the auxiliary stage message and keep the historical low-noise flow. */
 ipcRoute('POST', '/api/sessions/:sessionId/progress-card', async (req, res, params) => {
   const body = await readJsonBody<{ content?: unknown } & Record<string, unknown>>(req)
     .catch(() => ({} as { content?: unknown } & Record<string, unknown>));
@@ -1896,6 +1896,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/progress-card', async (req, res, para
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (typeof body.content !== 'string' || !body.content.trim() || body.content.length > 200_000) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_content' });
+  }
+  if (!stageConclusionCardsEnabled(ds)) {
+    return jsonRes(res, 200, {
+      ok: true,
+      suppressed: true,
+      reason: 'stage_conclusion_cards_disabled',
+    });
   }
   const turnId = ds.managedTurnOrigin?.turnId;
   const dispatchAttempt = ds.managedTurnOrigin?.dispatchAttempt;

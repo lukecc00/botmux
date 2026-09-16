@@ -349,6 +349,8 @@ botmux send --attention=blocked --mention-back "缺 TOS 上传密钥，拿不到
 
 过程卡只写可审阅的决策摘要：**已验证事实、选定方案及简短依据、下一步**。不要暴露内部思维链、私人草稿、原始终端日志，也不要发送“还在看”之类细碎重复状态。阶段结论即使重要也用 \`--no-mention\`；整轮结束或明确需要用户确认/决策/授权/补充信息/处理阻塞时，才用 \`--mention-back\`。
 
+如果后台按 bot 关闭了「阶段结论控制卡」，普通 \`--response-kind progress --no-mention\` 会被 daemon 接受但不向飞书额外发送（返回 \`suppressed: true\` / \`delivered: false\`），用于恢复低打扰的原有逻辑。看到这种结果不要改用 @、不要重复发送；最终答复仍必须按正常规则发送。
+
 ### 纯文本（最常见）
 
 **正文输入契约**：\`botmux send [content]\` 接收原始正文，不是 JSON；只有 \`--card-json\` / \`--card-file\` 的卡片输入才按 JSON 解析。不要先对普通正文执行 \`JSON.stringify\`、把换行手动替换成 \`\\n\`，再把结果塞进位置参数；外层工具协议会自行编码命令字符串，shell / botmux 也不会把字面量 \`\\n\` 反解成换行。

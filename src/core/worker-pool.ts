@@ -2090,11 +2090,14 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   }
 }
 
-/** Transcript-native user-facing commentary card. The content is always
- * delivered; Web Terminal / stop / manage controls are added only when this
- * bot opts in to stage-conclusion controls. */
+export function stageConclusionCardsEnabled(ds: DaemonSession): boolean {
+  return getBot(ds.larkAppId).config.stageConclusionCards === true;
+}
+
+/** Transcript-native user-facing commentary card. Only build/send it when the
+ * bot opts in to stage-conclusion controls; otherwise the historical low-noise
+ * flow suppresses these auxiliary progress cards entirely. */
 export function buildNativeProgressCard(ds: DaemonSession, content: string): string {
-  const controlsEnabled = getBot(ds.larkAppId).config.stageConclusionCards === true;
   const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   return buildMarkdownCard(
     content,
@@ -2105,25 +2108,23 @@ export function buildNativeProgressCard(ds: DaemonSession, content: string): str
     daemonCardLocalHomeLinkMode(ds),
     undefined,
     'footer',
-    controlsEnabled
-      ? {
-          terminalUrl: readableTerminalUrlFor(ds) || undefined,
-          stopValue: {
-            action: 'close',
-            root_id: sessionAnchorId(ds),
-            session_id: ds.session.sessionId,
-            cli_id: effectiveCliId,
-            botmux_control: 'reply_stop',
-          },
-          manageValue: {
-            action: 'manage_access',
-            root_id: sessionAnchorId(ds),
-            session_id: ds.session.sessionId,
-            cli_id: effectiveCliId,
-            botmux_control: 'reply_manage',
-          },
-        }
-      : undefined,
+    {
+      terminalUrl: readableTerminalUrlFor(ds) || undefined,
+      stopValue: {
+        action: 'close',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_stop',
+      },
+      manageValue: {
+        action: 'manage_access',
+        root_id: sessionAnchorId(ds),
+        session_id: ds.session.sessionId,
+        cli_id: effectiveCliId,
+        botmux_control: 'reply_manage',
+      },
+    },
   );
 }
 
@@ -11755,6 +11756,14 @@ function setupWorkerHandlers(
    * after Lark confirms the reply. */
   const enqueueProgressDelivery = (record: ProgressDeliveryRecord): void => {
     if (record.sessionId !== ds.session.sessionId) return;
+    if (!stageConclusionCardsEnabled(ds)) {
+      completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+      logger.info(
+        `[${t}] Structured progress suppressed by bot stage-conclusion card preference `
+        + `(turn ${record.turnId.substring(0, 8)})`,
+      );
+      return;
+    }
     if (!record.content.trim()) {
       completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
       return;
@@ -11774,7 +11783,6 @@ function setupWorkerHandlers(
     ds.progressOutputInFlight.add(record.transcriptUuid);
 
     const run = async (): Promise<void> => {
-      const cardJson = buildNativeProgressCard(ds, record.content);
       for (let attempt = 0; ; attempt++) {
         const backoff = PROGRESS_OUTPUT_RETRY_BACKOFF_MS[
           Math.min(attempt, PROGRESS_OUTPUT_RETRY_BACKOFF_MS.length - 1)
@@ -11789,6 +11797,15 @@ function setupWorkerHandlers(
           completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
           return;
         }
+        if (!stageConclusionCardsEnabled(ds)) {
+          completeProgressDelivery(config.session.dataDir, record.sessionId, record.transcriptUuid);
+          logger.info(
+            `[${t}] Structured progress retry suppressed by bot stage-conclusion card preference `
+            + `(turn ${record.turnId.substring(0, 8)}, attempt ${attempt + 1})`,
+          );
+          return;
+        }
+        const cardJson = buildNativeProgressCard(ds, record.content);
         try {
           await scopedReply(cardJson, 'interactive', record.turnId, {
             uuid: bridgeProgressProviderUuid(record.sessionId, record.turnId, record.content)
@@ -14574,6 +14591,13 @@ function setupWorkerHandlers(
           break;
         }
         if (isProgressDeliveryClosed(ds) || !msg.content.trim()) break;
+        if (!stageConclusionCardsEnabled(ds)) {
+          logger.info(
+            `[${t}] Dropped progress_output because stage-conclusion control cards are disabled `
+            + `(turn ${msg.turnId.substring(0, 8)})`,
+          );
+          break;
+        }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (ds.docCommentTurns?.has(msg.turnId)) break;
         const record = stageProgressDelivery(config.session.dataDir, {
